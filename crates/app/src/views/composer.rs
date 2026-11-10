@@ -2069,7 +2069,9 @@ impl Render for Composer {
             })
             .when_some(self.reply_to.clone(), |d, m| d.child(self.render_reply(&m, palette, cx)))
             .when_some(self.editing.clone(), |d, m| d.child(self.render_editing(&m, palette, cx)))
-            // ↑ in an empty composer edits your last message; Esc cancels an edit.
+            // ↑ in an empty composer edits your last message; Esc closes a
+            // link preview, else cancels an edit (Desktop's `handleEscape`,
+            // `ts/components/CompositionArea`).
             .when(!typeahead_open, |d| {
                 d.capture_action(cx.listener(|this, _: &MoveUp, _, cx| {
                     if this.editing.is_none()
@@ -2082,7 +2084,14 @@ impl Render for Composer {
                     }
                 }))
                 .capture_action(cx.listener(|this, _: &Escape, window, cx| {
-                    if this.editing.is_some() {
+                    // The emoji picker's own Esc closes it first.
+                    if this.picker_open {
+                        return;
+                    }
+                    if this.link_preview.as_ref().is_some_and(|p| !matches!(p.state, PreviewState::Unavailable)) {
+                        cx.stop_propagation();
+                        this.remove_link_preview(cx);
+                    } else if this.editing.is_some() {
                         cx.stop_propagation();
                         this.cancel_edit(window, cx);
                     }
@@ -2734,6 +2743,23 @@ mod tests {
         });
         assert_eq!(editing, Some(original.id), "still editing");
         assert!(!staged);
+        // Esc too closes the preview first, then the edit.
+        type_in(&f, cx, " https://signal.org/donate/");
+        // Still loading (the demo's fetch can answer first).
+        f.composer.update(cx, |c, _| {
+            c.link_preview = Some(StagedPreview { url: "https://signal.org/donate/".into(), state: PreviewState::Loading })
+        });
+        // Not while the emoji picker is open: its Esc is for it.
+        f.composer.update(cx, |c, _| c.picker_open = true);
+        press(&f, cx, "escape");
+        assert!(cx.update(|cx| f.composer.read(cx).link_preview.is_some()), "the picker took Esc");
+        f.composer.update(cx, |c, _| c.picker_open = false);
+        press(&f, cx, "escape");
+        let (editing, staged) = cx.update(|cx| {
+            let c = f.composer.read(cx);
+            (c.editing.as_ref().map(|m| m.id), c.link_preview.is_some())
+        });
+        assert_eq!((editing, staged), (Some(original.id), false), "Esc closed the preview");
         type_in(&f, cx, "!");
         press(&f, cx, "enter");
         let dropped = sent(&f, |m| m.id == original.id && m.link_preview.is_none()).into_iter().find(|m| m.id == original.id).unwrap();
