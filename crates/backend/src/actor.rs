@@ -193,6 +193,13 @@ enum Outbound {
         /// The link preview's image (already optimized), for `body.preview`.
         preview_image: Option<std::path::PathBuf>,
     },
+    /// An edit whose link preview has an image to upload first.
+    SendEdit {
+        conversation: ConversationId,
+        edit: presage::proto::EditMessage,
+        timestamp: u64,
+        preview_image: std::path::PathBuf,
+    },
     /// A GIF: its MP4 is uploaded with Signal's GIF flag.
     SendGif {
         conversation: ConversationId,
@@ -409,6 +416,7 @@ impl Outbound {
         match self {
             Outbound::Send { conversation, message: Some(_), .. }
             | Outbound::Send { conversation, body: ContentBody::EditMessage(_), .. }
+            | Outbound::SendEdit { conversation, .. }
             | Outbound::Delete { conversation, .. }
             | Outbound::SendImages { conversation, .. }
             | Outbound::SendGif { conversation, .. }
@@ -429,6 +437,18 @@ impl Outbound {
             | Outbound::SendContact { conversation, message: id, timestamp, .. } => Some((conversation.clone(), *id, *timestamp)),
             _ => None,
         }
+    }
+}
+
+/// A link preview as a message carries it; its image pointer is added once
+/// uploaded.
+fn wire_preview(preview: &LinkPreview) -> presage::proto::Preview {
+    presage::proto::Preview {
+        url: Some(preview.url.clone()),
+        title: preview.title.clone(),
+        description: preview.description.clone(),
+        date: preview.date.map(|d| d as u64),
+        image: None,
     }
 }
 
@@ -1028,8 +1048,8 @@ impl Actor {
                 Command::Typing { conversation, started } => self.typing(conversation, started).await,
                 Command::DeleteForMe { message_ids } => self.delete_for_me(message_ids).await,
                 Command::RetrySend { message_id } => self.retry_send(message_id).await,
-                Command::EditMessage { message_id, body, mentions, styles } => {
-                    self.edit_message(message_id, body, mentions, styles).await
+                Command::EditMessage { message_id, body, mentions, styles, preview } => {
+                    self.edit_message(message_id, body, mentions, styles, preview).await
                 }
                 Command::PinMessage { message_id, duration } => self.set_pin(message_id, true, duration).await,
                 Command::UnpinMessage { message_id } => self.set_pin(message_id, false, None).await,
@@ -3806,20 +3826,29 @@ impl Actor {
     }
 
     /// Signal's edit: the new text replaces the old everywhere, aimed at the
-    /// original's timestamp (every edit is). Attachments can't change.
+    /// original's timestamp (every edit is). Attachments can't change; the
+    /// link preview can, as in Desktop's `sendEditedMessage`.
     async fn edit_message(
         self: Rc<Self>,
         message_id: i64,
         body: String,
         mentions: Vec<String>,
         styles: Vec<signal_store::StyleSpan>,
+        preview: Option<crate::LinkPreviewDraft>,
     ) {
         let wire_body = body.trim_end().to_owned();
         let wire_styles = mapping::wire_styles(&wire_body, &styles);
         let (body, spans, style_spans) = self.render_body(&wire_body, &mentions, &wire_styles).await;
         let Some(message) = self.db.message(message_id).await.ok().flatten() else { return };
         let conversation = message.conversation_id.clone();
-        if body.is_empty() || (body == message.body && spans == message.mentions && style_spans == message.styles) {
+        // Only for a link still in the text. Beside attachments there's
+        // none to change: whatever the message has stays.
+        let preview = preview.filter(|p| crate::link_preview::is_valid(&body, &p.url));
+        let same_preview = !message.attachments.is_empty()
+            || preview.as_ref().map(|p| &p.url) == message.link_preview.as_ref().map(|p| &p.url);
+        if body.is_empty()
+            || (body == message.body && spans == message.mentions && style_spans == message.styles && same_preview)
+        {
             return;
         }
         if !crate::edits::can_edit(&message, self.is_note_to_self(&conversation), now_millis()) {
@@ -3831,13 +3860,22 @@ impl Actor {
         }
         let _ = self.db.set_mentions(message_id, &spans).await;
         let _ = self.db.set_styles(message_id, &style_spans).await;
+        // The same link keeps the preview it has (and its saved image).
+        let link_preview = match preview {
+            _ if same_preview => message.link_preview.clone(),
+            Some(draft) => Some(self.save_link_preview(draft).await),
+            None => None,
+        };
+        if !same_preview {
+            let _ = self.db.set_link_preview(message_id, link_preview.as_ref()).await;
+        }
         self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id });
         self.emit(Event::ConversationsChanged);
         let self_aci = self.self_aci();
         let config = crate::remote_config::current();
         let mut body_ranges = mapping::mention_ranges(&wire_body, &mentions, &config);
         body_ranges.extend(mapping::style_ranges(&wire_styles));
-        let data = DataMessage {
+        let mut data = DataMessage {
             body_ranges,
             body: Some(wire_body),
             timestamp: Some(timestamp),
@@ -3854,13 +3892,27 @@ impl Actor {
                 }
             }),
             group_v2: self.group_context(&conversation).await,
+            preview: link_preview.iter().map(wire_preview).collect(),
             ..Default::default()
         };
+        // The image here is uploaded; one not downloaded goes by its
+        // transit-tier locator (which can have expired in Note to Self,
+        // where edits have no time limit).
+        let image = link_preview.and_then(|p| p.image);
+        let preview_image = image.as_ref().and_then(|i| i.local_path.as_ref()).map(std::path::PathBuf::from);
+        if preview_image.is_none()
+            && let Some(pointer) = image.as_ref().and_then(mapping::pointer_from_remote)
+        {
+            data.preview[0].image = Some(pointer);
+        }
         let edit = presage::proto::EditMessage {
             target_sent_timestamp: Some(message.sent_at as u64),
             data_message: Some(data),
         };
-        self.enqueue(Outbound::Send { conversation, body: ContentBody::EditMessage(edit), timestamp, message: None });
+        match preview_image {
+            Some(preview_image) => self.enqueue(Outbound::SendEdit { conversation, edit, timestamp, preview_image }),
+            None => self.enqueue(Outbound::Send { conversation, body: ContentBody::EditMessage(edit), timestamp, message: None }),
+        }
     }
 
     /// Sends a failed message again from what we stored, with its original
@@ -3964,13 +4016,7 @@ impl Actor {
             .collect();
         let preview_image = preview.and_then(|p| p.image.as_ref()).and_then(local);
         if let Some(preview) = preview {
-            data.preview = vec![presage::proto::Preview {
-                url: Some(preview.url.clone()),
-                title: preview.title.clone(),
-                description: preview.description.clone(),
-                date: preview.date.map(|d| d as u64),
-                image: None,
-            }];
+            data.preview = vec![wire_preview(preview)];
         }
         if images.is_empty() && preview.is_none() {
             self.enqueue(Outbound::Send { conversation, body: data.into(), timestamp, message: Some(message_id) });
@@ -4110,48 +4156,12 @@ impl Actor {
         let wire_styles = mapping::wire_styles(&wire_body, &styles);
         let (body, spans, style_spans) = self.render_body(&wire_body, &mentions, &wire_styles).await;
         // Only for a link that's still in the message.
-        let preview = preview.filter(|p| crate::link_preview::is_valid(&body, &p.url));
-        let mut preview_image = None;
-        let link_preview = match &preview {
-            Some(draft) => {
-                let image = match &draft.image {
-                    Some(image) => {
-                        let ext = media::ImageKind::sniff(&image.bytes).map_or("img", |k| k.extension());
-                        let path = self.config.data_dir.join("attachments").join(format!("sent-{}-preview.{ext}", now_millis()));
-                        if let Err(error) = tokio::fs::write(&path, &*image.bytes).await {
-                            warn!(%error, "failed to save link preview image");
-                            None
-                        } else {
-                            preview_image = Some(path.clone());
-                            Some(AttachmentMeta {
-                                content_type: image.content_type.into(),
-                                file_name: None,
-                                size: image.bytes.len() as u64,
-                                width: Some(image.width),
-                                height: Some(image.height),
-                                local_path: Some(path.to_string_lossy().into_owned()),
-                                sticker: false,
-                                gif: false,
-                                voice: false,
-                                remote: None,
-                                thumbnail_path: None,
-                                sticker_pack: None,
-                                transcode: false,
-                            })
-                        }
-                    }
-                    None => None,
-                };
-                Some(LinkPreview {
-                    url: draft.url.clone(),
-                    title: Some(draft.title.clone()),
-                    description: draft.description.clone(),
-                    date: draft.date,
-                    image,
-                })
-            }
+        let link_preview = match preview.filter(|p| crate::link_preview::is_valid(&body, &p.url)) {
+            Some(draft) => Some(self.save_link_preview(draft).await),
             None => None,
         };
+        let preview_image =
+            link_preview.as_ref().and_then(|p| p.image.as_ref()?.local_path.as_ref()).map(std::path::PathBuf::from);
         let Some((id, mut data, timestamp)) =
             self.store_outgoing(&conversation, body, quote, Vec::new(), link_preview.clone()).await
         else {
@@ -4160,13 +4170,7 @@ impl Actor {
         self.add_ranges(id, &mut data, wire_body, &mentions, &spans, &wire_styles, &style_spans).await;
         match link_preview {
             Some(preview) => {
-                data.preview = vec![presage::proto::Preview {
-                    url: Some(preview.url),
-                    title: preview.title,
-                    description: preview.description,
-                    date: preview.date.map(|d| d as u64),
-                    image: None,
-                }];
+                data.preview = vec![wire_preview(&preview)];
                 self.enqueue(Outbound::SendImages {
                     conversation,
                     body: data,
@@ -4178,6 +4182,39 @@ impl Actor {
             }
             None => self.enqueue(Outbound::Send { conversation, body: data.into(), timestamp, message: Some(id) }),
         }
+    }
+
+    /// A fetched preview as the message keeps it, its image saved beside
+    /// attachments (left out if it can't be saved).
+    async fn save_link_preview(&self, draft: crate::LinkPreviewDraft) -> LinkPreview {
+        let image = match &draft.image {
+            Some(image) => {
+                let ext = media::ImageKind::sniff(&image.bytes).map_or("img", |k| k.extension());
+                let path = self.config.data_dir.join("attachments").join(format!("sent-{}-preview.{ext}", now_millis()));
+                if let Err(error) = tokio::fs::write(&path, &*image.bytes).await {
+                    warn!(%error, "failed to save link preview image");
+                    None
+                } else {
+                    Some(AttachmentMeta {
+                        content_type: image.content_type.into(),
+                        file_name: None,
+                        size: image.bytes.len() as u64,
+                        width: Some(image.width),
+                        height: Some(image.height),
+                        local_path: Some(path.to_string_lossy().into_owned()),
+                        sticker: false,
+                        gif: false,
+                        voice: false,
+                        remote: None,
+                        thumbnail_path: None,
+                        sticker_pack: None,
+                        transcode: false,
+                    })
+                }
+            }
+            None => None,
+        };
+        LinkPreview { url: draft.url, title: Some(draft.title), description: draft.description, date: draft.date, image }
     }
 
     /// Saves the images next to downloaded attachments so the message shows
@@ -4986,6 +5023,22 @@ impl Actor {
                         }
                     };
                     self.finish_send(&conversation, message, timestamp, status).await;
+                }
+                Outbound::SendEdit { conversation, mut edit, timestamp, preview_image } => {
+                    // The edit still goes if its image doesn't, as a quote's
+                    // thumbnail does.
+                    match self.upload_preview_image(&manager, &preview_image).await {
+                        Ok(pointer) => {
+                            if let Some(preview) = edit.data_message.as_mut().and_then(|d| d.preview.first_mut()) {
+                                preview.image = Some(pointer);
+                            }
+                        }
+                        Err(error) => warn!(error = %format!("{error:#}"), "edit sent without its link preview image"),
+                    }
+                    let delivery =
+                        self.deliver_to(&mut manager, &conversation, ContentBody::EditMessage(edit), timestamp, None).await;
+                    self.report(&conversation, &delivery);
+                    self.untracked_challenge(&delivery).await;
                 }
                 Outbound::SendGif { conversation, mut body, timestamp, message, path, size } => {
                     let status = match self.upload_gif(&manager, &path, size).await {

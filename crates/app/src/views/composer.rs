@@ -569,6 +569,24 @@ impl Composer {
         // With its formatting, shown as it is in the message.
         let (body, styles) = (message.body.clone(), message.styles.clone());
         self.reply_to = None;
+        // The message's preview shows as Desktop's edit does; it goes again
+        // unless dismissed or its link is removed.
+        self.take_link_preview(cx);
+        if let Some(p) = message.link_preview.as_ref().filter(|_| message.attachments.is_empty()) {
+            let image = p.image.as_ref().and_then(|i| {
+                let format = ImageFormat::from_mime_type(&i.content_type)?;
+                Some(Arc::new(Image::from_bytes(format, std::fs::read(i.local_path.as_ref()?).ok()?)))
+            });
+            let draft = LinkPreviewDraft {
+                url: p.url.clone(),
+                title: p.title.clone().unwrap_or_default(),
+                description: p.description.clone(),
+                date: p.date,
+                image: None,
+            };
+            let state = PreviewState::Ready { preview: std::rc::Rc::new(draft), image };
+            self.link_preview = Some(StagedPreview { url: p.url.clone(), state });
+        }
         self.editing = Some(message);
         self.input.update(cx, |input, cx| input.set_content(body, &styles, window, cx));
         self.focus(window, cx);
@@ -587,6 +605,7 @@ impl Composer {
     fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.editing.take().is_some() {
             self.mentions.clear();
+            self.take_link_preview(cx);
             self.input.update(cx, |input, cx| input.set_value("", window, cx));
             cx.notify();
         }
@@ -1075,8 +1094,12 @@ impl Composer {
             // are compared as the input would write them.
             let original_styles = crate::rich_input::styles::Styles::from_spans(&original.body, &original.styles)
                 .to_spans(&original.body);
-            if !text.is_empty() && (text != original.body || text_styles != original_styles || !same_people) {
-                self.state.read(cx).send(Command::EditMessage { message_id: original.id, body, mentions, styles });
+            let preview = self.take_link_preview(cx);
+            // Beside attachments there's no preview to change.
+            let same_preview = !original.attachments.is_empty()
+                || preview.as_ref().map(|p| &p.url) == original.link_preview.as_ref().map(|p| &p.url);
+            if !text.is_empty() && (text != original.body || text_styles != original_styles || !same_people || !same_preview) {
+                self.state.read(cx).send(Command::EditMessage { message_id: original.id, body, mentions, styles, preview });
             }
             self.input.update(cx, |input, cx| input.set_value("", window, cx));
             self.save_draft_later(cx);
@@ -1091,18 +1114,7 @@ impl Composer {
             return self.send_view_once(cx);
         }
         let quote = self.reply_to.take().map(|m| m.id);
-        let preview = match self.link_preview.take() {
-            Some(staged) => {
-                staged.release(cx);
-                match staged.state {
-                    PreviewState::Ready { preview, .. } => Some((*preview).clone()),
-                    _ => None,
-                }
-            }
-            None => None,
-        };
-        self.dismissed_previews.clear();
-        self.preview_task = None;
+        let preview = self.take_link_preview(cx);
         // The text goes with the images, else with the first file (each file
         // is a message of its own, as in Desktop).
         let files = std::mem::take(&mut self.files);
@@ -1150,9 +1162,31 @@ impl Composer {
         cx.notify();
     }
 
+    /// The staged preview, if loaded, to send; the next draft starts afresh.
+    fn take_link_preview(&mut self, cx: &mut Context<Self>) -> Option<LinkPreviewDraft> {
+        self.dismissed_previews.clear();
+        self.preview_task = None;
+        let staged = self.link_preview.take()?;
+        staged.release(cx);
+        match staged.state {
+            PreviewState::Ready { preview, .. } => Some((*preview).clone()),
+            _ => None,
+        }
+    }
+
     /// Keeps the staged preview in step with the draft's first link.
     fn update_link_preview(&mut self, text: &str, cx: &mut Context<Self>) {
-        let link = signal_backend::link_preview::first_previewable(text).filter(|l| !self.dismissed_previews.contains(l));
+        // An edit keeps its preview while its link is in the text, even one
+        // that isn't the first (as another client may have picked).
+        if self.editing.is_some()
+            && self.link_preview.as_ref().is_some_and(|p| signal_backend::link_preview::is_valid(text, &p.url))
+        {
+            return;
+        }
+        // A message with attachments has no preview, edited or not.
+        let link = signal_backend::link_preview::first_previewable(text)
+            .filter(|l| !self.dismissed_previews.contains(l))
+            .filter(|_| self.editing.as_ref().is_none_or(|m| m.attachments.is_empty()));
         if self.link_preview.as_ref().map(|p| &p.url) == link.as_ref() {
             return;
         }
@@ -1223,6 +1257,7 @@ impl Composer {
                 .child(
                     div()
                         .id("dismiss-link-preview")
+                        .debug_selector(|| "dismiss-link-preview".into())
                         .p_1()
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| this.remove_link_preview(cx)))
@@ -2634,6 +2669,75 @@ mod tests {
         vcx.run_until_parked();
         assert!(vcx.debug_bounds("add-button").is_none());
         assert!(vcx.debug_bounds("send-button").is_some());
+    }
+
+    #[gpui_kit::test]
+    fn an_edit_keeps_its_link_preview_or_drops_it(cx: &mut TestAppContext) {
+        let f = mount_with_keys(cx);
+        type_in(&f, cx, "see https://signal.org/blog/");
+        f.composer.update(cx, |c, cx| c.remove_link_preview(cx));
+        press(&f, cx, "enter");
+        let original = sent(&f, |m| m.body.starts_with("see")).into_iter().find(|m| m.body.starts_with("see")).unwrap();
+        assert!(original.link_preview.is_none());
+
+        let stage = |cx: &mut TestAppContext| {
+            let draft = LinkPreviewDraft {
+                url: "https://signal.org/blog/".into(),
+                title: "Blog".into(),
+                description: None,
+                date: None,
+                image: None,
+            };
+            f.composer.update(cx, |c, cx| c.on_link_preview("https://signal.org/blog/", Some(std::rc::Rc::new(draft)), cx));
+        };
+        cx.update_window(f.window, |_, window, cx| f.composer.update(cx, |c, cx| c.start_edit(original.clone(), window, cx)))
+            .unwrap();
+        type_in(&f, cx, " ");
+        stage(cx);
+        press(&f, cx, "enter");
+        let edited = sent(&f, |m| m.id == original.id && m.link_preview.is_some()).into_iter().find(|m| m.id == original.id).unwrap();
+        assert_eq!(edited.link_preview.as_ref().and_then(|p| p.title.as_deref()), Some("Blog"), "the edit took the preview");
+
+        // A typo fixed keeps a preview of a link that isn't the first.
+        let second = signal_store::LinkPreview {
+            url: "https://signal.org/blog/".into(),
+            title: Some("Blog".into()),
+            description: None,
+            date: None,
+            image: None,
+        };
+        let two_links = signal_store::Message {
+            body: "https://signal.org/donate/ and https://signal.org/blog/".into(),
+            link_preview: Some(second),
+            ..edited.clone()
+        };
+        cx.update_window(f.window, |_, window, cx| f.composer.update(cx, |c, cx| c.start_edit(two_links, window, cx)))
+            .unwrap();
+        type_in(&f, cx, "!");
+        let staged = cx.update(|cx| f.composer.read(cx).link_preview.as_ref().map(|p| p.url.clone()));
+        assert_eq!(staged.as_deref(), Some("https://signal.org/blog/"));
+        cx.update_window(f.window, |_, window, cx| f.composer.update(cx, |c, cx| c.cancel_edit(window, cx))).unwrap();
+
+        // Its ✕ while editing drops the preview, not the edit.
+        cx.update_window(f.window, |_, window, cx| f.composer.update(cx, |c, cx| c.start_edit(edited.clone(), window, cx)))
+            .unwrap();
+        cx.run_until_parked();
+        stage(cx);
+        let mut vcx = gpui_kit::VisualTestContext::from_window(f.window, cx);
+        vcx.run_until_parked();
+        let dismiss = vcx.debug_bounds("dismiss-link-preview").expect("the preview shows while editing");
+        vcx.simulate_click(dismiss.center(), gpui_kit::Modifiers::none());
+        vcx.run_until_parked();
+        let (editing, staged) = vcx.update(|_, cx| {
+            let c = f.composer.read(cx);
+            (c.editing.as_ref().map(|m| m.id), c.link_preview.is_some())
+        });
+        assert_eq!(editing, Some(original.id), "still editing");
+        assert!(!staged);
+        type_in(&f, cx, "!");
+        press(&f, cx, "enter");
+        let dropped = sent(&f, |m| m.id == original.id && m.link_preview.is_none()).into_iter().find(|m| m.id == original.id).unwrap();
+        assert!(dropped.body.ends_with('!'));
     }
 
     #[gpui_kit::test]

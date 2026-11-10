@@ -447,7 +447,15 @@ pub enum Command {
     PinMessage { message_id: i64, duration: Option<u32> },
     UnpinMessage { message_id: i64 },
     /// Changes the text of one of our sent messages (Signal's edit).
-    EditMessage { message_id: i64, body: String, mentions: Vec<String>, styles: Vec<signal_store::StyleSpan> },
+    /// `preview` replaces the message's link preview; the same link keeps
+    /// the one it has.
+    EditMessage {
+        message_id: i64,
+        body: String,
+        mentions: Vec<String>,
+        styles: Vec<signal_store::StyleSpan>,
+        preview: Option<LinkPreviewDraft>,
+    },
     /// Sends a failed message again, with its original timestamp.
     RetrySend { message_id: i64 },
     /// Sends copies of messages (text, photos, GIFs, link previews) to

@@ -2872,6 +2872,16 @@ impl AppDb {
         Ok(())
     }
 
+    /// Replaces a message's link preview (an edit's); a deleted message keeps none.
+    pub async fn set_link_preview(&self, message_id: i64, preview: Option<&LinkPreview>) -> Result<()> {
+        sqlx::query("UPDATE messages SET link_preview = ? WHERE id = ? AND deleted = 0")
+            .bind(preview.map(serde_json::to_string).transpose()?)
+            .bind(message_id)
+            .execute(&self.writer)
+            .await?;
+        Ok(())
+    }
+
     /// Records a message's formatting. Its chat's preview follows, as it
     /// hides spoilers.
     pub async fn set_styles(&self, message_id: i64, styles: &[StyleSpan]) -> Result<()> {

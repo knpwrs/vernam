@@ -1252,6 +1252,21 @@ fn where_a_long_text_downloads_from() {
     assert_eq!((remote.cdn, remote.cdn_key.as_deref()), (0, Some("42")));
     // Without its digest it can't be checked, so it isn't fetched.
     assert_eq!(remote_of(&AttachmentPointer { digest: None, ..long_text_pointer() }), None);
+
+    // What's kept rebuilds the pointer, by key or by number.
+    for pointer in [long_text_pointer(), old] {
+        let meta = signal_store::AttachmentMeta {
+            content_type: LONG_TEXT_TYPE.into(),
+            size: 3000,
+            remote: remote_of(&pointer),
+            ..attachment_meta(&pointer)
+        };
+        let rebuilt = pointer_from_remote(&meta).unwrap();
+        assert_eq!(
+            (rebuilt.attachment_identifier, rebuilt.cdn_number.unwrap_or(0), rebuilt.key, rebuilt.digest, rebuilt.size),
+            (pointer.attachment_identifier, pointer.cdn_number.unwrap_or(0), pointer.key, pointer.digest, pointer.size)
+        );
+    }
 }
 
 #[test]

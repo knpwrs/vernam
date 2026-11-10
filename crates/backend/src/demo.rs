@@ -1559,11 +1559,20 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     emit(Event::PinsChanged(m.conversation_id));
                 }
             }
-            Command::EditMessage { message_id, body, mentions, styles } => {
+            Command::EditMessage { message_id, body, mentions, styles, preview } => {
                 let (body, spans, styles) = demo_mentions(&db, body.trim_end(), &mentions, &styles).await;
+                let Ok(Some(original)) = db.message(message_id).await else { continue };
+                // shortcut: a new preview's image isn't saved in the demo.
+                let preview = preview.filter(|p| crate::link_preview::is_valid(&body, &p.url)).map(|draft| {
+                    match original.link_preview.clone().filter(|p| p.url == draft.url) {
+                        Some(kept) => kept,
+                        None => LinkPreview { url: draft.url, title: Some(draft.title), description: draft.description, date: draft.date, image: None },
+                    }
+                });
                 if db.edit_message(message_id, &body, next_sent_at()).await.is_ok()
                     && db.set_mentions(message_id, &spans).await.is_ok()
                     && db.set_styles(message_id, &styles).await.is_ok()
+                    && db.set_link_preview(message_id, preview.as_ref()).await.is_ok()
                     && let Ok(Some(m)) = db.message(message_id).await
                 {
                     emit(Event::MessageChanged { conversation: m.conversation_id, message_id });

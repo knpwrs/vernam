@@ -1030,6 +1030,31 @@ pub fn remote_of(pointer: &AttachmentPointer) -> Option<signal_store::RemoteAtta
     })
 }
 
+/// A pointer to a file still on the transit tier, rebuilt from what
+/// [`remote_of`] kept, to send again without uploading it.
+pub fn pointer_from_remote(meta: &AttachmentMeta) -> Option<AttachmentPointer> {
+    use attachment_pointer::AttachmentIdentifier;
+    let remote = meta.remote.as_ref()?;
+    let cdn_key = remote.cdn_key.clone()?;
+    // CDN 0 names files by number.
+    let identifier = match remote.cdn {
+        0 => AttachmentIdentifier::CdnId(cdn_key.parse().ok()?),
+        _ => AttachmentIdentifier::CdnKey(cdn_key),
+    };
+    Some(AttachmentPointer {
+        attachment_identifier: Some(identifier),
+        cdn_number: Some(remote.cdn),
+        key: Some(hex::decode(&remote.key).ok()?),
+        digest: Some(hex::decode(remote.digest.as_ref()?).ok()?),
+        content_type: Some(meta.content_type.clone()),
+        // Unknown (0) would break the download's unpadding.
+        size: Some(u32::try_from(meta.size).ok().filter(|s| *s > 0)?),
+        width: meta.width,
+        height: meta.height,
+        ..Default::default()
+    })
+}
+
 /// Body text for a data message: its text, or a sticker's emoji or a
 /// poll's question.
 fn body_text(dm: &DataMessage) -> String {
