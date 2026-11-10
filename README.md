@@ -19,7 +19,7 @@ It stays small as you use it:
 
 The goal is to do what Signal Desktop does, the way it does it. When behavior is in question, the answer comes from reading Desktop's source, and the code cites the file it follows. That covers the everyday things (messages, replies, reactions, edits, deletes, mentions, formatting, stickers, GIFs, link previews, voice messages, disappearing messages, pins, groups) and the less visible ones:
 
-- **Voice and video calls**, 1:1 and in groups, with screen sharing, through RingRTC, the calling library Desktop uses.
+- **Voice and video calls**, 1:1 and in groups, with screen sharing (macOS only for now), through RingRTC, the calling library Desktop uses.
 - **Stories**: viewing, posting text, photo and video stories, replies, and story privacy from your phone.
 - **Message history when linking**: like Desktop's "link and sync", your phone sends your history, which is downloaded, decrypted and imported.
 - **Sync with your other devices**: pins, archived, muted and unread chats, blocks, hidden stories and settings go through Signal's Storage Service, editing only the fields that changed and keeping the ones this client doesn't know.
@@ -45,7 +45,7 @@ Where Signal's server turns features on or sets limits through remote config, th
 | `crates/emoji` | The emoji table and search index, generated at build time from emojibase |
 | `vendor/` | presage and libsignal-service-rs with the changes this app needs, such as receiving and sending stories (`vendor/README.md`) |
 
-## Running
+## Running - macOS
 
 Building needs `cmake` (BoringSSL, for contact discovery) and `protoc` (RingRTC and libsignal's `spqr`), and GIFs and video posters need `ffmpeg`: `brew install cmake ffmpeg`, then `mise install` for the `protoc` pinned in `mise.toml`. mise's `protoc` is the upstream release binary; Homebrew's links Homebrew's abseil and stops starting when abseil upgrades ahead of it. The first build downloads Signal's prebuilt WebRTC (about 28 MB) into `target/webrtc`.
 
@@ -61,6 +61,22 @@ Each account's data is in `accounts/<id>/` in the data directory, beside the app
 macOS only shows notifications, and only grants camera and microphone access, to an app bundle. `cargo run` runs the app from `target/<profile>/Vernam.app`; for a build you start yourself, `scripts/bundle.sh` makes the bundle. `mise run bundle` does both: it builds release and makes `target/release/Vernam.app`.
 
 GIF search needs your own Giphy API key (free at developers.giphy.com), pasted in the GIFs tab or set as `GIPHY_API_KEY`. Signal Desktop's key belongs to Signal, so it isn't used here.
+
+## Running - Linux
+
+Building requires podman installed, no additional tools. Playing media needs ffmpeg at run time (`sudo apt install ffmpeg`).
+
+```bash
+./build-linux.sh
+./target/linux/release/vernam
+```
+
+If you'd like to use the firejail profile for additional isolation:
+
+```bash
+./scripts/install-firejail.sh    # installs to ~/.local/bin; rerun after each build
+vernam                           # jailed; so are the app menu and sgnl:// links
+```
 
 ## Tests
 

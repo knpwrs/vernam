@@ -6,8 +6,14 @@
 pub struct Ringtone {
     #[cfg(target_os = "macos")]
     sound: objc2::rc::Retained<objc2_app_kit::NSSound>,
+    /// Kept for its drop: dropping it stops the sound. (The lint can't see
+    /// that a drop is the point.)
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    player: rodio::Player,
 }
 
+#[cfg(not(all(target_os = "linux", test)))]
 const RINGTONE: &[u8] = include_bytes!("../assets/sounds/ringtone.m4a");
 
 impl Ringtone {
@@ -27,10 +33,46 @@ impl Ringtone {
             sound.play();
             Some(Self { sound })
         }
-        #[cfg(all(not(target_os = "macos"), not(test)))]
+        #[cfg(all(target_os = "linux", not(test)))]
         {
-            let _ = RINGTONE;
-            None
+            use std::num::NonZero;
+            use std::sync::Mutex;
+
+            use rodio::source::Source as _;
+            // Decoded once, then looped through the device. A failed decode
+            // isn't kept, as with the device.
+            static SAMPLES: Mutex<Option<&'static (Vec<f32>, u16, u32)>> = Mutex::new(None);
+            let decoded = {
+                let mut samples = SAMPLES.lock().unwrap_or_else(|e| e.into_inner());
+                match *samples {
+                    Some(decoded) => Some(decoded),
+                    None => {
+                        match crate::audio::linux::with_temp_file("ringtone", RINGTONE, crate::audio::linux::decode_for_playback) {
+                            Ok(Ok(decoded)) => {
+                                *samples = Some(&*Box::leak(Box::new(decoded)));
+                                *samples
+                            }
+                            _ => None,
+                        }
+                    }
+                }
+            };
+            let (samples, channels, rate) = decoded?;
+            let device = crate::audio::linux::device().ok()?;
+            let source = rodio::static_buffer::StaticSamplesBuffer::new(
+                NonZero::new(*channels).unwrap(),
+                NonZero::new(*rate).unwrap(),
+                samples,
+            )
+            .repeat_infinite();
+            let uniform = rodio::source::UniformSourceIterator::new(
+                source,
+                device.config().channel_count(),
+                device.config().sample_rate(),
+            );
+            let player = rodio::Player::connect_new(device.mixer());
+            player.append(uniform);
+            Some(Self { player })
         }
     }
 }
@@ -39,6 +81,7 @@ impl Drop for Ringtone {
     fn drop(&mut self) {
         #[cfg(target_os = "macos")]
         self.sound.stop();
+        // Linux's player stops in its own drop.
     }
 }
 

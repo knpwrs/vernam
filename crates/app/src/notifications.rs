@@ -69,7 +69,6 @@ pub struct Notification<'a> {
     pub id: &'a str,
     pub conversation: &'a ConversationId,
     pub title: &'a str,
-    pub subtitle: Option<&'a str>,
     pub body: &'a str,
     /// With the system's sound (Desktop's "Push notification sounds").
     pub sound: bool,
@@ -149,10 +148,13 @@ pub fn route(action: NotificationAction) -> (Option<String>, NotificationAction)
 #[cfg(target_os = "macos")]
 pub use macos::Notifier;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+pub use linux::Notifier;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub struct Notifier;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 impl Notifier {
     pub fn start(_actions: mpsc::UnboundedSender<NotificationAction>) -> Option<Self> {
         None
@@ -301,9 +303,6 @@ mod macos {
         pub fn post(&self, notification: &Notification) {
             let content = UNMutableNotificationContent::new();
             content.setTitle(&NSString::from_str(notification.title));
-            if let Some(subtitle) = notification.subtitle {
-                content.setSubtitle(&NSString::from_str(subtitle));
-            }
             content.setBody(&NSString::from_str(notification.body));
             // Groups a chat's notifications, and tells actions which chat.
             content.setThreadIdentifier(&NSString::from_str(&notification.conversation.0));
@@ -332,6 +331,296 @@ mod macos {
         pub fn set_badge(&self, count: usize) {
             self.center.setBadgeCount_withCompletionHandler(count as isize, None);
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use futures::StreamExt as _;
+    use zbus::zvariant::Variant as Value;
+
+    use super::*;
+
+    /// The daemon's names, per `org.freedesktop.Notifications`.
+    const SERVICE: &str = "org.freedesktop.Notifications";
+    const PATH: &str = "/org/freedesktop/Notifications";
+
+    /// What a reply may carry: a send beyond Signal's own limit fails
+    /// anyway, and a buggy daemon shouldn't push unbounded text through.
+    const MAX_REPLY_CHARS: usize = 4096;
+
+    /// Where the signal thread (called by the daemon) sends what was done.
+    static ACTIONS: OnceLock<mpsc::UnboundedSender<NotificationAction>> = OnceLock::new();
+
+    /// What the daemon assigns, and what it names: the notification id it
+    /// gave back, and the chat it's about, which its actions need. (And
+    /// whether it offers replies in the notification, KDE's do.)
+    struct Shared {
+        ids: Mutex<HashMap<String, u32>>,
+        conversations: Mutex<HashMap<u32, ConversationId>>,
+        inline_reply: bool,
+    }
+
+    /// A call to make at the daemon, ferried to the send thread: its
+    /// callers run on the interface's main thread, which must not block
+    /// on a daemon that can be slow or hung.
+    enum Out {
+        Post {
+            id: String,
+            conversation: ConversationId,
+            title: String,
+            body: String,
+            sound: bool,
+        },
+        Remove(Vec<String>),
+        Badge(usize),
+    }
+
+    pub struct Notifier {
+        out: mpsc::UnboundedSender<Out>,
+    }
+
+    impl Notifier {
+        /// Joins the session bus and its notification daemon, and listens
+        /// for what the user does. `None` without a bus or a daemon, where
+        /// nothing can notify.
+        pub fn start(actions: mpsc::UnboundedSender<NotificationAction>) -> Option<Self> {
+            let Ok(connection) = futures::executor::block_on(zbus::Connection::session()) else {
+                tracing::info!("no session bus, notifications are off");
+                return None;
+            };
+            let capabilities: Vec<String> = match futures::executor::block_on(connection.call_method(
+                Some(SERVICE),
+                PATH,
+                Some(SERVICE),
+                "GetCapabilities",
+                &(),
+            )) {
+                Ok(reply) => reply.body().deserialize::<Vec<String>>().unwrap_or_default(),
+                Err(_) => {
+                    tracing::info!("no notification daemon, notifications are off");
+                    return None;
+                }
+            };
+            let _ = ACTIONS.set(actions);
+            let shared = Arc::new(Shared {
+                ids: Mutex::new(HashMap::new()),
+                conversations: Mutex::new(HashMap::new()),
+                inline_reply: capabilities.iter().any(|capability| capability == "inline-reply"),
+            });
+            let rule = zbus::MatchRule::builder()
+                .msg_type(zbus::message::Type::Signal)
+                .sender(SERVICE)
+                .interface(SERVICE)
+                .build()
+                .expect("the rule's names are valid");
+            let stream_connection = connection.clone();
+            let stream_shared = shared.clone();
+            let listen = std::thread::Builder::new().name("notifications".into()).spawn(move || {
+                // The stream ends when the daemon stops (a restart, an
+                // update): listen again, rather than miss every action from
+                // then on.
+                loop {
+                    let listening = futures::executor::block_on(async {
+                        let Ok(mut stream) = zbus::MessageStream::for_match_rule(rule.clone(), &stream_connection, None).await
+                        else {
+                            return false;
+                        };
+                        while let Some(message) = stream.next().await {
+                            let Ok(message) = message else { break };
+                            let header = message.header();
+                            let Some(member) = header.member() else { continue };
+                            if member == "ActionInvoked" {
+                                act(&stream_shared, &message);
+                            } else if member == "NotificationReplied" {
+                                if let Ok((id, text)) = message.body().deserialize::<(u32, String)>() {
+                                    replied(&stream_shared, id, text);
+                                }
+                            } else if member == "NotificationClosed" {
+                                if let Ok((id, _reason)) = message.body().deserialize::<(u32, u32)>() {
+                                    forget(&stream_shared, id);
+                                }
+                            }
+                        }
+                        true
+                    });
+                    if listening {
+                        tracing::warn!("the notification daemon's signals stopped; listening again");
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            });
+            // If the thread couldn't start, nothing listens; notifications
+            // still show, but acts go nowhere. (Like macOS's refusal path.)
+            if listen.is_err() {
+                return None;
+            }
+            let (out, mut out_rx) = mpsc::unbounded::<Out>();
+            let send_connection = connection.clone();
+            let send_shared = shared.clone();
+            let send = std::thread::Builder::new().name("notify-send".into()).spawn(move || {
+                futures::executor::block_on(async {
+                    while let Some(op) = out_rx.next().await {
+                        match op {
+                            Out::Post { id, conversation, title, body, sound } => {
+                                daemon_post(&send_connection, &send_shared, &id, conversation, &title, &body, sound)
+                            }
+                            Out::Remove(ids) => daemon_close(&send_connection, &send_shared, &ids),
+                            Out::Badge(count) => daemon_badge(&send_connection, count),
+                        }
+                    }
+                })
+            });
+            // Without it nothing reaches the daemon; notifications are off.
+            if send.is_err() {
+                return None;
+            }
+            Some(Self { out })
+        }
+
+        pub fn post(&self, notification: &Notification) {
+            let _ = self.out.unbounded_send(Out::Post {
+                id: notification.id.to_owned(),
+                conversation: notification.conversation.clone(),
+                title: notification.title.to_owned(),
+                body: notification.body.to_owned(),
+                sound: notification.sound,
+            });
+        }
+
+        /// Takes notifications for messages that have been read off screen.
+        pub fn remove(&self, ids: &[String]) {
+            if ids.is_empty() {
+                return;
+            }
+            let _ = self.out.unbounded_send(Out::Remove(ids.to_owned()));
+        }
+
+        /// The unread count, for shells with Unity's launcher API (GNOME
+        /// and KDE extensions read it); best effort, as most have none.
+        pub fn set_badge(&self, count: usize) {
+            let _ = self.out.unbounded_send(Out::Badge(count));
+        }
+    }
+
+    /// Posts one notification, and keeps what the daemon assigned so its
+    /// actions can find the chat and a later `remove` can close it.
+    fn daemon_post(connection: &zbus::Connection, shared: &Shared, id: &str, conversation: ConversationId, title: &str, body: &str, sound: bool) {
+        let mut acts = vec!["default", "Show", "mark-read", "Mark as Read"];
+        if shared.inline_reply {
+            acts.extend(["inline-reply", "Reply"]);
+        }
+        let mut hints: HashMap<&str, Value> = HashMap::new();
+        hints.insert("category", Value::from("im.received"));
+        hints.insert("desktop-entry", Value::from(crate::linux::APP_ID));
+        if sound {
+            hints.insert("sound-name", Value::from("message-new-instant"));
+        }
+        let replaces = shared.ids.lock().unwrap_or_else(|e| e.into_inner()).get(id).copied().unwrap_or(0);
+        let call = (
+            "Vernam",
+            replaces,
+            crate::linux::APP_ID,
+            title,
+            body,
+            acts.as_slice(),
+            hints,
+            -1i32,
+        );
+        match futures::executor::block_on(connection.call_method(Some(SERVICE), PATH, Some(SERVICE), "Notify", &call)) {
+            Ok(reply) => {
+                if let Ok(assigned) = reply.body().deserialize::<u32>() {
+                    shared.ids.lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_owned(), assigned);
+                    shared
+                        .conversations
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(assigned, conversation);
+                }
+            }
+            // Missed notifications are silent, as on macOS.
+            Err(_) => {}
+        }
+    }
+
+    /// Closes the daemon's notifications for messages read off screen. The
+    /// ids are looked up here, on the send thread: a `remove` is enqueued
+    /// after its `post`, so what `post` assigned is already in place.
+    fn daemon_close(connection: &zbus::Connection, shared: &Shared, ids: &[String]) {
+        for id in ids {
+            let assigned = shared.ids.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+            let Some(assigned) = assigned else { continue };
+            let _ = futures::executor::block_on(connection.call_method(
+                Some(SERVICE),
+                PATH,
+                Some(SERVICE),
+                "CloseNotification",
+                &(assigned,),
+            ));
+        }
+    }
+
+    /// The unread count, for shells with Unity's launcher API (GNOME and
+    /// KDE extensions read it); best effort, as most have none.
+    fn daemon_badge(connection: &zbus::Connection, count: usize) {
+        let hints: HashMap<&str, Value> =
+            HashMap::from([("count", Value::from(count as i64)), ("count-visible", Value::from(count > 0))]);
+        let _ = futures::executor::block_on(connection.emit_signal(
+            None::<&str>,
+            "/",
+            "com.canonical.Unity.LauncherEntry",
+            "Update",
+            &(format!("application://{}.desktop", crate::linux::APP_ID), hints),
+        ));
+    }
+
+    /// What the user did with a notification.
+    fn act(shared: &Shared, message: &zbus::Message) {
+        let Ok((id, action)) = message.body().deserialize::<(u32, String)>() else { return };
+        let Some(conversation) = conversation(shared, id) else { return };
+        let action = match action.as_str() {
+            "default" => Some(NotificationAction::Open(conversation)),
+            "mark-read" => Some(NotificationAction::MarkRead(conversation)),
+            _ => None,
+        };
+        send(action);
+    }
+
+    /// Plasma's inline reply arrives as its own targeted signal carrying
+    /// the text, not as a third `ActionInvoked` argument (libnotificationmanager's
+    /// `server_p.cpp` sendReplyText).
+    fn replied(shared: &Shared, id: u32, text: String) {
+        if text.trim().is_empty() {
+            return;
+        }
+        let Some(conversation) = conversation(shared, id) else { return };
+        let text = text.chars().take(MAX_REPLY_CHARS).collect::<String>();
+        send(Some(NotificationAction::Reply(conversation, text)));
+    }
+
+    fn conversation(shared: &Shared, id: u32) -> Option<ConversationId> {
+        // A daemon that restarted hands its old ids to other apps'
+        // notifications; only what it assigned to us (and hasn't closed)
+        // may answer.
+        if !shared.ids.lock().unwrap_or_else(|e| e.into_inner()).values().any(|assigned| *assigned == id) {
+            return None;
+        }
+        shared.conversations.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned()
+    }
+
+    fn send(action: Option<NotificationAction>) {
+        if let (Some(action), Some(actions)) = (action, ACTIONS.get()) {
+            let _ = actions.unbounded_send(action);
+        }
+    }
+
+    /// Forgets a notification that closed (dismissed, or taken by `remove`).
+    fn forget(shared: &Shared, id: u32) {
+        shared.conversations.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+        shared.ids.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, assigned| *assigned != id);
     }
 }
 

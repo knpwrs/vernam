@@ -14,8 +14,9 @@ const MAX_SECONDS: u32 = 15;
 const MAX_FPS: f32 = 30.;
 
 /// `ffmpeg`/`ffprobe`, also where Homebrew puts them (an app started from
-/// Finder doesn't get the shell's PATH).
-fn tool(name: &str) -> PathBuf {
+/// Finder doesn't get the shell's PATH). The audio and video players use
+/// the same tools (see audio.rs).
+pub(crate) fn tool(name: &str) -> PathBuf {
     ["/opt/homebrew/bin", "/usr/local/bin"]
         .iter()
         .map(|dir| Path::new(dir).join(name))
@@ -23,10 +24,22 @@ fn tool(name: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(name))
 }
 
-/// Width, height and frame rate of the first video stream.
-fn probe(path: &Path) -> anyhow::Result<(u32, u32, f32)> {
+/// Width, height and frame rate of the first video stream, as displayed:
+/// a phone filmed sideways names its coded size turned (a display
+/// matrix), and the decoders turn it out that way. The video player
+/// shares it (video_player.rs).
+pub(crate) fn probe(path: &Path) -> anyhow::Result<(u32, u32, f32)> {
     let output = Command::new(tool("ffprobe"))
-        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,avg_frame_rate", "-of", "csv=p=0"])
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,avg_frame_rate:stream_side_data=rotation",
+            "-of",
+            "json",
+        ])
         .arg(path)
         .output()
         .context("running ffprobe (install ffmpeg: brew install ffmpeg)")?;
@@ -36,11 +49,46 @@ fn probe(path: &Path) -> anyhow::Result<(u32, u32, f32)> {
     parse_probe(&String::from_utf8_lossy(&output.stdout))
 }
 
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct Probe {
+    streams: Vec<Stream>,
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct Stream {
+    width: u32,
+    height: u32,
+    avg_frame_rate: String,
+    side_data_list: Vec<SideData>,
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct SideData {
+    /// Degrees clockwise (ffprobe's); 90 and 270 turn the video on
+    /// screen. Older ffprobes name no `stream_side_data` section at all,
+    /// which reads as none: the video is then taken at its coded size,
+    /// as before.
+    rotation: Option<f64>,
+}
+
 fn parse_probe(text: &str) -> anyhow::Result<(u32, u32, f32)> {
-    let mut parts = text.trim().split(',');
-    let width: u32 = parts.next().context("no width")?.trim().parse()?;
-    let height: u32 = parts.next().context("no height")?.trim().parse()?;
-    let rate = parts.next().unwrap_or("25/1").trim();
+    let probe: Probe = serde_json::from_str(text).context("reading ffprobe's answer")?;
+    let stream = probe.streams.first().context("no video stream")?;
+    let (mut width, mut height) = (stream.width, stream.height);
+    if stream
+        .side_data_list
+        .iter()
+        .any(|side| side.rotation.is_some_and(|rotation| rotation.rem_euclid(180.) != 0.))
+    {
+        // A quarter turn is shown sideways: the decoder's frames (it
+        // applies the matrix) are coded size turned, so name the turned
+        // size.
+        std::mem::swap(&mut width, &mut height);
+    }
+    let rate = stream.avg_frame_rate.trim();
     let fps = match rate.split_once('/') {
         Some((n, d)) => n.parse::<f32>().unwrap_or(25.) / d.parse::<f32>().unwrap_or(1.).max(1.),
         None => rate.parse().unwrap_or(25.),
@@ -149,13 +197,92 @@ mod tests {
 
     #[test]
     fn probe_output_and_sizes() {
-        assert_eq!(parse_probe("480,270,30000/1001\n").unwrap().0, 480);
-        assert!((parse_probe("480,270,30000/1001").unwrap().2 - 29.97).abs() < 0.01);
-        assert_eq!(parse_probe("100,50,0/0").unwrap().2, 25.);
-        assert!(parse_probe("").is_err());
+        let (width, height, fps) = parse_probe(
+            r#"{
+                "programs": [],
+                "stream_groups": [],
+                "streams": [{"width": 480, "height": 270, "avg_frame_rate": "30000/1001"}]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!((width, height), (480, 270));
+        assert!((fps - 29.97).abs() < 0.01);
+        let (_, _, fps) = parse_probe(r#"{"streams": [{"width": 100, "height": 50, "avg_frame_rate": "0/0"}]}"#).unwrap();
+        assert_eq!(fps, 25.);
+        assert!(parse_probe(r#"{"streams": []}"#).is_err());
+        assert!(parse_probe("not json").is_err());
+        // A quarter-turn display matrix names the shown size.
+        let (width, height, _) = parse_probe(
+            r#"{"streams": [{"width": 64, "height": 128, "avg_frame_rate": "10/1",
+                              "side_data_list": [{"rotation": 90}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!((width, height), (128, 64));
+        let (width, height, _) = parse_probe(
+            r#"{"streams": [{"width": 64, "height": 128, "avg_frame_rate": "10/1",
+                              "side_data_list": [{"rotation": -90}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!((width, height), (128, 64));
+        let (width, height, _) = parse_probe(
+            r#"{"streams": [{"width": 64, "height": 128, "avg_frame_rate": "10/1",
+                              "side_data_list": [{"rotation": 180}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!((width, height), (64, 128), "a half turn keeps the size");
+        // Side data about something else isn't a turn.
+        let (width, height, _) = parse_probe(
+            r#"{"streams": [{"width": 64, "height": 128, "avg_frame_rate": "10/1",
+                              "side_data_list": [{"side_data_type": "Spherical"}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!((width, height), (64, 128));
         assert_eq!(output_size(480, 270, 300), (300, 168));
         assert_eq!(output_size(201, 101, 400), (200, 100));
         assert_eq!(output_size(2, 20_000, 300), (2, 1200), "tall videos are capped");
+    }
+
+    /// Needs ffmpeg installed. A clip that says "show me turned a quarter
+    /// way" is probed as shown, and decoded at the shown size (the decoder
+    /// applies the matrix itself).
+    #[test]
+    fn a_sideways_clip_is_probed_and_decoded_as_shown() {
+        if std::process::Command::new(tool("ffmpeg")).arg("-version").output().is_err() {
+            eprintln!("skipping: no ffmpeg");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let straight = dir.path().join("straight.mp4");
+        let made = Command::new(tool("ffmpeg"))
+            .args(["-v", "error", "-f", "lavfi", "-i", "testsrc2=size=64x128:rate=10:duration=1"])
+            .args(["-c:v", "mpeg4", "-q:v", "2", "-y"])
+            .arg(&straight)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if !made.is_ok_and(|s| s.success()) {
+            eprintln!("skipping: the test clip didn't encode");
+            return;
+        }
+        // The rotation is metadata beside the coded frames (`-display_rotation`
+        // is an input option, and copying it writes the matrix, not turned
+        // frames).
+        let clip = dir.path().join("sideways.mp4");
+        let made = Command::new(tool("ffmpeg"))
+            .args(["-v", "error", "-display_rotation", "90", "-i"])
+            .arg(&straight)
+            .args(["-c", "copy", "-y"])
+            .arg(&clip)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if !made.is_ok_and(|s| s.success()) {
+            eprintln!("skipping: the display matrix didn't copy");
+            return;
+        }
+        assert_eq!(probe(&clip).map(|(width, height, _)| (width, height)).unwrap(), (128, 64));
+        let image = decode_loop(&clip, 160).unwrap();
+        assert_eq!((image.size(0).width.0, image.size(0).height.0), (128, 64));
     }
 
     /// Needs ffmpeg installed.

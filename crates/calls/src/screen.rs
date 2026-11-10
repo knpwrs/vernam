@@ -2,8 +2,6 @@
 //! ScreenCaptureKit, sent in place of the camera. macOS asks for screen
 //! recording access the first time.
 
-use ringrtc::webrtc::media::{VideoFrame, VideoPixelFormat, VideoSource};
-
 use crate::FrameSlot;
 
 /// Something to share.
@@ -16,12 +14,16 @@ pub struct ShareSource {
 }
 
 /// How wide a shared frame may be (taller screens keep their shape).
+#[cfg(any(target_os = "macos", test))]
 const MAX_WIDTH: u32 = 1920;
 /// Frames per second; screens change slowly, as Desktop assumes.
+#[cfg(target_os = "macos")]
 const FPS: i32 = 15;
 
 #[cfg(target_os = "macos")]
 mod imp {
+    use ringrtc::webrtc::media::{VideoFrame, VideoPixelFormat, VideoSource};
+
     use screencapturekit::cm::CMSampleBufferExt as _;
     use screencapturekit::cv::CVPixelBufferLockFlags;
     use screencapturekit::prelude::*;
@@ -137,6 +139,8 @@ mod imp {
 
 #[cfg(not(target_os = "macos"))]
 mod imp {
+    use ringrtc::webrtc::media::VideoSource;
+
     use super::*;
 
     pub fn sources() -> anyhow::Result<Vec<ShareSource>> {
@@ -155,6 +159,7 @@ mod imp {
 pub use imp::{Share, sources};
 
 /// At most `MAX_WIDTH` wide, keeping the shape; even sizes, as encoders like.
+#[cfg(any(target_os = "macos", test))]
 fn fit(width: u32, height: u32) -> (u32, u32) {
     let scale = (MAX_WIDTH as f64 / width.max(1) as f64).min(1.);
     let even = |v: f64| ((v as u32) & !1).max(2);

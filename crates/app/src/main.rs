@@ -73,14 +73,331 @@ fn other_vernam_running() -> bool {
 }
 
 fn device_name() -> String {
-    let host = std::process::Command::new("scutil")
-        .args(["--get", "ComputerName"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty());
-    host.unwrap_or_else(|| "Vernam".into())
+    #[cfg(target_os = "macos")]
+    {
+        let host = std::process::Command::new("scutil")
+            .args(["--get", "ComputerName"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        host.unwrap_or_else(|| "Vernam".into())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::device_name().unwrap_or_else(|| "Vernam".into())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        "Vernam".into()
+    }
+}
+
+/// Linux's pieces of what macOS gets from its bundle: the machine's name,
+/// one Vernam at a time with its links, and a place on the desktop.
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::io::AsRawFd as _;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::PathBuf;
+
+    use futures::channel::mpsc;
+
+    /// The window's app id (`main_window`), what wayland's shells and X11's
+    /// WM_CLASS name, and the icon and desktop file are named for. The
+    /// notifier names it too, as the desktop-entry hint and Unity's badge
+    /// target.
+    pub(crate) const APP_ID: &str = "io.github.knpwrs.vernam";
+
+    /// The machine's name, as the user sees it: logind's pretty name if it
+    /// has one, else `/etc/hostname` (`scutil --get ComputerName`).
+    pub fn device_name() -> Option<String> {
+        let pretty = std::fs::read_to_string("/etc/machine-info").ok().and_then(|info| {
+            info.lines()
+                .find_map(|line| line.strip_prefix("PRETTY_HOSTNAME="))
+                .map(|name| name.trim_matches('"').trim().to_owned())
+                .filter(|name| !name.is_empty())
+        });
+        pretty.or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|host| host.trim().to_owned())
+                .filter(|host| !host.is_empty())
+        })
+    }
+
+    /// The socket the running Vernam reads `sgnl://` links on, one per
+    /// user and data directory, in the directory: two Vernams with
+    /// different data directories (a development profile beside the real
+    /// account) run side by side, as they do on macOS. In the directory,
+    /// not `/run/user`, so the hand-off crosses mount namespaces: a
+    /// firejail'd instance shares only the whitelisted directory with
+    /// the unjailed launcher a desktop link runs. The uid in the name
+    /// keeps the path distinct when a directory is ever shared between
+    /// users.
+    pub(crate) fn socket_path(data_dir: &std::path::Path) -> Option<PathBuf> {
+        // FNV-1a, not DefaultHasher: the name must match across builds (an
+        // update relaunching beside the old instance), and std doesn't
+        // promise to keep DefaultHasher's algorithm.
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for byte in data_dir.as_os_str().as_bytes() {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+        }
+        Some(data_dir.join(format!("vernam-{}-{hash:016x}.links", unsafe { libc::getuid() })))
+    }
+
+    /// Hands `sgnl://` links to the Vernam of the same data directory
+    /// that's already running, and returns true if there was one (this
+    /// launch then quits, as Desktop's `requestSingleInstanceLock` ends a
+    /// second instance). Otherwise this one listens for later launches'
+    /// links, feeding `tx`, and returns false.
+    pub fn hand_off(data_dir: &std::path::Path, links: &[String], tx: mpsc::UnboundedSender<String>) -> bool {
+        match socket_path(data_dir).map(|socket| hand_off_at(&socket, links, tx)) {
+            Some(handed) => handed,
+            None => false,
+        }
+    }
+
+    pub(crate) fn hand_off_at(
+        socket: &std::path::Path,
+        links: &[String],
+        tx: mpsc::UnboundedSender<String>,
+    ) -> bool {
+        let uid = unsafe { libc::getuid() };
+        // Only a listener of this user takes the links: the data
+        // directory is wherever the user pointed the app at, and the
+        // links carry linking secrets.
+        let take = |stream: UnixStream| peer_uid(&stream) == Some(uid) && send_links(stream, links);
+        if let Ok(stream) = UnixStream::connect(socket) {
+            if take(stream) {
+                return true;
+            }
+            // It went away between connecting and writing (or isn't ours to
+            // write to); carry on here.
+        }
+        match UnixListener::bind(socket) {
+            Ok(listener) => listen_for_links(socket, listener, tx),
+            Err(first_error) => {
+                // The path is taken: either a Vernam bound it just now
+                // (simultaneous launches) or a crash left its socket
+                // behind. Wait for whoever bound it to listen, then hand
+                // off to it.
+                for _ in 0..5 {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    match UnixStream::connect(socket) {
+                        Ok(stream) => {
+                            if take(stream) {
+                                return true;
+                            }
+                            // It answered but died mid-hand-off (or isn't
+                            // ours); its path is free now.
+                            break;
+                        }
+                        // Nothing listens behind the path: whoever bound it
+                        // never got to listening (a bind is followed by a
+                        // listen within microseconds, and this retry began
+                        // a hundred milliseconds after it). Stale, and the
+                        // way in.
+                        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => break,
+                        // The path isn't there yet (a launch still starting):
+                        // wait for it.
+                        Err(_) => {}
+                    }
+                }
+                // Nothing answered: the socket is stale, and the way in.
+                let _ = std::fs::remove_file(socket);
+                match UnixListener::bind(socket) {
+                    Ok(listener) => listen_for_links(socket, listener, tx),
+                    Err(error) => {
+                        // One data directory can't have two instances (the
+                        // store queues its writes for one connection), so
+                        // this launch refuses rather than become a second
+                        // one.
+                        tracing::error!(
+                            "can't listen for sgnl:// links on {}: {error} (first try: {first_error}); is another Vernam starting?",
+                            socket.display()
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+    }
+
+    fn listen_for_links(socket: &std::path::Path, listener: UnixListener, tx: mpsc::UnboundedSender<String>) -> bool {
+        // The socket can live in a world-readable directory (the temp_dir
+        // fallback), so keep it private and check who connects: only this
+        // user's launches hand over links.
+        let _ = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600));
+        tracing::info!("listening for sgnl:// links on {}", socket.display());
+        let uid = unsafe { libc::getuid() };
+        let _ = std::thread::Builder::new().name("links".into()).spawn(move || {
+            for stream in listener.incoming().flatten() {
+                if peer_uid(&stream) != Some(uid) {
+                    tracing::warn!("ignored a link hand-off from another user's process");
+                    continue;
+                }
+                // One thread per launch, so a stalled client can't hold up
+                // the ones after it.
+                let tx = tx.clone();
+                let _ = std::thread::Builder::new().name("link".into()).spawn(move || {
+                    // Links are short; the cap only bounds what one client
+                    // can make the reader hold.
+                    for link in std::io::BufReader::new(stream.take(64 * 1024)).lines().map_while(Result::ok) {
+                        if link.starts_with("sgnl:") {
+                            tracing::info!("a link came in from another launch");
+                            let _ = tx.unbounded_send(link);
+                        }
+                    }
+                });
+            }
+        });
+        false
+    }
+
+    fn send_links(mut stream: UnixStream, links: &[String]) -> bool {
+        for link in links {
+            if writeln!(stream, "{link}").is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The connecting process's user, via SO_PEERCRED.
+    pub(crate) fn peer_uid(stream: &UnixStream) -> Option<u32> {
+        let mut credentials = libc::ucred { pid: 0, uid: u32::MAX, gid: u32::MAX };
+        let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let ok = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut credentials as *mut libc::ucred).cast(),
+                &mut length,
+            )
+        } == 0;
+        ok.then_some(credentials.uid)
+    }
+
+    /// Registers Vernam with the desktop, as `sgnl://` handler and with an
+    /// icon: what the macOS bundle's Info.plist and its icon do, what a
+    /// packaged install would ship. Best effort, written every launch so
+    /// an update takes.
+    pub fn register_desktop() {
+        // Never from a development build: its Exec would point at
+        // `target/debug`, taking the installed app's sgnl:// links (and
+        // autostart, through the desktop entry) away from it.
+        if cfg!(debug_assertions) {
+            tracing::info!("a development build registers no desktop entry");
+            return;
+        }
+        let Ok(exe) = std::env::current_exe() else { return };
+        let Some(data_dir) = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        else {
+            return;
+        };
+        let entry = data_dir.join("applications").join(format!("{APP_ID}.desktop"));
+        let desktop = format!(
+            "[Desktop Entry]\nType=Application\nName=Vernam\nComment=Unofficial Signal client\nExec=\"{}\" %U\n\
+             StartupWMClass={APP_ID}\nIcon={APP_ID}\nMimeType=x-scheme-handler/sgnl;\nTerminal=false\n\
+             Categories=Network;InstantMessaging;\n",
+            exe.display()
+        );
+        if std::fs::create_dir_all(entry.parent().expect("a file in a directory"))
+            .and_then(|_| std::fs::write(&entry, desktop))
+            .is_err()
+        {
+            tracing::warn!("couldn't write {}", entry.display());
+            return;
+        }
+        for (size, bytes) in [
+            ("16x16", include_bytes!("../assets/app-icon/16x16.png") as &[u8]),
+            ("24x24", include_bytes!("../assets/app-icon/24x24.png")),
+            ("32x32", include_bytes!("../assets/app-icon/32x32.png")),
+            ("48x48", include_bytes!("../assets/app-icon/48x48.png")),
+            ("64x64", include_bytes!("../assets/app-icon/64x64.png")),
+            ("256x256", include_bytes!("../assets/app-icon/256x256.png")),
+            ("512x512", include_bytes!("../assets/app-icon/512x512.png")),
+        ] {
+            let icon = data_dir.join("icons/hicolor").join(size).join("apps").join(format!("{APP_ID}.png"));
+            if std::fs::create_dir_all(icon.parent().expect("a file in a directory"))
+                .and_then(|_| std::fs::write(&icon, bytes))
+                .is_err()
+            {
+                tracing::warn!("couldn't write {}", icon.display());
+            }
+        }
+        // `xdg-mime` merges the handler into the user's mimeapps.list;
+        // without it (or xdg-utils), the desktop file still registers.
+        let _ = std::process::Command::new("xdg-mime")
+            .args(["default", &format!("{APP_ID}.desktop"), "x-scheme-handler/sgnl"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::linux;
+    use futures::StreamExt as _;
+
+    /// The second launch hands its links to the one listening.
+    #[test]
+    fn a_second_launch_hands_its_links_over() {
+        let socket = std::env::temp_dir().join(format!("vernam-links-test-{}", std::process::id()));
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        assert!(!linux::hand_off_at(&socket, &[], tx), "the first launch listens");
+        let (tx2, _) = futures::channel::mpsc::unbounded();
+        let link = "sgnl://link.signal.me/#/settings".to_owned();
+        assert!(linux::hand_off_at(&socket, &[link.clone()], tx2), "the second hands over");
+        assert_eq!(futures::executor::block_on(rx.next()), Some(link));
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    /// A connection carries the connecting process's user, which is what
+    /// the hand-off listener checks before reading its links.
+    #[test]
+    fn a_connection_carries_the_connecting_processs_user() {
+        use std::os::unix::net::UnixStream;
+        let (_ours, theirs) = UnixStream::pair().unwrap();
+        assert_eq!(linux::peer_uid(&theirs), Some(unsafe { libc::getuid() }));
+    }
+
+    /// A socket left by a crash doesn't block: it's cleared and this
+    /// launch listens in its place, and the next launch hands over.
+    #[test]
+    fn a_stale_socket_does_not_block_the_launch() {
+        use std::os::unix::net::UnixListener;
+        let socket = std::env::temp_dir().join(format!("vernam-links-test-stale-{}", std::process::id()));
+        drop(UnixListener::bind(&socket).unwrap());
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        assert!(!linux::hand_off_at(&socket, &[], tx), "the launch listens on the cleared path");
+        let (tx2, _) = futures::channel::mpsc::unbounded();
+        let link = "sgnl://link.signal.me/#/settings".to_owned();
+        assert!(linux::hand_off_at(&socket, &[link.clone()], tx2), "the next launch hands over");
+        assert_eq!(futures::executor::block_on(rx.next()), Some(link));
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    /// The hand-off socket is per data directory, not per user: a
+    /// development profile beside the real account runs side by side.
+    #[test]
+    fn the_socket_is_per_data_directory() {
+        let one = linux::socket_path(std::path::Path::new("/tmp/one")).unwrap();
+        let one_again = linux::socket_path(std::path::Path::new("/tmp/one")).unwrap();
+        let two = linux::socket_path(std::path::Path::new("/tmp/two")).unwrap();
+        assert_eq!(one, one_again, "a data directory keeps its socket");
+        assert_ne!(one, two, "different data directories don't hand off to each other");
+        assert!(one.starts_with("/tmp/one"), "the socket lives in its data directory");
+    }
 }
 
 /// How many days of logs are kept.
@@ -162,6 +479,24 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
     let _log_guard = init_logging(&data_dir);
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting");
+
+    // Links the system opens us with (`sgnl://`: registered in the macOS
+    // bundle's Info.plist by scripts/bundle.sh, and on Linux in the desktop
+    // file `register_desktop` writes), handed to the app once it runs.
+    let (link_tx, mut links) = futures::channel::mpsc::unbounded::<String>();
+    // Linux: one Vernam at a time, and a place on the desktop.
+    #[cfg(target_os = "linux")]
+    {
+        let from_argv = std::env::args().skip(1).filter(|arg| arg.starts_with("sgnl:")).collect::<Vec<_>>();
+        if linux::hand_off(&data_dir, &from_argv, link_tx.clone()) {
+            return Ok(());
+        }
+        for link in from_argv {
+            let _ = link_tx.unbounded_send(link);
+        }
+        linux::register_desktop();
+    }
+
     // From an earlier launch that moved the data but didn't get its key.
     let mut moved_from = match key_store {
         keys::KeyStore::System => former_name::moved_from(&data_dir),
@@ -209,9 +544,6 @@ fn main() -> Result<()> {
         call_lines: Default::default(),
     };
 
-    // Links macOS opens us with (`sgnl://`, registered in the bundle's
-    // Info.plist by scripts/bundle.sh), handed to the app once it runs.
-    let (link_tx, mut links) = futures::channel::mpsc::unbounded::<String>();
     let app = gpui_kit::application().with_assets(assets::Assets);
     app.on_open_urls(move |urls| {
         for url in urls {

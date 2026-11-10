@@ -134,7 +134,13 @@ pub fn adopt_layout(root: &Path, running: impl FnOnce() -> bool) -> Result<Regis
         .with_context(|| format!("reading {}", root.display()))?
         .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
         .collect::<std::io::Result<_>>()?;
-    leftovers.retain(|name| !APP_FILES.contains(&name.as_str()) && !name.starts_with(REGISTRY));
+    leftovers.retain(|name| {
+        // The hand-off socket, which this launch bound at startup, stays
+        // at the top with the app's own files.
+        !(name.starts_with("vernam-") && name.ends_with(".links"))
+            && !APP_FILES.contains(&name.as_str())
+            && !name.starts_with(REGISTRY)
+    });
     // The rest, then the journals, then the databases.
     leftovers.sort_by_key(|name| (DATABASES.contains(&name.as_str()), DATABASES.iter().any(|db| name.starts_with(db))));
     let entry = match registry.accounts.iter().find(|entry| entry.legacy) {
@@ -687,6 +693,8 @@ pub(crate) mod tests {
         for name in ["app.db", "signal.db", "db.key", "window.json", "moved-from"] {
             std::fs::write(root.join(name), name).unwrap();
         }
+        // A launch binds its hand-off socket before the move runs.
+        std::fs::write(root.join("vernam-1000-0123456789abcdef.links"), "").unwrap();
         let registry = adopt_layout(root, || false).unwrap();
         let [entry] = &registry.accounts[..] else { panic!("{registry:?}") };
         assert!(entry.legacy && entry.linked, "never cancelled from the link screen");
@@ -700,6 +708,9 @@ pub(crate) mod tests {
         // The app's own stay.
         assert!(root.join("logs").is_dir() && root.join("window.json").exists());
         assert!(!dir.join("logs").exists());
+        // The hand-off socket stays at the top: this launch is listening on it.
+        assert!(root.join("vernam-1000-0123456789abcdef.links").exists());
+        assert!(!dir.join("vernam-1000-0123456789abcdef.links").exists());
         // Again: nothing to do, the same account.
         assert_eq!(adopt_layout(root, || false).unwrap(), registry);
         assert_eq!(load(root).unwrap(), registry);

@@ -58,7 +58,52 @@ mod system {
     }
 }
 
-#[cfg(all(not(target_os = "macos"), not(test)))]
+/// Open at login is a file in `~/.config/autostart`, per the freedesktop
+/// autostart standard (what GNOME, KDE and friends read).
+#[cfg(all(target_os = "linux", not(test)))]
+mod system {
+    use std::path::PathBuf;
+
+    /// The autostart entry, named for the app like the desktop file that
+    /// registers it (`main.rs`).
+    fn file() -> Option<PathBuf> {
+        let config = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+        Some(config.join("autostart").join("vernam.desktop"))
+    }
+
+    /// The entry is the setting: whatever the system says, as on macOS.
+    pub fn is_enabled() -> bool {
+        file().map(|file| file.exists()).unwrap_or(false)
+    }
+
+    pub fn set(on: bool) -> Result<(), String> {
+        // Never from a development build: its Exec would point at
+        // `target/debug` (as `register_desktop`'s entry would in main.rs).
+        if on && cfg!(debug_assertions) {
+            return Err("Vernam doesn't open at login from a development build.".into());
+        }
+        let Some(file) = file() else {
+            return Err("Vernam doesn't know where your configuration lives.".into());
+        };
+        if !on {
+            return match std::fs::remove_file(&file) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(format!("couldn't remove {file:?}: {error}")),
+            };
+        }
+        if let Some(directory) = file.parent() {
+            std::fs::create_dir_all(directory).map_err(|error| format!("couldn't create {directory:?}: {error}"))?;
+        }
+        let exe = std::env::current_exe().map_err(|_| "Vernam doesn't know where it runs from.".to_string())?;
+        let entry = format!("[Desktop Entry]\nType=Application\nName=Vernam\nExec=\"{}\"\n", exe.display());
+        std::fs::write(&file, entry).map_err(|error| format!("couldn't write {file:?}: {error}"))
+    }
+}
+
+#[cfg(all(not(any(target_os = "macos", target_os = "linux")), not(test)))]
 mod system {
     pub fn is_enabled() -> bool {
         false
