@@ -1750,12 +1750,13 @@ impl Actor {
                         }
                         for (index, pointer) in downloadable.into_iter().filter(|_| !held) {
                             let sent_at = message.sent_at;
+                            let sticker = message.attachments.get(index).is_some_and(|a| a.sticker);
                             let this = self.clone();
                             let manager = manager.clone();
                             let conversation = conversation.clone();
                             self.spawn_auto_download(async move {
                                 if !this.has_file(id, sent_at, catch_up::File::Attachment(index)).await {
-                                    this.download(&manager, conversation, id, sent_at, index, &pointer).await
+                                    this.download(&manager, conversation, id, sent_at, index, &pointer, sticker).await
                                 }
                             });
                         }
@@ -5742,11 +5743,12 @@ impl Actor {
             Ok(None) => return self.error("attachment unavailable", "original message not found"),
             Err(error) => return self.error("attachment unavailable", error),
         };
+        let sticker = message.attachments.get(index).is_some_and(|a| a.sticker);
         let pointer = data_message_of(&content.body).and_then(|dm| mapping::normal_attachments(dm).nth(index).cloned());
         let Some(pointer) = pointer else {
             return self.error("attachment unavailable", "no such attachment");
         };
-        self.download(&manager, message.conversation_id, message_id, message.sent_at, index, &pointer).await;
+        self.download(&manager, message.conversation_id, message_id, message.sent_at, index, &pointer, sticker).await;
     }
 
     /// Notes that a message's whole text came as an attachment, and
@@ -5901,10 +5903,11 @@ impl Actor {
         sent_at: i64,
         index: usize,
         pointer: &AttachmentPointer,
+        sticker: bool,
     ) {
         // Too big to receive: left undownloaded, as Desktop leaves it.
         let size = pointer.size.map_or(0, u64::from);
-        if crate::remote_config().too_big_to_receive(size) {
+        if crate::remote_config().attachment_too_big_to_receive(size, sticker) {
             return info!(size, "not downloading an attachment over the receive limit");
         }
         let bytes = match manager.get_attachment(pointer).await {
@@ -6061,7 +6064,7 @@ impl Actor {
         meta: &AttachmentMeta,
     ) -> anyhow::Result<()> {
         let remote = meta.remote.as_ref().context("no locator")?;
-        if crate::remote_config().too_big_to_receive(meta.size) {
+        if crate::remote_config().attachment_too_big_to_receive(meta.size, meta.sticker) {
             anyhow::bail!("it's over Signal's receive limit");
         }
         let bytes = self.remote_bytes(manager, remote, meta.size).await?;

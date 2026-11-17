@@ -1819,12 +1819,12 @@ impl<S: Store> Manager<S, Registered> {
     ) -> Result<StickerPackManifest, Error<S::Error>> {
         let mut unidentified_websocket = self.unidentified_websocket().await?;
         let key = derive_key(pack_key)?;
-        let mut ciphertext = Vec::new();
-        unidentified_websocket
-            .get_sticker_pack_manifest(&hex::encode(pack_id))
-            .await?
-            .read_to_end(&mut ciphertext)
-            .await?;
+        let mut ciphertext = read_sticker_cdn(
+            unidentified_websocket
+                .get_sticker_pack_manifest(&hex::encode(pack_id))
+                .await?,
+        )
+        .await?;
         decrypt_in_place(key, &mut ciphertext)?;
         Ok(libsignal_service::proto::Pack::decode(ciphertext.as_slice())
             .map_err(ProvisioningError::from)?
@@ -2229,13 +2229,13 @@ async fn download_sticker_pack<C: ContentsStore>(
     let pack_id = operation.pack_id();
     let key = derive_key(pack_key)?;
 
-    let mut ciphertext = Vec::new();
-
-    let size_bytes = unidentified_websocket
-        .get_sticker_pack_manifest(&hex::encode(pack_id))
-        .await?
-        .read_to_end(&mut ciphertext)
-        .await?;
+    let mut ciphertext = read_sticker_cdn(
+        unidentified_websocket
+            .get_sticker_pack_manifest(&hex::encode(pack_id))
+            .await?,
+    )
+    .await?;
+    let size_bytes = ciphertext.len();
 
     trace!(size_bytes, "downloaded encrypted sticker pack manifest");
 
@@ -2279,17 +2279,41 @@ async fn download_sticker<C: ContentsStore>(
 ) -> Result<Vec<u8>, Error<C::ContentsStoreError>> {
     let key = derive_key(pack_key)?;
 
-    let mut sticker_stream = unidentified_websocket
+    let sticker_stream = unidentified_websocket
         .get_sticker(&hex::encode(pack_id), sticker_id)
         .await?;
 
-    let mut ciphertext = Vec::new();
-    let size_bytes = sticker_stream.read_to_end(&mut ciphertext).await?;
+    let mut ciphertext = read_sticker_cdn(sticker_stream).await?;
+    let size_bytes = ciphertext.len();
 
     trace!(size_bytes, "downloaded encrypted sticker");
 
     decrypt_in_place(key, &mut ciphertext)?;
 
+    Ok(ciphertext)
+}
+
+/// The most a sticker or a sticker pack's manifest may be, encrypted
+/// (Signal Desktop's `MAX_STICKER_CIPHERTEXT_BYTE_LENGTH` and
+/// `MAX_STICKER_PACK_MANIFEST_CIPHERTEXT_BYTE_LENGTH`, 1 MiB each).
+const MAX_STICKER_CDN_BYTES: u64 = 1024 * 1024;
+
+/// Reads a response from the sticker CDN, failing once it's over
+/// [`MAX_STICKER_CDN_BYTES`] rather than reading all of it.
+async fn read_sticker_cdn(
+    stream: impl futures::io::AsyncRead + Unpin,
+) -> Result<Vec<u8>, std::io::Error> {
+    let mut ciphertext = Vec::new();
+    stream
+        .take(MAX_STICKER_CDN_BYTES + 1)
+        .read_to_end(&mut ciphertext)
+        .await?;
+    if ciphertext.len() as u64 > MAX_STICKER_CDN_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("sticker CDN response over {MAX_STICKER_CDN_BYTES} bytes"),
+        ));
+    }
     Ok(ciphertext)
 }
 
@@ -2615,5 +2639,21 @@ fn log_if_slow(step: &str, started: std::time::Instant) {
     let elapsed = started.elapsed();
     if elapsed >= std::time::Duration::from_millis(250) {
         warn!(elapsed_ms = elapsed.as_millis(), "slow receive step: {step}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_sticker_cdn, MAX_STICKER_CDN_BYTES};
+
+    #[test]
+    fn sticker_cdn_reads_stop_past_a_mebibyte() {
+        let read = |len: u64| {
+            futures::executor::block_on(read_sticker_cdn(futures::io::Cursor::new(vec![7u8; len as usize])))
+        };
+        assert_eq!(read(10).unwrap().len(), 10);
+        assert_eq!(read(MAX_STICKER_CDN_BYTES).unwrap().len() as u64, MAX_STICKER_CDN_BYTES);
+        let error = read(MAX_STICKER_CDN_BYTES + 1).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 }

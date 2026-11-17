@@ -2433,6 +2433,8 @@ impl ConversationView {
                     // sticker's pack, ts/state/ducks/lightbox.preload.ts).
                     // In select mode the row's click picks the message instead.
                     let (sticker_message, pack) = (message.id, sticker.sticker_pack.clone());
+                    let max_receive = self.state.read(cx).remote_config().attachment_max_receive_bytes();
+                    let too_big = too_big(sticker, max_receive);
                     div()
                         .id(SharedString::from(format!("sticker-{}", message.id)))
                         .debug_selector(move || format!("sticker-{sticker_message}"))
@@ -2447,8 +2449,24 @@ impl ConversationView {
                                 .h(px(h))
                                 .object_fit(gpui_kit::ObjectFit::Contain)
                                 .into_any_element(),
-                            // Not downloaded yet.
-                            None => div().size(px(STICKER_SIZE)).rounded_lg().bg(palette.bubble_in).into_any_element(),
+                            // Not downloaded yet, or too big to be.
+                            None => div()
+                                .size(px(STICKER_SIZE))
+                                .rounded_lg()
+                                .bg(palette.bubble_in)
+                                .when(too_big, |d| {
+                                    d.flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .p_2()
+                                        .text_center()
+                                        .text_sm()
+                                        .italic()
+                                        .text_color(palette.text_secondary)
+                                        .debug_selector(move || format!("too-big-{sticker_message}"))
+                                        .child("Attachment too large to display.")
+                                })
+                                .into_any_element(),
                         })
                 })
                 .when_some(meta, |d, m| d.child(m))
@@ -5436,6 +5454,8 @@ fn open_pin_dialog(state: Entity<AppState>, message_id: i64, pinned: usize, disa
 /// `max`: the account's limit (`attachment_max_receive_bytes`), which the
 /// padded, encrypted size is compared with (Desktop's `isAttachmentTooLarge`).
 fn too_big(attachment: &AttachmentMeta, max: u64) -> bool {
+    // A sticker has Desktop's own, smaller limit too.
+    let max = if attachment.sticker { max.min(signal_backend::remote_config::MAX_STICKER_BYTES) } else { max };
     attachment.local_path.is_none() && signal_backend::remote_config::too_large(attachment.size, max)
 }
 
@@ -5979,6 +5999,34 @@ mod tests {
         let mut reacted = older.clone();
         reacted.reactions.push(signal_store::Reaction { emoji: "😂".into(), author: None, sent_at: 1_500 });
         assert!(!super::same_group(&reacted, &newer), "the reacted message ends its group");
+    }
+
+    /// A sticker is too big over 1 MiB once padded and encrypted (Desktop's
+    /// `MAX_STICKER_CIPHERTEXT_BYTE_LENGTH`), other attachments only over the
+    /// receive limit; nothing downloaded is.
+    #[test]
+    fn a_sticker_has_its_own_size_limit() {
+        let attachment = |size, sticker| AttachmentMeta {
+            content_type: "image/webp".into(),
+            file_name: None,
+            size,
+            width: None,
+            height: None,
+            local_path: None,
+            sticker,
+            gif: false,
+            voice: false,
+            remote: None,
+            thumbnail_path: None,
+            sticker_pack: None,
+            transcode: false,
+        };
+        let max = 125 * 1024 * 1024;
+        assert!(!super::too_big(&attachment(900 * 1024, true), max));
+        assert!(super::too_big(&attachment(1024 * 1024 - 1, true), max));
+        assert!(!super::too_big(&attachment(1024 * 1024 - 1, false), max));
+        let downloaded = AttachmentMeta { local_path: Some("/tmp/x.webp".into()), ..attachment(2 * 1024 * 1024, true) };
+        assert!(!super::too_big(&downloaded, max));
     }
 
     /// A sticker can be favorited from its message once the message kept

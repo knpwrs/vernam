@@ -30,6 +30,14 @@ pub(crate) const SETTING_CONFIG: &str = "remote_config";
 pub(crate) const SETTING_ETAG: &str = "remote_config.etag";
 
 const MIB: u64 = 1024 * 1024;
+
+/// The most a sticker, or a sticker pack's manifest, may be once encrypted
+/// (Desktop's `MAX_STICKER_CIPHERTEXT_BYTE_LENGTH` and
+/// `MAX_STICKER_PACK_MANIFEST_CIPHERTEXT_BYTE_LENGTH` in
+/// `ts/types/AttachmentSize.std.ts`): a sticker message's image over it
+/// isn't downloaded. (Vendored presage has the same limit for the sticker
+/// CDN, `MAX_STICKER_CDN_BYTES`.)
+pub const MAX_STICKER_BYTES: u64 = MIB;
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// The remote config: every key the server turned on, with its value.
@@ -233,6 +241,12 @@ impl RemoteConfig {
     /// over `attachment_max_receive_bytes`).
     pub fn too_big_to_receive(&self, size: u64) -> bool {
         too_large(size, self.attachment_max_receive_bytes())
+    }
+
+    /// The same for a message's attachment, where a sticker also has
+    /// Desktop's own limit ([`MAX_STICKER_BYTES`]).
+    pub fn attachment_too_big_to_receive(&self, size: u64, sticker: bool) -> bool {
+        self.too_big_to_receive(size) || (sticker && too_large(size, MAX_STICKER_BYTES))
     }
 
     /// Members a group should have at most (`global.groupsv2.maxGroupSize`;
@@ -443,6 +457,11 @@ mod tests {
         assert!(!empty.auto_downloads(200 * MIB - 1));
         assert!(!empty.too_big_to_receive(119 * MIB));
         assert!(empty.too_big_to_receive(125 * MIB - 1));
+        // A sticker has its own 1 MiB limit, also padded and encrypted.
+        assert!(!empty.attachment_too_big_to_receive(900 * 1024, true));
+        assert!(empty.attachment_too_big_to_receive(MIB - 1, true));
+        assert!(!empty.attachment_too_big_to_receive(MIB - 1, false));
+        assert!(empty.attachment_too_big_to_receive(125 * MIB - 1, false));
     }
 
     #[test]
