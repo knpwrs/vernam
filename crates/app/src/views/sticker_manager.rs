@@ -12,12 +12,18 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{Disableable as _, Sizable as _, WindowExt as _};
 use gpui_kit::prelude::*;
-use gpui_kit::{AnyElement, App, Entity, FontWeight, SharedString, TestSupportExt as _, Window, div, img, px};
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use gpui_kit::{
+    Anchor, AnyElement, App, Entity, FontWeight, SharedString, TestSupportExt as _, Window, anchored, deferred, div, img, px,
+};
 use signal_backend::Command;
 use signal_backend::stickers::StickerPackSummary;
 
 use crate::state::{AppState, StickerPreview};
 use crate::theme::Palette;
+use crate::views::common::ClosedByClick;
 
 /// Desktop's manager tabs (`StickerManagerTabType`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -232,10 +238,133 @@ pub fn open(state: Entity<AppState>, window: &mut Window, cx: &mut App) {
     });
 }
 
+/// Which of the preview's stickers has its details open, and the click
+/// that closed them.
+#[derive(Default)]
+struct Detail {
+    open: Option<u32>,
+    closed_by: ClosedByClick,
+}
+
+/// One sticker of the preview. With `stickerFavorites` on, a click shows
+/// its details above it (Desktop's `StickerButton` popover, commit 4cbe353):
+/// the sticker large, the pack's title and author, and "Remove from
+/// Favorites" for a favorite or "Add to Favorites" when the pack is
+/// installed, either of which closes them.
+fn preview_sticker(
+    state: &Entity<AppState>,
+    pack: &StickerPackSummary,
+    sticker: &signal_backend::StickerView,
+    detail: &Rc<RefCell<Detail>>,
+    palette: Palette,
+    cx: &App,
+) -> AnyElement {
+    let image = |size: f32| img(sticker.path.clone()).size(px(size)).object_fit(gpui_kit::ObjectFit::Contain);
+    let app = state.read(cx);
+    if !app.remote_config().sticker_favorites() {
+        return image(72.).into_any_element();
+    }
+    let id = sticker.id;
+    let open = detail.borrow().open == Some(id);
+    let favorite = app.favorite_sticker_ids.contains(&(pack.id.clone(), id));
+    let action = if favorite {
+        Some(("Remove from Favorites", IconName::StarOff))
+    } else {
+        pack.installed.then_some(("Add to Favorites", IconName::Star))
+    };
+    let toggle = {
+        let detail = detail.clone();
+        move |click: &gpui_kit::ClickEvent, window: &mut Window, _: &mut App| {
+            let mut detail = detail.borrow_mut();
+            if detail.closed_by.take(click) {
+                return;
+            }
+            detail.open = if detail.open == Some(id) { None } else { Some(id) };
+            window.refresh();
+        }
+    };
+    let card = || {
+        let close = detail.clone();
+        div()
+            .id(SharedString::from(format!("sticker-detail-{id}")))
+            .debug_selector(move || format!("sticker-detail-{id}"))
+            // The card is the sticker's child: a click in it isn't one on
+            // the sticker, which would open it again.
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .w(px(296.))
+            .p_2()
+            .flex()
+            .flex_col()
+            .items_center()
+            .rounded_3xl()
+            .shadow_lg()
+            .bg(palette.popover)
+            .on_mouse_down_out(move |event, window, _| {
+                let mut detail = close.borrow_mut();
+                detail.closed_by.record(event);
+                detail.open = None;
+                window.refresh();
+            })
+            .child(image(256.))
+            .child(
+                div()
+                    .mt_1()
+                    .mb_3p5()
+                    .text_sm()
+                    .text_color(palette.text_secondary)
+                    .child(format!("{}\u{a0}·\u{a0}{}", pack.title, pack.author)),
+            )
+            .children(action.map(|(label, icon)| {
+                let (state, detail) = (state.clone(), detail.clone());
+                let (pack_id, pack_key) = (pack.id.clone(), pack.key.clone());
+                Button::new(SharedString::from(format!("sticker-detail-favorite-{id}")))
+                    .label(label)
+                    .icon(icon)
+                    .ghost()
+                    .w_full()
+                    .on_click(move |_, window, cx| {
+                        state.read(cx).send(Command::SetStickerFavorite {
+                            pack_id: pack_id.clone(),
+                            pack_key: pack_key.clone(),
+                            sticker_id: id,
+                            favorite: !favorite,
+                        });
+                        detail.borrow_mut().open = None;
+                        window.refresh();
+                    })
+            }))
+    };
+    div()
+        .id(SharedString::from(format!("sticker-preview-sticker-{id}")))
+        .debug_selector(move || format!("sticker-preview-sticker-{id}"))
+        .relative()
+        .rounded_2xl()
+        .cursor_pointer()
+        .when(open, |d| d.bg(palette.row_hover))
+        .on_click(toggle)
+        .child(image(72.))
+        .when(open, |d| {
+            // Desktop's popover: above the sticker, 11px off it.
+            d.child(div().absolute().top_0().left(px(36.)).child(
+                deferred(
+                    anchored()
+                        .anchor(Anchor::BottomCenter)
+                        .offset(gpui_kit::point(px(0.), px(-11.)))
+                        .snap_to_window_with_margin(px(8.))
+                        .child(card()),
+                )
+                // Over the dialog it's in, as the kit's own popups are.
+                .with_priority(gpui_kit::base::POPUP_PRIORITY),
+            ))
+        })
+        .into_any_element()
+}
+
 /// Desktop's `StickerPreviewModal` for the pack `AppState::open_sticker_pack`
 /// opened: loading, the error, or the pack with Link, Remove and Add
 /// Stickers.
 pub fn open_preview(state: Entity<AppState>, window: &mut Window, cx: &mut App) {
+    let detail = Rc::new(RefCell::new(Detail::default()));
     window.open_dialog(cx, move |dialog, _, cx| {
         let palette = Palette::get(cx);
         let preview = state.read(cx).sticker_preview.clone();
@@ -289,9 +418,9 @@ pub fn open_preview(state: Entity<AppState>, window: &mut Window, cx: &mut App) 
                             .children(remove),
                     )
                     .child(div().id("sticker-preview-grid").max_h(px(320.)).overflow_y_scroll().child(
-                        div().flex().flex_wrap().gap_2().justify_center().children(preview.stickers.iter().map(|sticker| {
-                            img(sticker.path.clone()).size(px(72.)).object_fit(gpui_kit::ObjectFit::Contain)
-                        })),
+                        div().flex().flex_wrap().gap_2().justify_center().children(
+                            preview.stickers.iter().map(|sticker| preview_sticker(&state, &pack, sticker, &detail, palette, cx)),
+                        ),
                     ));
                 let install = (!pack.installed).then(|| {
                     let (state, pack) = (state.clone(), pack.clone());
@@ -310,7 +439,7 @@ mod tests {
     use gpui_kit::TestAppContext;
 
     use super::*;
-    use crate::views::test_support::{demo, press, shows, wait};
+    use crate::views::test_support::{click_at, demo, press, shows, wait};
 
     #[gpui_kit::test]
     fn the_manager_installs_a_shared_pack_and_its_preview_opens(cx: &mut TestAppContext) {
@@ -338,5 +467,68 @@ mod tests {
         wait(&mut cx, "the preview", &mut |cx| shows(cx, "sticker-preview"));
         let Some(StickerPreview::Ready(preview)) = cx.read(|cx| state.read(cx).sticker_preview.clone()) else { panic!() };
         assert_eq!((preview.stickers.len(), preview.pack.installed), (4, true));
+    }
+
+    #[gpui_kit::test]
+    fn a_preview_sticker_opens_its_details_to_favorite_it(cx: &mut TestAppContext) {
+        let (_backend, state, mut cx, _dir) = demo(cx);
+        state.read_with(&cx, |s, _| {
+            s.send(Command::LoadStickers);
+            s.send(Command::LoadStickerManager);
+        });
+        wait(&mut cx, "the demo's packs and config", &mut |cx| {
+            cx.read(|cx| {
+                let s = state.read(cx);
+                s.sticker_packs.len() == 1 && s.sticker_manager.is_some() && s.remote_config().sticker_favorites()
+            })
+        });
+        let (shapes, garden) = cx.read(|cx| {
+            let s = state.read(cx);
+            let received = &s.sticker_manager.as_ref().unwrap().received;
+            (s.sticker_packs[0].clone(), received.iter().find(|p| !p.installed).unwrap().clone())
+        });
+
+        // Demo shapes is installed: its first sticker can be favorited.
+        // (Opened as a manager row does; the demo's pack ids are too short
+        // for a link.)
+        cx.update(|window, cx| {
+            state.update(cx, |s, cx| s.open_sticker_pack(shapes.id.clone(), shapes.key.clone(), cx));
+            open_preview(state.clone(), window, cx);
+        });
+        wait(&mut cx, "the preview", &mut |cx| shows(cx, "sticker-preview"));
+        let Some(StickerPreview::Ready(preview)) = cx.read(|cx| state.read(cx).sticker_preview.clone()) else { panic!() };
+        assert_eq!(preview.stickers[0].id, 0);
+        assert!(!shows(&mut cx, "sticker-detail-0"));
+        click_at(&mut cx, "sticker-preview-sticker-0");
+        assert!(shows(&mut cx, "sticker-detail-0"));
+        press(&mut cx, "sticker-detail-favorite-0");
+        wait(&mut cx, "the favorite", &mut |cx| {
+            cx.read(|cx| state.read(cx).favorite_sticker_ids.contains(&(shapes.id.clone(), 0)))
+        });
+        // Favoriting closed the details; opened again, they offer removing it.
+        assert!(!shows(&mut cx, "sticker-detail-0"));
+        click_at(&mut cx, "sticker-preview-sticker-0");
+        assert!(shows(&mut cx, "sticker-detail-0"));
+        press(&mut cx, "sticker-detail-favorite-0");
+        wait(&mut cx, "the unfavorite", &mut |cx| {
+            cx.read(|cx| !state.read(cx).favorite_sticker_ids.contains(&(shapes.id.clone(), 0)))
+        });
+
+        // Garden dots isn't installed: its details offer nothing to do.
+        cx.update(|window, cx| {
+            window.close_all_dialogs(cx);
+            state.update(cx, |s, cx| s.open_sticker_pack(garden.id.clone(), garden.key.clone(), cx));
+            open_preview(state.clone(), window, cx);
+        });
+        wait(&mut cx, "the other preview", &mut |cx| {
+            cx.read(|cx| matches!(&state.read(cx).sticker_preview, Some(StickerPreview::Ready(p)) if !p.pack.installed))
+        });
+        click_at(&mut cx, "sticker-preview-sticker-0");
+        assert!(shows(&mut cx, "sticker-detail-0"));
+        cx.update(|window, cx| {
+            use gpui_kit::test::TestWindowExt as _;
+            window.render_frame(cx);
+            assert!(window.try_find("sticker-detail-favorite-0").is_none());
+        });
     }
 }

@@ -124,8 +124,10 @@ impl Actor {
                 Ok(Favorited::Added(added)) => Some(added),
                 Ok(Favorited::Already) => None,
                 Ok(Favorited::Full) => {
+                    // Desktop's toast (`StickerFavoritesTooMany`, commit d465a37).
                     let limit = signal_store::FAVORITE_STICKER_LIMIT;
-                    return self.error("couldn't add the sticker to your favorites", format!("you have {limit} favorites already"));
+                    warn!(limit, "not favoriting a sticker: at the limit");
+                    return self.emit(Event::Error(format!("You can only add {limit} stickers to Favorites")));
                 }
                 Err(error) => return self.error("failed to save the favorite sticker", error),
             }
