@@ -27,7 +27,6 @@ made-up config; the fetch hasn't been run against Signal's server.
 | `retireAccessKeyGroupSend` | Group sends with group send endorsements instead of access keys. | Always on: group messages go with a sender key and a `Group-Send-Token`, and one by one without endorsements. See "Sender keys" below. |
 | `sendMessageViaLibsignal` | Sending through libsignal's network stack. | Not applicable. |
 | `keyTransparency` | Key transparency checks in safety numbers. | Follows `desktop.keyTransparency.prod`. See "Key transparency" below. |
-| `localBackups` | Local (on-disk) backups. | Not applicable. |
 | `disappearingCalls` | Call notices follow the chat's disappearing timer. | Done, always on: a call's notice takes the chat's timer and counts down once it's seen and the call is over (`signal_store::call_history`). |
 | `remoteMute.send` | Muting someone in a group call. | Done, always on (`Command::RemoteMute`). |
 
