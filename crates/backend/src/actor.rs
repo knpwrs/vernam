@@ -917,9 +917,22 @@ impl Actor {
             }
             // Transferred view-once messages may be old enough to erase.
             self.view_once_expiry.notify_one();
+            // Installed sticker packs, then favorite stickers: shown, and
+            // those from packs that aren't installed downloaded (Desktop's
+            // `createPacksFromBackup`), once the packs are in so their
+            // favorites aren't fetched one by one as well.
             let packs = std::mem::take(&mut imported.sticker_packs);
-            if !packs.is_empty() {
-                tokio::task::spawn_local(self.clone().install_sticker_packs(manager.clone(), packs));
+            let favorites = imported.favorite_stickers > 0;
+            if !packs.is_empty() || favorites {
+                let (this, manager) = (self.clone(), manager.clone());
+                tokio::task::spawn_local(async move {
+                    if !packs.is_empty() {
+                        this.clone().install_sticker_packs(manager, packs).await;
+                    }
+                    if favorites {
+                        this.favorite_stickers_changed().await;
+                    }
+                });
             }
             let downloads = std::mem::take(&mut imported.downloads);
             if !downloads.is_empty() {

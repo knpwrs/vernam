@@ -197,6 +197,57 @@ pub fn merge_favorites(
     merge
 }
 
+/// Favorites from a transferred backup, added to `local` as Desktop's
+/// `#fromFavoriteStickerList` (`ts/services/backups/import.preload.ts`)
+/// adds them: each as a favorite Storage Service already has (not to be
+/// written), skipped when there's a record of that sticker here already
+/// (Desktop's insert fails) or no pack key, and none past
+/// [`FAVORITE_STICKER_LIMIT`].
+pub fn import_favorites(local: &mut Vec<FavoriteSticker>, imported: &[RemoteFavoriteSticker]) -> FavoriteImport {
+    let mut active = local.iter().filter(|f| f.is_active()).count();
+    let mut import = FavoriteImport::default();
+    for record in imported {
+        let Some(key) = record.pack_key.clone() else {
+            import.keyless += 1;
+            continue;
+        };
+        if local.iter().any(|f| f.is(&record.pack_id, record.sticker_id)) {
+            import.already += 1;
+            continue;
+        }
+        if active >= FAVORITE_STICKER_LIMIT {
+            import.over_limit += 1;
+            continue;
+        }
+        local.push(FavoriteSticker {
+            pack_id: record.pack_id.clone(),
+            sticker_id: record.sticker_id,
+            pack_key: Some(key),
+            favorited_at: Some(record.favorited_at),
+            deleted_at: None,
+            needs_sync: false,
+            emoji: None,
+            path: None,
+        });
+        active += 1;
+        import.added += 1;
+    }
+    sort(local);
+    import
+}
+
+/// What [`import_favorites`] did with each favorite.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FavoriteImport {
+    pub added: usize,
+    /// A record of that sticker was here already.
+    pub already: usize,
+    /// Past [`FAVORITE_STICKER_LIMIT`].
+    pub over_limit: usize,
+    /// Without a pack key.
+    pub keyless: usize,
+}
+
 /// Newest favorite first, then tombstones.
 fn sort(favorites: &mut [FavoriteSticker]) {
     favorites.sort_by(|a, b| {
@@ -290,6 +341,11 @@ impl AppDb {
     /// Storage Service's favorites, merged (see [`merge_favorites`]).
     pub async fn merge_storage_favorites(&self, remote: &[RemoteFavoriteSticker], drop_before: i64) -> Result<FavoriteMerge> {
         self.edit_favorites(|favorites| merge_favorites(favorites, remote, drop_before)).await
+    }
+
+    /// A transferred backup's favorites (see [`import_favorites`]).
+    pub async fn import_favorite_stickers(&self, imported: &[RemoteFavoriteSticker]) -> Result<FavoriteImport> {
+        self.edit_favorites(|favorites| import_favorites(favorites, imported)).await
     }
 
     /// `written` (as it was then) is in Storage Service: no longer pending,
@@ -399,5 +455,33 @@ mod tests {
         assert_eq!((merge.rejected, local.len()), (1, FAVORITE_STICKER_LIMIT));
         assert!(local.iter().any(|f| f.pack_id == "bb" && f.needs_sync));
         assert!(!local.iter().any(|f| f.pack_id == "aa" && f.sticker_id == FAVORITE_STICKER_LIMIT as u32 - 1));
+    }
+
+    #[test]
+    fn a_backups_favorites_are_added_as_already_written() {
+        // A favorite and a tombstone here; the backup names both again, one
+        // without a key, and two new ones.
+        let tombstone = FavoriteSticker { pack_key: None, favorited_at: None, deleted_at: Some(5), ..favorite("aa", 2, 0) };
+        let mut local = vec![favorite("aa", 1, 10), tombstone.clone()];
+        let keyless = RemoteFavoriteSticker { pack_key: None, ..remote("cc", 1, 40, 0) };
+        let records = [remote("aa", 1, 99, 0), remote("aa", 2, 99, 0), keyless, remote("bb", 1, 30, 0), remote("bb", 2, 20, 0)];
+        let import = import_favorites(&mut local, &records);
+        assert_eq!(import, FavoriteImport { added: 2, already: 2, over_limit: 0, keyless: 1 });
+        let ids: Vec<_> = local.iter().map(|f| (f.pack_id.as_str(), f.sticker_id, f.favorited_at, f.needs_sync)).collect();
+        assert_eq!(
+            ids,
+            [("bb", 1, Some(30), false), ("bb", 2, Some(20), false), ("aa", 1, Some(10), false), ("aa", 2, None, false)]
+        );
+        assert_eq!(local[3], tombstone);
+    }
+
+    #[test]
+    fn a_backups_favorites_stop_at_the_limit() {
+        let mut local: Vec<_> = (0..FAVORITE_STICKER_LIMIT as u32 - 2).map(|i| favorite("aa", i, 1)).collect();
+        let records: Vec<_> = (0..5).map(|i| remote("bb", i, 2, 0)).collect();
+        assert_eq!(import_favorites(&mut local, &records), FavoriteImport { added: 2, over_limit: 3, ..Default::default() });
+        assert_eq!(local.iter().filter(|f| f.is_active()).count(), FAVORITE_STICKER_LIMIT);
+        assert!(local.iter().any(|f| f.pack_id == "bb" && f.sticker_id == 1));
+        assert!(!local.iter().any(|f| f.pack_id == "bb" && f.sticker_id == 2));
     }
 }

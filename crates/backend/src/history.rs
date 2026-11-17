@@ -218,6 +218,8 @@ pub(crate) struct Imported {
     pub long_texts: Vec<i64>,
     /// Installed sticker packs: `(pack id, pack key)`.
     pub sticker_packs: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Favorite stickers added, whose images are still to download.
+    pub favorite_stickers: usize,
     /// The account's privacy settings, when the backup has them.
     pub settings: Option<crate::AccountSettings>,
 }
@@ -655,6 +657,25 @@ pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: imp
             Some(proto::frame::Item::InstalledStickerPack(pack)) => {
                 imported.sticker_packs.push((pack.packId.clone(), pack.packKey.clone()));
             }
+            Some(proto::frame::Item::FavoriteStickerList(list)) => {
+                let favorites = favorite_stickers(&list);
+                let invalid = list.favoriteSticker.len() - favorites.len();
+                if invalid > 0 {
+                    tracing::warn!(invalid, "skipped favorite stickers in the backup without a valid pack id, key or date");
+                }
+                match db.import_favorite_stickers(&favorites).await {
+                    Ok(import) => {
+                        if import.already > 0 {
+                            tracing::debug!(already = import.already, "favorite stickers in the backup were here already");
+                        }
+                        if import.over_limit > 0 {
+                            tracing::warn!(over_limit = import.over_limit, "favorite stickers in the backup were over the limit");
+                        }
+                        imported.favorite_stickers += import.added;
+                    }
+                    Err(error) => tracing::warn!(%error, "failed to save the backup's favorite stickers"),
+                }
+            }
             Some(proto::frame::Item::ChatItem(item)) => {
                 imported.messages +=
                     usize::from(import_item(db, &item, &people, &chats, me, now, &mut imported).await?);
@@ -674,6 +695,25 @@ pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: imp
         db.replace_pinned(&pinned.into_iter().map(|(_, id)| id).collect::<Vec<_>>()).await?;
     }
     Ok(imported)
+}
+
+/// A backup's favorite stickers (Desktop's `#fromFavoriteSticker`, commit
+/// e345f39): one without a 16-byte pack id, a 32-byte pack key or a valid
+/// date is left out.
+fn favorite_stickers(list: &proto::FavoriteStickerList) -> Vec<signal_store::RemoteFavoriteSticker> {
+    // The latest date JavaScript can hold (Desktop's `MAX_SAFE_DATE`).
+    const MAX_SAFE_DATE: u64 = 8_640_000_000_000_000;
+    list.favoriteSticker
+        .iter()
+        .filter(|f| f.packId.len() == 16 && f.packKey.len() == 32 && f.favoritedAtTimestamp <= MAX_SAFE_DATE)
+        .map(|f| signal_store::RemoteFavoriteSticker {
+            pack_id: hex::encode(&f.packId),
+            sticker_id: f.stickerId,
+            pack_key: Some(hex::encode(&f.packKey)),
+            favorited_at: f.favoritedAtTimestamp as i64,
+            deleted_at: 0,
+        })
+        .collect()
 }
 
 /// A backup's chat folder (Desktop's `#fromChatFolder`): one without a
@@ -1516,6 +1556,17 @@ mod tests {
         pack.packId = vec![0xab; 16];
         pack.packKey = vec![0xcd; 32];
         push(proto::Frame { item: Some(proto::frame::Item::InstalledStickerPack(pack)), ..Default::default() });
+        // Favorite stickers, one with a short pack key.
+        let mut favorites = proto::FavoriteStickerList::new();
+        for (key_len, sticker_id) in [(32, 3), (31, 4)] {
+            let mut favorite = proto::favorite_sticker_list::FavoriteSticker::new();
+            favorite.packId = vec![0xef; 16];
+            favorite.packKey = vec![0x12; key_len];
+            favorite.stickerId = sticker_id;
+            favorite.favoritedAtTimestamp = 1_700_000_000_000;
+            favorites.favoriteSticker.push(favorite);
+        }
+        push(proto::Frame { item: Some(proto::frame::Item::FavoriteStickerList(favorites)), ..Default::default() });
         // Our reply to Alice, quoting her, with her reaction and a photo
         // still on the transit tier.
         let mut standard = proto::StandardMessage::new();
@@ -1637,6 +1688,11 @@ mod tests {
         assert_eq!(seen.last(), Some(&(plain.len() as u64)));
         assert_eq!((imported.chats, imported.messages), (4, 7));
         assert_eq!(imported.sticker_packs, vec![(vec![0xab; 16], vec![0xcd; 32])]);
+        // The favorite with a whole key, as Storage Service would have it.
+        assert_eq!(imported.favorite_stickers, 1);
+        let favorites = db.favorite_stickers().await.unwrap();
+        let ids: Vec<_> = favorites.iter().map(|f| (f.pack_id.as_str(), f.sticker_id, f.pack_key.as_deref(), f.favorited_at, f.needs_sync)).collect();
+        assert_eq!(ids, [("ef".repeat(16).as_str(), 3, Some("12".repeat(32).as_str()), Some(1_700_000_000_000), false)]);
         // Each setting the backup leaves off is off, as Desktop imports them.
         let settings = imported.settings.clone().unwrap();
         let on = |s: crate::AccountSetting| settings.flags[&s];
