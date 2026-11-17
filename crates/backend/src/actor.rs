@@ -5743,8 +5743,13 @@ impl Actor {
             Ok(None) => return self.error("attachment unavailable", "original message not found"),
             Err(error) => return self.error("attachment unavailable", error),
         };
+        // A sticker's image is the message's sticker, not one of its
+        // attachments (`mapping` puts it after them).
         let sticker = message.attachments.get(index).is_some_and(|a| a.sticker);
-        let pointer = data_message_of(&content.body).and_then(|dm| mapping::normal_attachments(dm).nth(index).cloned());
+        let pointer = data_message_of(&content.body).and_then(|dm| match sticker {
+            true => dm.sticker.as_ref().and_then(|s| s.data.clone()),
+            false => mapping::normal_attachments(dm).nth(index).cloned(),
+        });
         let Some(pointer) = pointer else {
             return self.error("attachment unavailable", "no such attachment");
         };

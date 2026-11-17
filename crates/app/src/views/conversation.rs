@@ -2432,15 +2432,26 @@ impl ConversationView {
                     // A click opens its pack (Desktop's `showLightbox` shows a
                     // sticker's pack, ts/state/ducks/lightbox.preload.ts).
                     // In select mode the row's click picks the message instead.
+                    // One not downloaded (a big one with Photos off doesn't
+                    // download on its own, Desktop commit a26894b) downloads
+                    // instead, unless it's too big to.
                     let (sticker_message, pack) = (message.id, sticker.sticker_pack.clone());
                     let max_receive = self.state.read(cx).remote_config().attachment_max_receive_bytes();
                     let too_big = too_big(sticker, max_receive);
+                    // (A transferred sticker without its image, no locator
+                    // and no size, has nothing to fetch: it opens its pack.)
+                    let fetchable = sticker.remote.is_some() || sticker.size > 0;
+                    let fetch = sticker.local_path.is_none() && !too_big && fetchable;
                     div()
                         .id(SharedString::from(format!("sticker-{}", message.id)))
                         .debug_selector(move || format!("sticker-{sticker_message}"))
                         .when(self.selecting.is_none(), |d| {
                             d.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
-                                this.state.update(cx, |state, cx| state.open_message_sticker(sticker_message, pack.as_ref(), cx))
+                                if fetch {
+                                    this.state.read(cx).send(Command::FetchAttachment { message_id: sticker_message, index: 0 });
+                                } else {
+                                    this.state.update(cx, |state, cx| state.open_message_sticker(sticker_message, pack.as_ref(), cx))
+                                }
                             }))
                         })
                         .child(match &sticker.local_path {
@@ -5831,7 +5842,8 @@ impl ConversationView {
             return;
         }
         let Some(first) = message.attachments.first() else { return };
-        if too_big(first, self.state.read(cx).remote_config().attachment_max_receive_bytes()) {
+        // (A sticker too big to download still opens its pack, below.)
+        if !first.sticker && too_big(first, self.state.read(cx).remote_config().attachment_max_receive_bytes()) {
             return;
         }
         let kind = &first.content_type;
@@ -5844,9 +5856,14 @@ impl ConversationView {
                 let title = self.reactor_name(message.author.as_deref(), cx);
                 self.state.update(cx, |state, cx| state.toggle_audio(id, 0, path, title, cx));
             }
-            None if !first.sticker => self.state.read(cx).send(Command::FetchAttachment { message_id: id, index: 0 }),
-            // Desktop's `showLightbox` shows a sticker's pack instead,
-            // downloaded or not (as a click does).
+            None if !first.sticker
+                || (!too_big(first, self.state.read(cx).remote_config().attachment_max_receive_bytes())
+                    && (first.remote.is_some() || first.size > 0)) =>
+            {
+                self.state.read(cx).send(Command::FetchAttachment { message_id: id, index: 0 })
+            }
+            // Desktop's `showLightbox` shows a sticker's pack instead, once
+            // it's downloaded or when it can't be (as a click does).
             _ if first.sticker => {
                 let pack = first.sticker_pack.clone();
                 self.state.update(cx, |state, cx| state.open_message_sticker(id, pack.as_ref(), cx));
@@ -7209,6 +7226,8 @@ mod tests {
         wait_for_messages(&backend, MAYA, 1, |m| m.body == MAYA_LAST);
         // A sticker from the demo's Garden dots pack.
         let garden = signal_store::StickerPackRef { id: "9a".repeat(16), key: "00".repeat(32), sticker_id: None };
+        let file = _dir.path().join("sticker.png");
+        image::RgbaImage::new(8, 8).save(&file).unwrap();
         let db = backend.db().clone();
         let sticker = futures::executor::block_on(backend.spawn(async move {
             let now = chrono::Utc::now().timestamp_millis();
@@ -7228,7 +7247,8 @@ mod tests {
                     size: 0,
                     width: Some(512),
                     height: Some(512),
-                    local_path: None,
+                    // Downloaded: one that isn't downloads on a click instead.
+                    local_path: Some(file.to_string_lossy().into_owned()),
                     sticker: true,
                     gif: false,
                     voice: false,
