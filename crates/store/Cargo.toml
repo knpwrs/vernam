@@ -17,6 +17,9 @@ thiserror.workspace = true
 tracing.workspace = true
 # Poll limits count characters as Desktop does: graphemes.
 unicode-segmentation = "1"
+# Scheduled messages' photos and files are kept as files, randomly named.
+rand = "0.9"
+tokio = { workspace = true, features = ["fs"] }
 
 # Elsewhere than macOS (where SQLCipher uses CommonCrypto), SQLCipher's
 # crypto in Rust rather than OpenSSL: libsignal links BoringSSL, whose

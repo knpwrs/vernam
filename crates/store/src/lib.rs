@@ -24,6 +24,7 @@ mod nickname;
 mod poll;
 mod profile;
 mod reminders;
+mod scheduled;
 mod send_states;
 mod sticker_favorites;
 mod sticker_packs;
@@ -41,6 +42,7 @@ pub use nickname::*;
 pub use poll::*;
 pub use profile::*;
 pub use reminders::*;
+pub use scheduled::*;
 pub use send_states::*;
 pub use sticker_favorites::*;
 pub use sticker_packs::*;
@@ -57,6 +59,8 @@ pub enum Error {
     Migrate(#[from] sqlx::migrate::MigrateError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
     #[error("{0}")]
     Schema(String),
 }
@@ -3034,6 +3038,7 @@ impl AppDb {
         sqlx::query("DELETE FROM messages WHERE conversation_id = ?").bind(&id.0).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM pinned_messages WHERE conversation_id = ?").bind(&id.0).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM conversations WHERE id = ?").bind(&id.0).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM scheduled_messages WHERE conversation_id = ?").bind(&id.0).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM settings WHERE key = ?")
             .bind(format!("{DRAFT_STYLES}{}", id.0))
             .execute(&mut *tx)
@@ -3360,6 +3365,7 @@ impl AppDb {
         sqlx::query("DELETE FROM message_edits").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM messages").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM conversations").execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM scheduled_messages").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM settings").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM contact_names").execute(&mut *tx).await?;
         sqlx::query("DELETE FROM contact_nicknames").execute(&mut *tx).await?;

@@ -1140,6 +1140,8 @@ async fn drop_later_migrations(db: &AppDb) {
     sqlx::query("ALTER TABLE messages DROP COLUMN content").execute(&db.writer).await.unwrap();
     sqlx::query("DROP TABLE sticker_packs").execute(&db.writer).await.unwrap();
     sqlx::query("ALTER TABLE messages DROP COLUMN edit_history").execute(&db.writer).await.unwrap();
+    sqlx::query("DROP TABLE scheduled_attachments").execute(&db.writer).await.unwrap();
+    sqlx::query("DROP TABLE scheduled_messages").execute(&db.writer).await.unwrap();
 }
 
 /// Rewrites the migration history to look like a pre-squash database that
@@ -3088,4 +3090,134 @@ async fn favorite_stickers_stop_at_the_limit() {
     assert_eq!(db.favorite_sticker("bb", "k", 1, 5).await.unwrap(), Favorited::Full);
     db.unfavorite_sticker("aa", 0, 6).await.unwrap();
     assert!(matches!(db.favorite_sticker("bb", "k", 1, 7).await.unwrap(), Favorited::Added(_)));
+}
+
+fn scheduled(c: &str, send_at: i64, body: &str, files: Vec<ScheduledFile>) -> NewScheduled {
+    NewScheduled {
+        conversation: conv(c),
+        send_at,
+        body: body.into(),
+        extras: ScheduledExtras {
+            mentions: vec!["aci-bob".into()],
+            styles: vec![StyleSpan { start: 0, len: 2, style: TextStyle::Bold }],
+            quote: Some(7),
+            preview: Some(ScheduledPreview {
+                url: "https://example.com".into(),
+                title: "Example".into(),
+                description: None,
+                date: None,
+                image: Some(ScheduledPreviewImage { content_type: "image/png".into(), width: 4, height: 3 }),
+            }),
+        },
+        files,
+    }
+}
+
+/// The files in a scheduled-files directory.
+fn files_in(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir).map_or(0, |d| d.count())
+}
+
+#[tokio::test]
+async fn scheduled_messages_list_soonest_first_and_are_taken_once() {
+    let db = test_db().await;
+    let dir = tempfile::tempdir().unwrap();
+    // A chat with no row yet (a new one) can have them too.
+    let photo = ScheduledFile { kind: ScheduledKind::Image, file_name: Some("a.png".into()), bytes: vec![1, 2, 3] };
+    let file = ScheduledFile { kind: ScheduledKind::File, file_name: Some("b.pdf".into()), bytes: vec![4; 10] };
+    let later = db
+        .schedule_message(&scheduled("d:alice", 2_000, "hi later", vec![photo.clone(), file.clone()]), dir.path(), 100)
+        .await
+        .unwrap();
+    let sooner = db.schedule_message(&scheduled("d:alice", 1_000, "hi sooner", Vec::new()), dir.path(), 100).await.unwrap();
+    // The bytes are files beside the database, not in it.
+    assert_eq!(files_in(dir.path()), 2);
+
+    let listed = db.scheduled_messages().await.unwrap();
+    assert_eq!(listed.iter().map(|m| m.id).collect::<Vec<_>>(), [sooner, later]);
+    let first = &listed[1];
+    assert_eq!(first.body, "hi later");
+    assert_eq!(first.created_at, 100);
+    assert_eq!(first.extras.quote, Some(7));
+    assert_eq!(first.extras.mentions, ["aci-bob"]);
+    assert_eq!(first.extras.preview.as_ref().unwrap().image.as_ref().unwrap().width, 4);
+    // Listed without their bytes, in the order added.
+    assert_eq!(
+        first.attachments.iter().map(|a| (a.kind, a.file_name.as_deref(), a.size)).collect::<Vec<_>>(),
+        [(ScheduledKind::Image, Some("a.png"), 3), (ScheduledKind::File, Some("b.pdf"), 10)]
+    );
+
+    assert!(db.reschedule_message(later, 500).await.unwrap());
+    assert_eq!(db.scheduled_messages().await.unwrap()[0].id, later);
+
+    let (taken, files) = db.take_scheduled_message(later, dir.path()).await.unwrap().expect("still scheduled");
+    assert_eq!(taken.send_at, 500);
+    assert_eq!(files, [photo, file]);
+    // Taken once: it's gone, with its attachments and their files.
+    assert!(db.take_scheduled_message(later, dir.path()).await.unwrap().is_none());
+    assert!(!db.reschedule_message(later, 600).await.unwrap());
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scheduled_attachments").fetch_one(&db.pool).await.unwrap();
+    assert_eq!(left, 0);
+    assert_eq!(files_in(dir.path()), 0);
+
+    assert!(db.delete_scheduled_message(sooner, dir.path()).await.unwrap());
+    assert!(!db.delete_scheduled_message(sooner, dir.path()).await.unwrap());
+    assert!(db.scheduled_messages().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_deleted_scheduled_message_takes_its_files_and_a_missing_file_keeps_it() {
+    let db = test_db().await;
+    let dir = tempfile::tempdir().unwrap();
+    let photo = ScheduledFile { kind: ScheduledKind::Image, file_name: None, bytes: vec![1] };
+    let deleted = db.schedule_message(&scheduled("d:alice", 1_000, "a", vec![photo.clone()]), dir.path(), 0).await.unwrap();
+    let kept = db.schedule_message(&scheduled("d:alice", 1_000, "b", vec![photo]), dir.path(), 0).await.unwrap();
+    assert!(db.delete_scheduled_message(deleted, dir.path()).await.unwrap());
+    assert_eq!(files_in(dir.path()), 1);
+    // Its photo gone, it can't go as it was: it stays, to be tried again.
+    let file = &db.scheduled_messages().await.unwrap()[0].attachments[0].file;
+    std::fs::remove_file(dir.path().join(file)).unwrap();
+    assert!(db.take_scheduled_message(kept, dir.path()).await.is_err());
+    assert_eq!(db.scheduled_messages().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn deleting_a_chat_or_the_account_deletes_scheduled_messages() {
+    let db = test_db().await;
+    let dir = tempfile::tempdir().unwrap();
+    for c in ["d:alice", "d:bob"] {
+        db.upsert_conversation(&conv(c), ConversationUpdate::default()).await.unwrap();
+    }
+    let photo = ScheduledFile { kind: ScheduledKind::Image, file_name: None, bytes: vec![1] };
+    db.schedule_message(&scheduled("d:alice", 1_000, "a", vec![photo.clone()]), dir.path(), 0).await.unwrap();
+    let bobs = db.schedule_message(&scheduled("d:bob", 1_000, "b", vec![photo]), dir.path(), 0).await.unwrap();
+    db.remove_conversation(&conv("d:alice")).await.unwrap();
+    assert_eq!(db.scheduled_messages().await.unwrap().iter().map(|m| m.id).collect::<Vec<_>>(), [bobs]);
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scheduled_attachments").fetch_one(&db.pool).await.unwrap();
+    assert_eq!(left, 1);
+    // Alice's photo is left behind; only files from before a time are
+    // pruned, since newer ones may belong to a message still being saved.
+    assert_eq!(files_in(dir.path()), 2);
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    assert_eq!(db.prune_scheduled_files(dir.path(), past).await.unwrap(), 0);
+    let future = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    assert_eq!(db.prune_scheduled_files(dir.path(), future).await.unwrap(), 1);
+    assert_eq!(files_in(dir.path()), 1, "Bob's photo stays");
+    db.clear().await.unwrap();
+    assert!(db.scheduled_messages().await.unwrap().is_empty());
+    assert_eq!(db.prune_scheduled_files(dir.path(), future).await.unwrap(), 1);
+    assert_eq!(db.prune_scheduled_files(&dir.path().join("none"), future).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn a_scheduled_message_with_unreadable_extras_is_listed_but_not_taken() {
+    let db = test_db().await;
+    let dir = tempfile::tempdir().unwrap();
+    let id = db.schedule_message(&scheduled("d:alice", 1_000, "hi \u{FFFC}", Vec::new()), dir.path(), 0).await.unwrap();
+    sqlx::query("UPDATE scheduled_messages SET extras = '{not json' WHERE id = ?").bind(id).execute(&db.writer).await.unwrap();
+    let listed = db.scheduled_messages().await.unwrap();
+    assert_eq!((listed[0].id, listed[0].extras.mentions.len()), (id, 0));
+    // Sent without its mentions it would show the placeholder: it stays.
+    assert!(db.take_scheduled_message(id, dir.path()).await.is_err());
+    assert_eq!(db.scheduled_messages().await.unwrap().len(), 1);
 }

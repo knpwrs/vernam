@@ -9728,6 +9728,7 @@ name = "signal-store"
 version = "0.1.0"
 dependencies = [
  "libsqlite3-sys",
+ "rand 0.9.5",
  "serde",
  "serde_json",
  "sha2 0.11.1",

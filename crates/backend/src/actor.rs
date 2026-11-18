@@ -1315,7 +1315,7 @@ impl Actor {
             warn!(%error, "failed to clear app database");
         }
         // Downloaded and sent media are files, unencrypted: they go too.
-        for dir in ["avatars", "attachments", "stickers", "gif-cache", settings::CONTACT_AVATARS_DIR] {
+        for dir in ["avatars", "attachments", "scheduled", "stickers", "gif-cache", settings::CONTACT_AVATARS_DIR] {
             let _ = std::fs::remove_dir_all(self.config.data_dir.join(dir));
         }
         let _ = std::fs::create_dir_all(self.config.data_dir.join("attachments"));
