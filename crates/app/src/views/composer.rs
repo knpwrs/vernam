@@ -120,6 +120,17 @@ impl StagedPreview {
     }
 }
 
+/// What a scheduled draft took with it, to clear once it's saved (each
+/// photo and file by its bytes, held so they can't be mistaken for new
+/// ones).
+struct Went {
+    images: Vec<Arc<Vec<u8>>>,
+    files: Vec<Arc<Vec<u8>>>,
+    reply: Option<i64>,
+    preview: Option<String>,
+    text: String,
+}
+
 /// A file (not an image) waiting to be sent, as a message of its own.
 struct PendingFile {
     bytes: Arc<Vec<u8>>,
@@ -221,6 +232,8 @@ pub struct Composer {
     /// Desktop's view-once toggle: the one photo or video staged goes to
     /// be viewed once, while [`Self::view_once_eligible`] holds.
     view_once: bool,
+    /// A scheduled draft is being saved; it stays until it is.
+    scheduling: bool,
     link_preview: Option<StagedPreview>,
     /// Links whose preview was dismissed in this draft.
     dismissed_previews: std::collections::HashSet<String>,
@@ -372,6 +385,7 @@ impl Composer {
             images: Vec::new(),
             files: Vec::new(),
             view_once: false,
+            scheduling: false,
             link_preview: None,
             dismissed_previews: Default::default(),
             preview_task: None,
@@ -1046,7 +1060,38 @@ impl Composer {
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.typeahead.is_some() {
+        self.submit_at(None, window, cx);
+    }
+
+    /// Whether the draft can be scheduled (`crate::scheduled`): something
+    /// to send, and not an edit or a view-once photo.
+    fn can_schedule(&self, cx: &App) -> bool {
+        let something = !self.input.read(cx).value().trim().is_empty() || !self.images.is_empty() || !self.files.is_empty();
+        something && self.editing.is_none() && !self.view_once_active() && self.voice_draft.is_none() && self.recording.is_none()
+    }
+
+    /// Asks when to send the draft, then schedules it.
+    pub(crate) fn open_schedule(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_schedule(cx) {
+            return;
+        }
+        let composer = cx.entity().downgrade();
+        crate::views::scheduled::pick_time("Schedule message", "Schedule", window, cx, move |send_at, window, cx| {
+            let _ = composer.update(cx, |composer, cx| composer.submit_at(Some(send_at), window, cx));
+        });
+    }
+
+    /// Sends the draft, or with `at` (unix millis) schedules it to send then.
+    fn submit_at(&mut self, at: Option<i64>, window: &mut Window, cx: &mut Context<Self>) {
+        // While a scheduled draft saves it's still here: sending it now
+        // too would send it twice.
+        if self.scheduling || (at.is_some() && !self.can_schedule(cx)) {
+            return;
+        }
+        // Scheduling from Send's menu leaves an open @mention list as it is.
+        if at.is_some() {
+            self.typeahead = None;
+        } else if self.typeahead.is_some() {
             self.accept_typeahead(None, window, cx);
             return;
         }
@@ -1079,11 +1124,13 @@ impl Composer {
                         (sid, name)
                     })
                     .collect();
-                confirm_safety_changes(self.state.clone(), cx.entity().downgrade(), people, window, cx);
+                confirm_safety_changes(self.state.clone(), cx.entity().downgrade(), people, at, window, cx);
                 return;
             }
         }
-        let (body, mentions, styles) = encode_mentions(&text, &std::mem::take(&mut self.mentions), &text_styles);
+        // A scheduled draft keeps its mentions until it's saved.
+        let picked = if at.is_some() { self.mentions.clone() } else { std::mem::take(&mut self.mentions) };
+        let (body, mentions, styles) = encode_mentions(&text, &picked, &text_styles);
         if let Some(original) = self.editing.take() {
             // Who's mentioned can change without the text changing (two people
             // with one name), so compare both.
@@ -1113,39 +1160,25 @@ impl Composer {
         if self.view_once && self.view_once_eligible() {
             return self.send_view_once(cx);
         }
+        if let Some(send_at) = at {
+            return self.schedule_draft(send_at, text, body, mentions, styles, window, cx);
+        }
         let quote = self.reply_to.take().map(|m| m.id);
         let preview = self.take_link_preview(cx);
-        // The text goes with the images, else with the first file (each file
-        // is a message of its own, as in Desktop).
-        let files = std::mem::take(&mut self.files);
-        let mut commands = Vec::new();
-        let mut caption = Some((body, quote, mentions, styles));
-        if !self.images.is_empty() || files.is_empty() {
-            let (body, quote, mentions, styles) = caption.take().unwrap_or_default();
-            commands.push(if self.images.is_empty() {
-                Command::SendText { conversation: self.conversation.clone(), body, quote, preview, mentions, styles }
-            } else {
-                let images = std::mem::take(&mut self.images)
-                    .into_iter()
-                    .map(|i| {
-                        i.release(cx);
-                        OutgoingImage { bytes: i.bytes, file_name: i.file_name }
-                    })
-                    .collect();
-                Command::SendImages { conversation: self.conversation.clone(), images, caption: body, quote, mentions, styles }
-            });
-        }
-        for file in files {
-            let (caption, quote, mentions, styles) = caption.take().unwrap_or_default();
-            commands.push(Command::SendFile {
-                conversation: self.conversation.clone(),
-                file: OutgoingFile { bytes: file.bytes, file_name: file.file_name, voice: false },
-                caption,
-                quote,
-                mentions,
-                styles,
-            });
-        }
+        let images: Vec<OutgoingImage> = std::mem::take(&mut self.images)
+            .into_iter()
+            .map(|i| {
+                i.release(cx);
+                OutgoingImage { bytes: i.bytes, file_name: i.file_name }
+            })
+            .collect();
+        let files: Vec<OutgoingFile> = std::mem::take(&mut self.files)
+            .into_iter()
+            .map(|f| OutgoingFile { bytes: f.bytes, file_name: f.file_name, voice: false })
+            .collect();
+        // The text goes with the images, else with the first file (each
+        // file is a message of its own, as in Desktop).
+        let commands = crate::scheduled::commands(&self.conversation, body, quote, preview, mentions, styles, images, files);
         for command in commands {
             self.state.read(cx).send(command);
         }
@@ -1159,6 +1192,95 @@ impl Composer {
         // Desktop collapses the large composer once sent.
         self.set_large(false, cx);
         cx.emit(ComposerEvent::Sent);
+        cx.notify();
+    }
+
+    /// Saves the draft to send at `send_at`, and clears it once it's saved
+    /// (a failure leaves it to send or schedule again).
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_draft(
+        &mut self,
+        send_at: i64,
+        text: String,
+        body: String,
+        mentions: Vec<String>,
+        styles: Vec<signal_store::StyleSpan>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let preview = match self.link_preview.as_ref().map(|p| &p.state) {
+            Some(PreviewState::Ready { preview, .. }) => Some((**preview).clone()),
+            _ => None,
+        };
+        let (preview, preview_image) = preview.as_ref().map(crate::scheduled::preview_to_store).unzip();
+        let files = self
+            .images
+            .iter()
+            .map(|i| signal_store::ScheduledFile {
+                kind: signal_store::ScheduledKind::Image,
+                file_name: i.file_name.clone(),
+                bytes: i.bytes.to_vec(),
+            })
+            .chain(self.files.iter().map(|f| signal_store::ScheduledFile {
+                kind: signal_store::ScheduledKind::File,
+                file_name: Some(f.file_name.clone()),
+                bytes: f.bytes.to_vec(),
+            }))
+            .chain(preview_image.flatten())
+            .collect();
+        let quote = self.reply_to.as_ref().map(|m| m.id);
+        let went = Went {
+            images: self.images.iter().map(|i| i.bytes.clone()).collect(),
+            files: self.files.iter().map(|f| f.bytes.clone()).collect(),
+            reply: quote,
+            preview: self.link_preview.as_ref().map(|p| p.url.clone()),
+            text,
+        };
+        let message = signal_store::NewScheduled {
+            conversation: self.conversation.clone(),
+            send_at,
+            body,
+            extras: signal_store::ScheduledExtras { mentions, styles, quote, preview },
+            files,
+        };
+        self.scheduling = true;
+        let saving = self.state.update(cx, |state, cx| state.schedule(message, cx));
+        cx.spawn_in(window, async move |this, cx| {
+            let saved = saving.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.scheduling = false;
+                if saved {
+                    this.clear_scheduled(&went, window, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Clears what was scheduled from the draft, leaving anything added or
+    /// changed while it saved.
+    fn clear_scheduled(&mut self, went: &Went, window: &mut Window, cx: &mut Context<Self>) {
+        if self.reply_to.as_ref().map(|m| m.id) == went.reply {
+            self.reply_to = None;
+        }
+        if self.link_preview.as_ref().map(|p| p.url.clone()) == went.preview {
+            self.take_link_preview(cx);
+        }
+        let (gone, kept): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.images).into_iter().partition(|i| went.images.iter().any(|b| Arc::ptr_eq(b, &i.bytes)));
+        for image in gone {
+            image.release(cx);
+        }
+        self.images = kept;
+        self.files.retain(|f| !went.files.iter().any(|b| Arc::ptr_eq(b, &f.bytes)));
+        if self.input.read(cx).trimmed().0 == went.text {
+            self.mentions.clear();
+            self.input.update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        // Nothing was sent, so typing stops by saying so.
+        self.stop_typing(cx);
+        self.save_draft_later(cx);
+        self.set_large(false, cx);
         cx.notify();
     }
 
@@ -1847,6 +1969,8 @@ fn confirm_safety_changes(
     state: Entity<AppState>,
     composer: gpui_kit::WeakEntity<Composer>,
     people: Vec<(String, String)>,
+    // When a scheduled draft sends (`None`: now).
+    at: Option<i64>,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -1888,7 +2012,7 @@ fn confirm_safety_changes(
                 DialogFooter::new()
                     .child(Button::new("safety-changes-cancel").label("Cancel").outline().on_click(|_, window, cx| window.close_all_dialogs(cx)))
                     .child(div().debug_selector(|| "safety-changes-send".into()).child(
-                        Button::new("safety-changes-send").label("Send anyway").primary().on_click(move |_, window, cx| {
+                        Button::new("safety-changes-send").label(if at.is_some() { "Schedule anyway" } else { "Send anyway" }).primary().on_click(move |_, window, cx| {
                             send_state.update(cx, |state, _| {
                                 for (sid, _) in &send_people {
                                     state.unverified.remove(sid);
@@ -1896,7 +2020,7 @@ fn confirm_safety_changes(
                                 }
                             });
                             window.close_all_dialogs(cx);
-                            let _ = send_composer.update(cx, |composer, cx| composer.submit(window, cx));
+                            let _ = send_composer.update(cx, |composer, cx| composer.submit_at(at, window, cx));
                         }),
                     )),
             )
@@ -2157,6 +2281,26 @@ impl Render for Composer {
                     .cursor_pointer()
                     .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
                     .child(Icon::new(if editing { IconName::Check } else { IconName::Send }).size_4().text_color(palette.on_accent));
+                // A right click schedules it instead (Signal Android's long
+                // press on Send).
+                let schedulable = self.can_schedule(cx);
+                let composer = cx.entity().downgrade();
+                let send = if editing {
+                    send.into_any_element()
+                } else {
+                    use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+                    send.context_menu(move |menu, _, _| {
+                        let composer = composer.clone();
+                        menu.item(
+                            PopupMenuItem::new("Schedule message…").icon(IconName::Clock).disabled(!schedulable).on_click(
+                                move |_, window, cx| {
+                                    let _ = composer.update(cx, |this, cx| this.open_schedule(window, cx));
+                                },
+                            ),
+                        )
+                    })
+                    .into_any_element()
+                };
                 // The plus goes while editing or showing a loaded link
                 // preview (Desktop's `composerAddMenuButton` checks
                 // `linkPreviewResult`, not one loading or missing).

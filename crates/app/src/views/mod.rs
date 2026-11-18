@@ -32,6 +32,7 @@ pub mod preferred_reactions;
 pub mod profile_editor;
 pub mod root;
 pub mod safety_number;
+pub mod scheduled;
 pub mod settings;
 pub mod share_contact;
 pub mod shortcut_guide;

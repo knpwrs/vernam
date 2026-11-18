@@ -305,6 +305,8 @@ impl ConversationView {
                 }
                 AppEvent::ConversationCleared(conversation) if *conversation == this.id => this.load_initial(cx),
                 AppEvent::PinsChanged(conversation) if *conversation == this.id => this.load_pins(cx),
+                // The bar of this chat's scheduled messages.
+                AppEvent::ScheduledChanged => cx.notify(),
                 AppEvent::JumpTo { conversation } if *conversation == this.id => {
                     if let Some(id) = this.state.update(cx, |state, _| state.take_jump(conversation)) {
                         this.load_around(id, cx);
@@ -5079,6 +5081,10 @@ impl Render for ConversationView {
                 if self.id.is_signal() {
                     return d;
                 }
+                // Above the composer, or above what stands in for it, so a
+                // message held in a chat that can't be sent to now can
+                // still be seen and deleted.
+                let d = d.children(crate::views::scheduled::bar(&self.state, &self.id, palette, cx));
                 // A request to join, or announcement-only (a message request,
                 // an invitation among them, has the bar below, as Desktop's
                 // `CompositionArea` puts it first).
@@ -8403,6 +8409,186 @@ mod tests {
             cx.update(|window, cx| view.update(cx, |v, cx| v.target_oldest_unread_or_last(window, cx)));
             assert_eq!(view.read_with(cx, |v, _| v.targeted), Some(incoming[incoming.len() - 2]));
         }
+        backend.shutdown();
+    }
+
+    /// The scheduled messages, once the state has read them and `done`
+    /// holds.
+    fn scheduled_when(
+        cx: &mut VisualTestContext,
+        state: &Entity<AppState>,
+        done: impl Fn(&[signal_store::ScheduledMessage]) -> bool,
+    ) -> Vec<signal_store::ScheduledMessage> {
+        for _ in 0..300 {
+            cx.run_until_parked();
+            let scheduled = state.read_with(cx, |s, _| s.scheduled.clone());
+            if done(&scheduled) {
+                return scheduled;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("scheduled messages never matched");
+    }
+
+    /// Waits for our message saying `body` to be sent, running the app
+    /// meanwhile (the scheduled sends start there).
+    fn wait_sent(cx: &mut VisualTestContext, backend: &Backend, body: &str) {
+        for _ in 0..300 {
+            cx.run_until_parked();
+            if sent_to(backend, MAYA, body) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("{body} wasn't sent");
+    }
+
+    fn sent_to(backend: &Backend, id: &str, body: &str) -> bool {
+        let db = backend.db().clone();
+        let conversation = ConversationId(id.into());
+        futures::executor::block_on(backend.spawn(async move { db.messages(&conversation, None, 50).await }))
+            .unwrap()
+            .iter()
+            .any(|m| m.body == body)
+    }
+
+    #[gpui_kit::test]
+    fn a_scheduled_draft_waits_and_sends_now_on_request(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        wait_for_messages(&backend, MAYA, 1, |_| true);
+        let (mut cx, view) = open_view(cx, &backend, MAYA);
+        let state = view.read_with(&cx, |v, _| v.state.clone());
+        let composer = view.read_with(&cx, |v, _| v.composer.clone());
+        cx.update(|window, cx| composer.update(cx, |c, cx| c.focus(window, cx)));
+        cx.simulate_input("see you tomorrow");
+        cx.run_until_parked();
+        let before = chrono::Utc::now().timestamp_millis();
+        cx.update(|window, cx| composer.update(cx, |c, cx| c.open_schedule(window, cx)));
+        bounds(&mut cx, "schedule-dialog".into());
+        // The first choice: in an hour.
+        crate::views::test_support::click_at(&mut cx, "schedule-confirm");
+        let scheduled = scheduled_when(&mut cx, &state, |s| s.len() == 1);
+        assert_eq!(scheduled[0].body, "see you tomorrow");
+        assert_eq!(scheduled[0].conversation.0, MAYA);
+        let hour = 60 * 60 * 1000;
+        assert!((before + hour - 60_000..=before + hour + 60_000).contains(&scheduled[0].send_at), "in an hour");
+        assert_eq!(cx.update(|_, cx| composer.read(cx).input.read(cx).value().to_owned()), "", "the draft went");
+        bounds(&mut cx, "scheduled-bar".into());
+        assert!(!sent_to(&backend, MAYA, "see you tomorrow"), "nothing goes before it's due");
+
+        // Send now, from the list.
+        crate::views::test_support::click_at(&mut cx, "scheduled-bar");
+        let row: &'static str = Box::leak(format!("scheduled-{}", scheduled[0].id).into_boxed_str());
+        bounds(&mut cx, row.into());
+        state.update(&mut cx, |s, cx| s.send_scheduled(vec![scheduled[0].id], cx));
+        wait_sent(&mut cx, &backend, "see you tomorrow");
+        scheduled_when(&mut cx, &state, |s| s.is_empty());
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("scheduled-bar").is_none());
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn a_due_message_waits_until_the_account_is_online(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        wait_for_messages(&backend, MAYA, 1, |_| true);
+        let (mut cx, view) = open_view(cx, &backend, MAYA);
+        let state = view.read_with(&cx, |v, _| v.state.clone());
+        let schedule = |cx: &mut VisualTestContext, body: &str, in_ms: i64| {
+            let message = signal_store::NewScheduled {
+                conversation: ConversationId(MAYA.into()),
+                send_at: chrono::Utc::now().timestamp_millis() + in_ms,
+                body: body.into(),
+                extras: Default::default(),
+                files: Vec::new(),
+            };
+            state.update(cx, |s, cx| s.schedule(message, cx)).detach();
+        };
+        // Due while the account isn't up yet: it waits.
+        schedule(&mut cx, "while away", 50);
+        scheduled_when(&mut cx, &state, |s| s.len() == 1);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        cx.executor().advance_clock(crate::scheduled::MAX_WAIT);
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        cx.run_until_parked();
+        assert!(!sent_to(&backend, MAYA, "while away"));
+        assert_eq!(state.read_with(&cx, |s, _| s.scheduled.len()), 1, "still scheduled");
+        // Online: it goes.
+        state.update(&mut cx, |s, cx| {
+            s.handle(signal_backend::Event::Ready { phone: None, aci: "me".into() }, cx);
+            s.handle(signal_backend::Event::Connection(signal_backend::ConnectionState::Online), cx);
+        });
+        wait_sent(&mut cx, &backend, "while away");
+        scheduled_when(&mut cx, &state, |s| s.is_empty());
+        // Online already: it goes when the timer comes due.
+        schedule(&mut cx, "on time", 100);
+        scheduled_when(&mut cx, &state, |s| s.len() == 1);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        cx.executor().advance_clock(crate::scheduled::MAX_WAIT);
+        wait_sent(&mut cx, &backend, "on time");
+        scheduled_when(&mut cx, &state, |s| s.is_empty());
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn a_due_message_waits_while_the_chat_is_blocked(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        wait_for_messages(&backend, MAYA, 1, |_| true);
+        let (mut cx, view) = open_view(cx, &backend, MAYA);
+        let state = view.read_with(&cx, |v, _| v.state.clone());
+        let maya = ConversationId(MAYA.into());
+        state.update(&mut cx, |s, cx| {
+            s.handle(signal_backend::Event::Ready { phone: None, aci: "me".into() }, cx);
+            s.handle(signal_backend::Event::Connection(signal_backend::ConnectionState::Online), cx);
+        });
+        for _ in 0..300 {
+            cx.run_until_parked();
+            if state.read_with(&cx, |s, _| s.conversation(&maya).is_some()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Blocked in the database, so a reload of the chat list keeps it.
+        let block = |cx: &mut VisualTestContext, blocked: bool| {
+            let db = backend.db().clone();
+            let id = maya.clone();
+            futures::executor::block_on(backend.spawn(async move { db.set_blocked(&id, blocked).await })).unwrap();
+            for _ in 0..300 {
+                state.update(cx, |s, cx| s.reload_conversations(cx));
+                cx.run_until_parked();
+                if state.read_with(cx, |s, _| s.conversation(&maya).is_some_and(|c| c.blocked == blocked)) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("never {}", if blocked { "blocked" } else { "unblocked" });
+        };
+        block(&mut cx, true);
+        let message = signal_store::NewScheduled {
+            conversation: maya.clone(),
+            send_at: chrono::Utc::now().timestamp_millis() + 50,
+            body: "while blocked".into(),
+            extras: Default::default(),
+            files: Vec::new(),
+        };
+        state.update(&mut cx, |s, cx| s.schedule(message, cx)).detach();
+        let scheduled = scheduled_when(&mut cx, &state, |s| s.len() == 1);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        cx.executor().advance_clock(crate::scheduled::MAX_WAIT);
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        cx.run_until_parked();
+        assert!(!sent_to(&backend, MAYA, "while blocked"));
+        let held = state.read_with(&cx, |s, _| s.scheduled_held(&scheduled[0]));
+        assert_eq!(held, Some(crate::scheduled::Held::CantSend));
+        // With no composer, the bar still shows it's there.
+        bounds(&mut cx, "scheduled-bar".into());
+        // Unblocked: it goes at the next look.
+        block(&mut cx, false);
+        cx.executor().advance_clock(crate::scheduled::MAX_WAIT * 2);
+        wait_sent(&mut cx, &backend, "while blocked");
         backend.shutdown();
     }
 }

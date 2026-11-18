@@ -119,6 +119,8 @@ pub enum AppEvent {
     AuthorNamesChanged(std::rc::Rc<Vec<(String, String)>>),
     /// Something failed that the user should hear about.
     Error(SharedString),
+    /// The scheduled messages changed (`AppState::scheduled`).
+    ScheduledChanged,
     /// Answer to a username or phone number lookup.
     RecipientFound { query: String, result: Result<signal_store::DirectoryEntry, String> },
     /// GIF search results (`Err`: why not).
@@ -447,6 +449,26 @@ pub struct AppState {
     reaction_notifications: HashMap<ConversationId, Vec<String>>,
     /// Checks for unread reminders hourly while an account is linked.
     reminder_task: Option<Task<()>>,
+    /// The account's scheduled messages, soonest first, without their
+    /// photos' and files' bytes, which are files in `scheduled/`
+    /// (`crate::scheduled`).
+    pub scheduled: Vec<signal_store::ScheduledMessage>,
+    /// Waits for the next scheduled message to come due.
+    scheduled_task: Option<Task<()>>,
+    /// The newest `reload_scheduled` read; an older one finishing late is
+    /// dropped.
+    scheduled_read: u64,
+    /// Held messages already told about (`crate::scheduled::Held`).
+    scheduled_held_told: std::collections::HashSet<i64>,
+    /// Messages whose take failed, and when: tried again only after
+    /// [`crate::scheduled::MAX_WAIT`], and told about once.
+    scheduled_failed: HashMap<i64, Instant>,
+    /// When this state was made: scheduled files older than this that no
+    /// message has are left over, and pruned.
+    scheduled_since: std::time::SystemTime,
+    /// The chat list (and who's unverified) has been read since the
+    /// account came up: until then a due message can't be checked.
+    conversations_loaded: bool,
     /// The `signal.me` link being looked up (`open_signal_link`); its
     /// answer opens the chat.
     link_lookup: Option<String>,
@@ -611,6 +633,13 @@ impl AppState {
             held_notification: None,
             reaction_notifications: HashMap::new(),
             reminder_task: None,
+            scheduled: Vec::new(),
+            scheduled_task: None,
+            scheduled_read: 0,
+            scheduled_held_told: Default::default(),
+            scheduled_failed: HashMap::new(),
+            scheduled_since: std::time::SystemTime::now(),
+            conversations_loaded: false,
             link_lookup: None,
             pending_links: Vec::new(),
         };
@@ -1102,6 +1131,8 @@ impl AppState {
                 self.reload_badges(cx);
                 self.start_catch_up(cx);
                 self.start_unread_reminders(cx);
+                self.reload_scheduled(cx);
+                self.prune_scheduled_files();
                 for url in std::mem::take(&mut self.pending_links) {
                     self.open_signal_link(&url, cx);
                 }
@@ -1116,6 +1147,10 @@ impl AppState {
                 // Done draining: a reload put off for it happens now.
                 if self.connection != ConnectionState::Syncing && std::mem::take(&mut self.reload_soon) {
                     self.reload_conversations(cx);
+                }
+                // Scheduled messages that came due offline go now.
+                if self.connection == ConnectionState::Online {
+                    self.send_due_scheduled(cx);
                 }
             }
             Event::CatchingUp { first, latest } => {
@@ -1258,6 +1293,21 @@ impl AppState {
                     self.select(None, cx);
                 }
                 self.reload_conversations(cx);
+                // Its scheduled messages went with it, and their files go now.
+                let files: Vec<_> = self
+                    .scheduled
+                    .iter()
+                    .filter(|m| m.conversation == conversation)
+                    .flat_map(|m| m.attachments.iter().cloned())
+                    .collect();
+                if self.scheduled.iter().any(|m| m.conversation == conversation) {
+                    self.reload_scheduled(cx);
+                }
+                if !files.is_empty() {
+                    let dir = self.scheduled_dir();
+                    // Runs on the backend's runtime; the handle needn't be awaited.
+                    drop(self.backend.spawn(async move { signal_store::remove_scheduled_files(&dir, &files).await }));
+                }
             }
             Event::Typing {
                 conversation,
@@ -1429,6 +1479,13 @@ impl AppState {
                 self.catching_up = None;
                 self.held_notification = None;
                 self.reminder_task = None;
+                self.scheduled.clear();
+                self.scheduled_task = None;
+                self.scheduled_held_told.clear();
+                self.scheduled_failed.clear();
+                // A read still running is for the account that went.
+                self.scheduled_read += 1;
+                self.conversations_loaded = false;
                 self.screen = Screen::Link { url: None, error: None };
                 self.backend.send(Command::Link);
                 cx.emit(AppEvent::SelectionChanged);
@@ -1511,6 +1568,11 @@ impl AppState {
                         this.conversations = conversations;
                         this.unverified = unverified;
                         this.archived = archived;
+                        // Due scheduled messages could wait on this (with
+                        // the archived chats read too).
+                        if !std::mem::replace(&mut this.conversations_loaded, true) && !this.scheduled.is_empty() {
+                            this.send_due_scheduled(cx);
+                        }
                         this.person_avatars = avatars.into_iter().map(|(sid, path)| (sid, path.into())).collect();
                         this.withheld_photos = withheld.into_iter().map(|(sid, _)| sid).collect();
                         this.contact_avatars = contact_avatars
@@ -1844,6 +1906,252 @@ impl AppState {
                     cx.notify();
                 });
             }
+        })
+        .detach();
+    }
+
+    /// The scheduled messages in a chat, soonest first.
+    pub fn scheduled_in<'a>(
+        &'a self,
+        conversation: &'a ConversationId,
+    ) -> impl Iterator<Item = &'a signal_store::ScheduledMessage> + 'a {
+        self.scheduled.iter().filter(move |m| &m.conversation == conversation)
+    }
+
+    /// Reads the scheduled messages again, and waits for the next one due.
+    pub fn reload_scheduled(&mut self, cx: &mut Context<Self>) {
+        self.scheduled_read += 1;
+        let read = self.scheduled_read;
+        let db = self.backend.db().clone();
+        let query = self.backend.spawn(async move { db.scheduled_messages().await });
+        cx.spawn(async move |this, cx| {
+            let scheduled = query.await;
+            let _ = this.update(cx, |this, cx| {
+                if read != this.scheduled_read {
+                    return;
+                }
+                match scheduled {
+                    Ok(scheduled) => {
+                        this.scheduled_held_told.retain(|id| scheduled.iter().any(|m| m.id == *id));
+                        this.scheduled_failed.retain(|id, _| scheduled.iter().any(|m| m.id == *id));
+                        this.scheduled = scheduled;
+                        cx.emit(AppEvent::ScheduledChanged);
+                        cx.notify();
+                        this.wait_for_scheduled(cx);
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "couldn't read scheduled messages");
+                        // Read them again in a while rather than not at all.
+                        this.scheduled_task = Some(cx.spawn(async move |this, cx| {
+                            cx.background_executor().timer(crate::scheduled::MAX_WAIT).await;
+                            let _ = this.update(cx, |this, cx| this.reload_scheduled(cx));
+                        }));
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Where scheduled messages' photos and files are kept.
+    fn scheduled_dir(&self) -> std::path::PathBuf {
+        self.backend.data_dir().join("scheduled")
+    }
+
+    /// Removes scheduled files left by a quit while scheduling, or by a chat
+    /// or account deleted while the app wasn't watching.
+    fn prune_scheduled_files(&self) {
+        let db = self.backend.db().clone();
+        let (dir, before) = (self.scheduled_dir(), self.scheduled_since);
+        drop(self.backend.spawn(async move {
+            match db.prune_scheduled_files(&dir, before).await {
+                Ok(0) => {}
+                Ok(removed) => tracing::info!(removed, "removed left-over scheduled files"),
+                Err(error) => tracing::warn!(error = %error, "couldn't prune scheduled files"),
+            }
+        }));
+    }
+
+    /// Why a scheduled message must wait, if it must.
+    pub fn scheduled_held(&self, message: &signal_store::ScheduledMessage) -> Option<crate::scheduled::Held> {
+        let me = self.account.as_ref().map_or("", |a| a.aci.as_str());
+        crate::scheduled::held(self.conversation(&message.conversation), &self.unverified, me)
+    }
+
+    /// Why a due message isn't sent now, if it isn't: held, or its take
+    /// failed within the last [`crate::scheduled::MAX_WAIT`].
+    fn scheduled_waits(&self, message: &signal_store::ScheduledMessage) -> bool {
+        let failed = self.scheduled_failed.get(&message.id).is_some_and(|at| at.elapsed() < crate::scheduled::MAX_WAIT);
+        failed || self.scheduled_held(message).is_some()
+    }
+
+    /// Wakes when the next scheduled message is due, or sooner to look at
+    /// the clock again. Due messages that wait (held, or a failed take) are
+    /// looked at again every [`crate::scheduled::MAX_WAIT`], without
+    /// holding back the others.
+    fn wait_for_scheduled(&mut self, cx: &mut Context<Self>) {
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut waiting = false;
+        let mut next = None::<i64>;
+        for message in &self.scheduled {
+            if message.send_at <= now && self.scheduled_waits(message) {
+                waiting = true;
+            } else {
+                next = Some(next.map_or(message.send_at, |n| n.min(message.send_at)));
+            }
+        }
+        let wait = match (crate::scheduled::wait(next, now), waiting) {
+            (Some(wait), _) => wait,
+            (None, true) => crate::scheduled::MAX_WAIT,
+            (None, false) => {
+                self.scheduled_task = None;
+                return;
+            }
+        };
+        self.scheduled_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            let _ = this.update(cx, |this, cx| this.send_due_scheduled(cx));
+        }));
+    }
+
+    /// Sends the scheduled messages that are due, once the account is
+    /// online, done catching up (so they come after what arrived while it
+    /// was away) and its chats are read. One the chat wouldn't let Send
+    /// send now waits, and the user hears about it once.
+    fn send_due_scheduled(&mut self, cx: &mut Context<Self>) {
+        let now = chrono::Utc::now().timestamp_millis();
+        let ready = self.account.is_some()
+            && self.connection == ConnectionState::Online
+            && !self.is_loading()
+            && self.conversations_loaded;
+        if !ready {
+            // Online and the chat list each look again when they come.
+            if self.scheduled.iter().any(|m| m.send_at <= now) {
+                self.scheduled_task = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(crate::scheduled::MAX_WAIT).await;
+                    let _ = this.update(cx, |this, cx| this.send_due_scheduled(cx));
+                }));
+            } else {
+                self.wait_for_scheduled(cx);
+            }
+            return;
+        }
+        let mut due = Vec::new();
+        for message in self.scheduled.iter().filter(|m| m.send_at <= now) {
+            if self.scheduled_waits(message) {
+                if let Some(held) = self.scheduled_held(message)
+                    && self.scheduled_held_told.insert(message.id)
+                {
+                    let chat = self.conversation(&message.conversation).map_or("a chat", |c| c.title.as_str());
+                    cx.emit(AppEvent::Error(format!("A scheduled message to {chat} wasn't sent. {}", held.reason()).into()));
+                }
+            } else {
+                due.push(message.id);
+            }
+        }
+        if due.is_empty() {
+            self.wait_for_scheduled(cx);
+        } else {
+            self.scheduled_task = None;
+            self.send_scheduled(due, cx);
+        }
+    }
+
+    /// Sends scheduled messages now, as Send would have sent them. Each is
+    /// taken from the database first, so it goes at most once.
+    pub fn send_scheduled(&mut self, ids: Vec<i64>, cx: &mut Context<Self>) {
+        let db = self.backend.db().clone();
+        let dir = self.scheduled_dir();
+        let taken = self.backend.spawn(async move {
+            let mut taken = Vec::new();
+            let mut failed = Vec::new();
+            for id in ids {
+                match db.take_scheduled_message(id, &dir).await {
+                    Ok(Some(message)) => taken.push(message),
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(error = %error, id, "couldn't take a scheduled message");
+                        failed.push(id);
+                    }
+                }
+            }
+            (taken, failed)
+        });
+        cx.spawn(async move |this, cx| {
+            let (taken, failed) = taken.await;
+            let _ = this.update(cx, |this, cx| {
+                for (message, files) in taken {
+                    this.scheduled_held_told.remove(&message.id);
+                    this.scheduled_failed.remove(&message.id);
+                    for command in crate::scheduled::commands_for(message, files) {
+                        this.send(command);
+                    }
+                }
+                let mut told = false;
+                for id in failed {
+                    told |= this.scheduled_failed.insert(id, Instant::now()).is_none();
+                }
+                if told {
+                    cx.emit(AppEvent::Error("Couldn't send a scheduled message. It will be tried again.".into()));
+                }
+                this.reload_scheduled(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Schedules a message from the composer; the task says whether it was
+    /// saved (the draft stays until it is).
+    pub fn schedule(&mut self, message: signal_store::NewScheduled, cx: &mut Context<Self>) -> Task<bool> {
+        let db = self.backend.db().clone();
+        let now = chrono::Utc::now().timestamp_millis();
+        let dir = self.scheduled_dir();
+        let saved = self.backend.spawn(async move { db.schedule_message(&message, &dir, now).await });
+        cx.spawn(async move |this, cx| {
+            let saved = saved.await;
+            this.update(cx, |this, cx| {
+                if let Err(error) = &saved {
+                    cx.emit(AppEvent::Error(format!("Couldn't schedule the message: {error}").into()));
+                }
+                this.reload_scheduled(cx);
+                saved.is_ok()
+            })
+            .unwrap_or(false)
+        })
+    }
+
+    /// Moves a scheduled message to another time.
+    pub fn reschedule(&mut self, id: i64, send_at: i64, cx: &mut Context<Self>) {
+        // Held again at its new time, it's told about again.
+        self.scheduled_held_told.remove(&id);
+        self.scheduled_failed.remove(&id);
+        let db = self.backend.db().clone();
+        let done = self.backend.spawn(async move { db.reschedule_message(id, send_at).await });
+        self.after_scheduled_change(done, "Couldn't change when the message sends", cx);
+    }
+
+    /// Deletes a scheduled message unsent.
+    pub fn delete_scheduled(&mut self, id: i64, cx: &mut Context<Self>) {
+        let db = self.backend.db().clone();
+        let dir = self.scheduled_dir();
+        let done = self.backend.spawn(async move { db.delete_scheduled_message(id, &dir).await });
+        self.after_scheduled_change(done, "Couldn't delete the scheduled message", cx);
+    }
+
+    fn after_scheduled_change(
+        &mut self,
+        done: impl std::future::Future<Output = signal_store::Result<bool>> + 'static,
+        failed: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let done = done.await;
+            let _ = this.update(cx, |this, cx| {
+                if let Err(error) = done {
+                    cx.emit(AppEvent::Error(format!("{failed}: {error}").into()));
+                }
+                this.reload_scheduled(cx);
+            });
         })
         .detach();
     }

@@ -157,6 +157,7 @@ impl Sidebar {
                 | AppEvent::ViewStories(_)
                 | AppEvent::CreateStory(_)
                 | AppEvent::CallLinksChanged
+                | AppEvent::ScheduledChanged
                 | AppEvent::CallLinkCreated(_)
                 | AppEvent::Gifs { .. }
                 | AppEvent::KeyTransparencyFailed

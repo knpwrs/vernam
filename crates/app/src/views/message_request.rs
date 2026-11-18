@@ -607,7 +607,7 @@ impl ReviewPerson {
 
     /// Their chat, or one standing in for it (a person we have no chat
     /// with: the backend makes one when it's answered).
-    fn chat_or_new(&self) -> Conversation {
+    pub(crate) fn chat_or_new(&self) -> Conversation {
         self.chat.clone().unwrap_or_else(|| Conversation {
             id: ConversationId::direct(&self.aci),
             kind: ConversationKind::Direct,

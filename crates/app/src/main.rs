@@ -22,6 +22,7 @@ mod prefs;
 mod recorder;
 mod reminders;
 mod rich_input;
+mod scheduled;
 mod shortcuts;
 mod sidebar_width;
 mod sounds;
