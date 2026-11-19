@@ -286,7 +286,7 @@ fn editor(forward: &Entity<Forward>, palette: Palette, _window: &mut Window, cx:
                 .overflow_hidden()
                 .bg(palette.input_bg)
                 .child(match thumbnail {
-                    Some(path) => img(std::path::PathBuf::from(path)).size(px(72.)).aspect_square().object_fit(ObjectFit::Cover).into_any_element(),
+                    Some(path) => img(std::path::PathBuf::from(path)).size(px(72.)).aspect_square().rounded_lg().object_fit(ObjectFit::Cover).into_any_element(),
                     None => div().size_full().p_2().flex().items_end().text_xs().child(name).into_any_element(),
                 })
                 .child(

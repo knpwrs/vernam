@@ -571,7 +571,7 @@ fn photo_element(photo: &StagedPhoto, profile: &OwnProfile, size: f32) -> AnyEle
     let name = profile.name().unwrap_or_default();
     let color = 0;
     match photo {
-        StagedPhoto::New(_, image) => img(image.clone()).size(px(size)).rounded_full().object_fit(ObjectFit::Cover).into_any_element(),
+        StagedPhoto::New(_, image) => img(image.clone()).size(px(size)).aspect_square().rounded_full().object_fit(ObjectFit::Cover).into_any_element(),
         StagedPhoto::Remove => crate::views::common::avatar(&name, color, px(size)).into_any_element(),
         StagedPhoto::Current => crate::views::common::person_avatar(profile.photo.as_deref(), &name, color, px(size)),
     }

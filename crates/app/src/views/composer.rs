@@ -1363,7 +1363,7 @@ impl Composer {
                 .rounded_lg()
                 .bg(palette.input_bg)
                 .when_some(image, |d, image| {
-                    d.child(img(image).size(px(48.)).flex_none().rounded_md().object_fit(ObjectFit::Cover))
+                    d.child(img(image).size(px(48.)).aspect_square().flex_none().rounded_md().object_fit(ObjectFit::Cover))
                 })
                 .child(
                     div()
@@ -1439,7 +1439,8 @@ impl Composer {
             .cursor_pointer()
             .text_xs()
             .when(on, |d| d.bg(palette.accent).text_color(palette.on_accent))
-            .when(!on, |d| d.border_1().border_color(palette.panel_border).text_color(palette.text_secondary))
+            // Off, it's still plain to see: filled and in the text color.
+            .when(!on, |d| d.bg(palette.input_bg).border_1().border_color(palette.panel_border).text_color(palette.text))
             .child(Icon::new(IconName::CircleDashed).size_3p5())
             .child("View once")
             .on_click(cx.listener(|this, _, window, cx| {
@@ -1660,10 +1661,21 @@ impl Composer {
 
     fn render_images(&self, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         div().flex().flex_wrap().gap_2().mx_3().mt_2().children(self.images.iter().enumerate().map(|(ix, image)| {
+            // A tall or wide photo is cropped to the square, never drawn
+            // past it over the toggle and the text box below.
             div()
                 .relative()
+                .flex_none()
                 .size(px(72.))
-                .child(img(image.preview.clone()).size_full().rounded_lg().object_fit(ObjectFit::Cover))
+                .child(
+                    img(image.preview.clone())
+                        .debug_selector(move || format!("pending-image-{ix}"))
+                        .size(px(72.))
+                        // Its own shape would set its height otherwise.
+                        .aspect_square()
+                        .rounded_lg()
+                        .object_fit(ObjectFit::Cover),
+                )
                 .child(
                     div()
                         .id(("remove-image", ix))
@@ -1912,7 +1924,7 @@ impl Composer {
                     }),
             )
             .when_some(thumbnail, |d, path| {
-                d.child(img(PathBuf::from(path)).flex_none().size(px(40.)).rounded_md().object_fit(ObjectFit::Cover))
+                d.child(img(PathBuf::from(path)).flex_none().size(px(40.)).aspect_square().rounded_md().object_fit(ObjectFit::Cover))
             })
             .when(audio, |d| {
                 d.child(
@@ -3830,6 +3842,20 @@ mod tests {
             assert!(c.add_file(b"%PDF-1.7".to_vec(), Some("notes.pdf".into()), cx));
         });
         assert!(!eligible(cx), "not a photo or video");
+    }
+
+    #[gpui_kit::test]
+    fn a_tall_photo_stays_in_its_square(cx: &mut TestAppContext) {
+        let f = mount(cx);
+        let mut bytes = Vec::new();
+        image::RgbaImage::new(30, 120).write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png).unwrap();
+        let mut cx = gpui_kit::VisualTestContext::from_window(f.window, cx);
+        f.composer.update(&mut cx, |c, cx| assert!(c.add_image(bytes, Some("tall.png".into()), cx)));
+        cx.run_until_parked();
+        let photo = cx.debug_bounds("pending-image-0").expect("the photo");
+        let toggle = cx.debug_bounds("view-once-toggle").expect("offered for one photo");
+        assert_eq!((photo.size.width, photo.size.height), (px(72.), px(72.)));
+        assert!(photo.bottom() <= toggle.top(), "{photo:?} over {toggle:?}");
     }
 
     #[gpui_kit::test]
