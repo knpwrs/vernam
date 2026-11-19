@@ -5347,12 +5347,10 @@ fn message_menu(
                 .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(body.clone()))),
         );
     }
-    let (details, info_state) = (message.clone(), state.clone());
-    menu = menu.item(
-        PopupMenuItem::new("Info")
-            .icon(IconName::Info)
-            .on_click(move |_, window, cx| crate::views::message_info::open(info_state.clone(), details.clone(), window, cx)),
-    );
+    let (details, info_state, info_view) = (message.clone(), state.clone(), view.clone());
+    menu = menu.item(PopupMenuItem::new("Info").icon(IconName::Info).on_click(move |_, window, cx| {
+        crate::views::message_info::open(info_state.clone(), info_view.clone(), details.clone(), window, cx)
+    }));
     let delete_state = state.clone();
     menu = menu.item(PopupMenuItem::new("Delete").icon(IconName::Trash).on_click(move |_, window, cx| {
         confirm_delete(delete_state.clone(), vec![id], note_to_self, everyone, window, cx)
@@ -5895,7 +5893,7 @@ impl ConversationView {
     /// Desktop's ⌘D: the targeted message's details.
     pub fn show_targeted_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(message) = self.targeted_message().filter(|m| m.notice.is_none()) {
-            crate::views::message_info::open(self.state.clone(), message, window, cx);
+            crate::views::message_info::open(self.state.clone(), cx.entity().downgrade(), message, window, cx);
         }
     }
 
@@ -7606,8 +7604,8 @@ mod tests {
         let (mut cx, view) = open_view(cx, &backend, GROUP);
         // Two read it, one has it, one it went to.
         let plan = wait_for_messages(&backend, GROUP, 1, |m| m.id == plan.id && m.status == DeliveryStatus::Read).remove(0);
-        let state = view.read_with(&cx, |v, _| v.state.clone());
-        cx.update(|window, cx| crate::views::message_info::open(state.clone(), plan.clone(), window, cx));
+        let (state, weak) = (view.read_with(&cx, |v, _| v.state.clone()), view.downgrade());
+        cx.update(|window, cx| crate::views::message_info::open(state.clone(), weak.clone(), plan.clone(), window, cx));
         for header in ["Read by", "Delivered to", "Sent to"] {
             bounds(&mut cx, format!("details-{header}"));
         }
@@ -7982,6 +7980,24 @@ mod tests {
         let oldest = bounds(&mut cx, "edit-version-2".into());
         assert!(oldest.top() > current.top(), "newest first");
         assert!(cx.debug_bounds("edit-version-3").is_none());
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn message_details_open_the_edit_history(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        let plan = wait_for_messages(&backend, GROUP, 1, |m| m.edited && m.direction == Direction::Outgoing).remove(0);
+        let (mut cx, view) = open_view(cx, &backend, GROUP);
+        // From inside the view, as ⌘D opens them.
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                crate::views::message_info::open(v.state.clone(), cx.entity().downgrade(), plan.clone(), window, cx)
+            })
+        });
+        let button = bounds(&mut cx, "details-edit-history".into());
+        cx.simulate_click(button.center(), gpui_kit::Modifiers::none());
+        bounds(&mut cx, "edit-history".into());
+        bounds(&mut cx, "edit-version-2".into());
         backend.shutdown();
     }
 

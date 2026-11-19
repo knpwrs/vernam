@@ -3,17 +3,19 @@
 //! with each (Failed, Viewed, Read, Delivered, Sent, Pending), each with
 //! their photo, when that last changed, the sealed sender icon (with "Show
 //! status icon" on), and "View safety number" when their key changed.
-//! Failed sends can be sent again from here ("Retry Send").
+//! Failed sends can be sent again from here ("Retry Send"), and an edited
+//! message's earlier versions opened ("View edit history").
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::Icon;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::prelude::*;
-use gpui_kit::{App, Entity, SharedString, Window, div, px};
+use gpui_kit::{App, Entity, SharedString, WeakEntity, Window, div, px};
 use signal_store::{ConversationId, DeliveryStatus, Direction, Message, SendState, SendStatus};
 
 use crate::state::AppState;
 use crate::theme::Palette;
+use crate::views::conversation::ConversationView;
 
 /// Desktop's groups, in its order, with their headers
 /// (`icu:MessageDetailsHeader--…`).
@@ -39,8 +41,9 @@ pub(crate) fn grouped(states: &[SendState], name: impl Fn(&str) -> String) -> Ve
         .collect()
 }
 
-/// Opens the details once the recipients' states are read.
-pub fn open(state: Entity<AppState>, message: Message, window: &mut Window, cx: &mut App) {
+/// Opens the details of a message in `view`'s chat once the recipients'
+/// states are read. `view` isn't read here: ⌘D opens them from inside it.
+pub fn open(state: Entity<AppState>, view: WeakEntity<ConversationView>, message: Message, window: &mut Window, cx: &mut App) {
     let backend = state.read(cx).backend.clone();
     let db = backend.db().clone();
     let id = message.id;
@@ -48,12 +51,19 @@ pub fn open(state: Entity<AppState>, message: Message, window: &mut Window, cx: 
     let handle = window.window_handle();
     cx.spawn(async move |cx| {
         let states = read.await;
-        let _ = cx.update_window(handle, |_, window, cx| show(state, message, states, window, cx));
+        let _ = cx.update_window(handle, |_, window, cx| show(state, view, message, states, window, cx));
     })
     .detach();
 }
 
-fn show(state: Entity<AppState>, message: Message, states: Vec<SendState>, window: &mut Window, cx: &mut App) {
+fn show(
+    state: Entity<AppState>,
+    view: WeakEntity<ConversationView>,
+    message: Message,
+    states: Vec<SendState>,
+    window: &mut Window,
+    cx: &mut App,
+) {
     let sealed = sealed_sender(state.read(cx), &message);
     let indicators = state.read(cx).prefs.flag(signal_backend::AccountSetting::SealedSenderIndicators);
     window.open_dialog(cx, move |dialog, _, cx| {
@@ -98,6 +108,17 @@ fn show(state: Entity<AppState>, message: Message, states: Vec<SendState>, windo
             .when(outgoing && states.is_empty(), |d| d.child(row("Status", status.into())))
             .when_some(disappears, |d, left| d.child(row("Disappears in", left)))
             .when_some(sealed.clone().filter(|_| states.is_empty()), |d, sealed| d.child(row("Sealed sender", sealed)));
+        // Desktop's "View edit history" (`MessageDetail.dom.tsx`, for
+        // `isEditedMessage`), opening what clicking "Edited" does. A deleted
+        // message has no earlier versions.
+        if shows_edit_history(&message) {
+            use gpui_kit::component::button::{Button, ButtonVariants as _};
+            let (view, current) = (view.clone(), message.clone());
+            let button = Button::new("details-edit-history").label("View edit history").icon(IconName::Pencil).ghost().on_click(
+                move |_, window, cx| crate::views::edit_history::open(view.clone(), current.clone(), window, cx),
+            );
+            body = body.child(div().pt_1().flex().child(div().debug_selector(|| "details-edit-history".into()).child(button)));
+        }
         for (status, header, people) in groups {
             body = body.child(
                 div()
@@ -172,6 +193,12 @@ fn show(state: Entity<AppState>, message: Message, states: Vec<SendState>, windo
             ))
         })
     });
+}
+
+/// Whether the details offer the edit history: an edited message that
+/// isn't deleted.
+pub(crate) fn shows_edit_history(message: &Message) -> bool {
+    message.edited && !message.deleted
 }
 
 /// Desktop's sealed sender icon in message details
