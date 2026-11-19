@@ -2573,6 +2573,25 @@ impl AppDb {
         Ok(keep)
     }
 
+    /// A delete for everyone of our message, sent elsewhere (another admin,
+    /// or our other device), leaves nothing for this device to retry: the
+    /// original send's recipients aren't the delete's (Desktop lists only
+    /// `deletedForEveryoneSendStatus`, set by the device that sent it), and
+    /// `status`, when given, replaces a failed one.
+    pub async fn settle_received_delete(&self, message_id: i64, status: Option<DeliveryStatus>) -> Result<()> {
+        let mut tx = self.write().await?;
+        sqlx::query("DELETE FROM message_send_states WHERE message_id = ?").bind(message_id).execute(&mut *tx).await?;
+        if let Some(status) = status {
+            sqlx::query("UPDATE messages SET status = ? WHERE id = ? AND deleted = 1")
+                .bind(status_to_i64(status))
+                .bind(message_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Erases what every kept deleted message said ("Keep deleted messages"
     /// turned off with "Erase"), as [`Self::mark_deleted`] would have when
     /// it was deleted; who deleted it (`deleted_by_admin`) stays. Returns

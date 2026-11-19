@@ -259,6 +259,7 @@ impl Actor {
         let marked = if keep { self.db.keep_deleted(message.id).await.map(|_| ()) } else { self.db.mark_deleted(message.id).await };
         match marked {
             Ok(()) => {
+                self.settle_delete_status(&message).await;
                 self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id: message.id });
                 self.emit(Event::ConversationsChanged);
                 Outcome::Applied
@@ -267,6 +268,18 @@ impl Actor {
                 self.error("failed to delete message", error);
                 Outcome::Failed
             }
+        }
+    }
+
+    /// A delete for everyone sent elsewhere leaves nothing to retry here
+    /// (`deletes::status_after_received_delete`).
+    async fn settle_delete_status(&self, message: &signal_store::Message) {
+        if message.direction != signal_store::Direction::Outgoing {
+            return;
+        }
+        let status = crate::deletes::status_after_received_delete(message);
+        if let Err(error) = self.db.settle_received_delete(message.id, status).await {
+            self.error("failed to update a deleted message's status", error);
         }
     }
 
@@ -311,6 +324,7 @@ impl Actor {
         self.erase_view_once(message.id, signal_store::ViewOnce::Gone).await;
         match self.db.mark_deleted_by_admin(message.id, &signal_store::DeletedByAdmin { by: by.clone() }, keep).await {
             Ok(true) => {
+                self.settle_delete_status(&message).await;
                 self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id: message.id });
                 self.emit(Event::ConversationsChanged);
                 Outcome::Applied

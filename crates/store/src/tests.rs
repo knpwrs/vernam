@@ -569,6 +569,21 @@ async fn kept_deletes_keep_what_the_message_said() {
 }
 
 #[tokio::test]
+async fn a_delete_sent_elsewhere_drops_the_sends_failures() {
+    let db = test_db().await;
+    let ours = db.insert_message(&outgoing("g:x", 10, "hi all")).await.unwrap();
+    db.record_send_states(ours, &[("b".into(), SendStatus::Sent, None), ("c".into(), SendStatus::Failed, Some("x".into()))], 11)
+        .await
+        .unwrap();
+    assert_eq!(db.message(ours).await.unwrap().unwrap().status, DeliveryStatus::PartialSent);
+    db.mark_deleted(ours).await.unwrap();
+    db.settle_received_delete(ours, Some(DeliveryStatus::Sent)).await.unwrap();
+    assert_eq!(db.message(ours).await.unwrap().unwrap().status, DeliveryStatus::Sent);
+    assert!(db.send_states(ours).await.unwrap().is_empty());
+    assert!(db.failed_recipients(ours).await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn attachment_only_preview() {
     let db = test_db().await;
     let mut m = incoming("d:a", "a", 1, "");

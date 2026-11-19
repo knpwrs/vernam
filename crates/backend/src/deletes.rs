@@ -106,10 +106,25 @@ pub fn retry_kind(message: &Message, chat: Chat, now: i64) -> Option<Kind> {
         return None;
     }
     let age = now - message.sent_at;
-    if message.deleted_by_admin.is_some() {
+    if let Some(by) = &message.deleted_by_admin {
+        // Another admin's delete was theirs to send.
+        if by.by.is_some() {
+            return None;
+        }
         return admin(chat.group, chat.we_are_admin, age, chat.admin_max_age_ms).ok().map(|()| Kind::Admin);
     }
     (message.direction == Direction::Outgoing && age.abs() <= chat.max_age_ms).then_some(Kind::Normal)
+}
+
+/// The status an outgoing message of ours takes when a delete for everyone
+/// sent elsewhere (another admin, or our other device) deletes it: its
+/// status then describes the message's own send, and a failed or partial
+/// one would offer "Retry Delete for Everyone" for a delete this device
+/// never sent. Desktop sets `deletedForEveryoneFailed` only on the device
+/// that sent the delete (`ts/util/deleteForEveryone`). `None` keeps it.
+pub fn status_after_received_delete(message: &Message) -> Option<DeliveryStatus> {
+    let failed = matches!(message.status, DeliveryStatus::Failed | DeliveryStatus::PartialSent);
+    (message.direction == Direction::Outgoing && failed).then_some(DeliveryStatus::Sent)
 }
 
 /// Whether we can delete `message` for everyone as a group admin at `now`,
@@ -356,6 +371,22 @@ mod tests {
         assert_eq!(retry_kind(&theirs, GROUP, now), Some(Kind::Admin));
         assert_eq!(retry_kind(&theirs, Chat { we_are_admin: false, ..GROUP }, now), None);
         assert_eq!(retry_kind(&failed(Direction::Incoming, false, now - 1000), GROUP, now), None, "theirs, not by us");
+        // Another admin deleted our message that reached only some: no
+        // delete of ours to retry, though its own send was partial.
+        let other_admin = Message {
+            deleted_by_admin: Some(signal_store::DeletedByAdmin { by: Some("other".into()) }),
+            ..partly.clone()
+        };
+        assert_eq!(retry_kind(&other_admin, GROUP, now), None);
+    }
+
+    #[test]
+    fn a_delete_sent_elsewhere_settles_a_failed_send() {
+        let ours = |status| message(Direction::Outgoing, status, 0);
+        assert_eq!(status_after_received_delete(&ours(DeliveryStatus::PartialSent)), Some(DeliveryStatus::Sent));
+        assert_eq!(status_after_received_delete(&ours(DeliveryStatus::Failed)), Some(DeliveryStatus::Sent));
+        assert_eq!(status_after_received_delete(&ours(DeliveryStatus::Delivered)), None);
+        assert_eq!(status_after_received_delete(&message(Direction::Incoming, DeliveryStatus::Failed, 0)), None);
     }
 
     #[test]
