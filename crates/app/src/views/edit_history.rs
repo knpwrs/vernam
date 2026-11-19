@@ -51,6 +51,8 @@ pub(crate) fn versions(current: &Message, history: &[EditRevision]) -> Vec<Messa
             mentions: revision.mentions.clone(),
             styles: revision.styles.clone(),
             edited: false,
+            // "Deleted" marks the message as it is, not its earlier versions.
+            kept_deleted: false,
             // The preview was the latest text's; earlier ones' weren't kept.
             link_preview: None,
             // Only text is edited.
@@ -147,6 +149,7 @@ mod tests {
             attachments: vec![],
             link_preview: None,
             deleted: false,
+            kept_deleted: false,
             edited: true,
             expires_in: 0,
             expire_start: None,

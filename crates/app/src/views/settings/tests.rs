@@ -159,6 +159,46 @@ fn appearance_chooses_the_default_chat_color(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn keep_deleted_messages_asks_before_turning_off(cx: &mut TestAppContext) {
+    let h = Harness::open(cx, Page::Chats);
+    assert_eq!(h.value(cx, "keep-deleted-messages").as_deref(), Some("off"));
+    h.click(cx, "keep-deleted-messages");
+    assert!(wait(cx, |_| h.stored(signal_backend::SETTING_KEEP_DELETED_MESSAGES).as_deref() == Some("true")));
+    assert_eq!(h.value(cx, "keep-deleted-messages").as_deref(), Some("on"));
+
+    // The demo's message Maya deleted, kept.
+    let kept = |h: &Harness| {
+        let db = h.backend.db().clone();
+        let maya = signal_store::ConversationId("d:00000000-0000-4000-8000-00000000a11c".into());
+        let messages = futures::executor::block_on(h.backend.spawn(async move { db.messages(&maya, None, 500).await })).unwrap();
+        let message = messages.into_iter().find(|m| m.deleted).expect("the demo's deleted message");
+        (message.kept_deleted, message.body)
+    };
+    assert_eq!(kept(&h), (true, "Oops, that was meant for the family chat".to_owned()));
+
+    // Turning it off asks first; Cancel leaves it on.
+    h.click(cx, "keep-deleted-messages");
+    assert!(h.shown(cx, "keep-deleted-erase"));
+    h.click(cx, "keep-deleted-cancel");
+    assert_eq!(h.value(cx, "keep-deleted-messages").as_deref(), Some("on"));
+    assert_eq!(h.stored(signal_backend::SETTING_KEEP_DELETED_MESSAGES).as_deref(), Some("true"));
+    // "Keep them" turns it off and leaves the kept message as it was.
+    h.click(cx, "keep-deleted-messages");
+    h.click(cx, "keep-deleted-keep");
+    assert!(wait(cx, |_| h.stored(signal_backend::SETTING_KEEP_DELETED_MESSAGES).as_deref() == Some("false")));
+    assert_eq!(h.value(cx, "keep-deleted-messages").as_deref(), Some("off"));
+    assert!(kept(&h).0);
+    // "Erase them" erases it.
+    h.click(cx, "keep-deleted-messages");
+    assert!(wait(cx, |_| h.stored(signal_backend::SETTING_KEEP_DELETED_MESSAGES).as_deref() == Some("true")));
+    h.click(cx, "keep-deleted-messages");
+    h.click(cx, "keep-deleted-erase");
+    assert!(wait(cx, |_| kept(&h) == (false, String::new())));
+    assert_eq!(h.stored(signal_backend::SETTING_KEEP_DELETED_MESSAGES).as_deref(), Some("false"));
+    assert_eq!(h.value(cx, "keep-deleted-messages").as_deref(), Some("off"));
+}
+
+#[gpui_kit::test]
 fn chat_folders_are_made_from_suggestions_and_the_editor(cx: &mut TestAppContext) {
     use signal_store::ChatFolderType;
     let h = Harness::open(cx, Page::Chats);
@@ -566,6 +606,7 @@ fn sealed_sender_shows_in_message_details_when_on(cx: &mut TestAppContext) {
         attachments: Vec::new(),
         link_preview: None,
         deleted: false,
+        kept_deleted: false,
         edited: false,
         expires_in: 0,
         expire_start: None,

@@ -296,6 +296,13 @@ impl Poll {
         true
     }
 
+    /// Gives up every vote of ours still sending (its poll was deleted for
+    /// everyone and kept). Returns whether any was.
+    pub fn give_up_votes(&mut self) -> bool {
+        let pending: Vec<u32> = self.votes.iter().filter(|v| v.author.is_none() && v.pending).map(|v| v.vote_count).collect();
+        pending.into_iter().fold(false, |any, count| self.give_up_vote(count) || any)
+    }
+
     /// We gave up sending our vote numbered `vote_count` (Desktop's
     /// `markOutgoingPollVoteFailed`): if it reached nobody it goes;
     /// otherwise it stays as sent, since some have it. Returns whether

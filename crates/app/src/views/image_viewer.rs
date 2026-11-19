@@ -333,14 +333,14 @@ impl gpui_kit::Render for ImageViewer {
                     // Desktop's Forward and Save, which a view-once photo
                     // hasn't; and its message in the chat.
                     .when(in_chat.is_some(), |d| {
-                        d.child(
+                        d.when(in_chat.as_ref().is_some_and(|c| c.forwardable()), |d| d.child(
                             Button::new("forward-image")
                                 .ghost()
                                 .small()
                                 .icon(IconName::Forward)
                                 .tooltip("Forward")
                                 .on_click(cx.listener(|this, _, window, cx| this.leave_for(true, window, cx))),
-                        )
+                        ))
                         .child(
                             Button::new("go-to-image-message")
                                 .ghost()

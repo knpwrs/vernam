@@ -1,17 +1,17 @@
 //! Desktop's Chats page: address book photos, keeping muted chats
 //! archived, link previews, emoticons, the text formatting popover, chat
-//! folders, and importing the phone's contacts. (Its spell check, skin tone
-//! and chat export aren't here.)
+//! folders, and importing the phone's contacts. (Its skin tone and chat
+//! export aren't here.) "Keep deleted messages" is Vernam's own.
 
-use gpui_kit::component::button::Button;
-use gpui_kit::component::{Disableable as _, Sizable as _};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::{Disableable as _, Sizable as _, WindowExt as _};
 use gpui_kit::prelude::*;
-use gpui_kit::{AnyElement, App, Entity, SharedString, div};
+use gpui_kit::{AnyElement, App, Entity, SharedString, Window, div, px};
 use signal_backend::AccountSetting;
 
 use super::{Settings, list, switch};
 use crate::prefs::Toggle;
-use crate::state::ContactSync;
+use crate::state::{AppState, ContactSync};
 use crate::theme::Palette;
 
 pub(super) fn render(settings: &Entity<Settings>, palette: Palette, cx: &mut App) -> AnyElement {
@@ -29,6 +29,7 @@ pub(super) fn render(settings: &Entity<Settings>, palette: Palette, cx: &mut App
     let emoji_state = state.clone();
     let formatting_state = state.clone();
     let spell_state = state.clone();
+    let keep_state = state.clone();
     let sync_state = state.clone();
     let pending = matches!(sync, ContactSync::Pending(_));
     div()
@@ -50,6 +51,25 @@ pub(super) fn render(settings: &Entity<Settings>, palette: Palette, cx: &mut App
                     "Keep muted chats archived",
                     "Muted chats that are archived will remain archived when a new message arrives.",
                     AccountSetting::KeepMutedChatsArchived,
+                ),
+                switch(
+                    "keep-deleted-messages",
+                    "Keep deleted messages",
+                    Some(
+                        "When someone deletes a message for everyone, keep it here, marked as deleted. \
+                         Applies to messages deleted after you turn this on."
+                            .into(),
+                    ),
+                    prefs.on(Toggle::KeepDeletedMessages),
+                    false,
+                    palette,
+                    move |on, window, cx| {
+                        if on {
+                            keep_state.update(cx, |s, cx| s.set_toggle(Toggle::KeepDeletedMessages, true, cx));
+                        } else {
+                            confirm_keep_deleted_off(keep_state.clone(), window, cx);
+                        }
+                    },
                 ),
             ],
             palette,
@@ -134,6 +154,36 @@ pub(super) fn render(settings: &Entity<Settings>, palette: Palette, cx: &mut App
             palette,
         ))
         .into_any_element()
+}
+
+/// Turning "Keep deleted messages" off asks what becomes of the messages
+/// it kept: they stay, or lose what they said as any deleted message
+/// does. Cancel leaves it on.
+fn confirm_keep_deleted_off(state: Entity<AppState>, window: &mut Window, cx: &mut App) {
+    use gpui_kit::component::dialog::DialogFooter;
+    window.open_dialog(cx, move |dialog, _, _| {
+        let (keep, erase) = (state.clone(), state.clone());
+        dialog
+            .w(px(420.))
+            .title("Turn off Keep deleted messages?")
+            .child(div().text_sm().child(
+                "Messages already kept after someone deleted them can stay, or lose what they said, as other deleted messages do.",
+            ))
+            .footer(
+                DialogFooter::new()
+                    .child(Button::new("keep-deleted-cancel").label("Cancel").outline().on_click(|_, window, cx| window.close_dialog(cx)))
+                    .child(Button::new("keep-deleted-keep").label("Keep them").outline().on_click(move |_, window, cx| {
+                        keep.update(cx, |s, cx| s.set_toggle(Toggle::KeepDeletedMessages, false, cx));
+                        window.close_dialog(cx);
+                        window.refresh();
+                    }))
+                    .child(Button::new("keep-deleted-erase").label("Erase them").danger().on_click(move |_, window, cx| {
+                        erase.update(cx, |s, cx| s.erase_kept_deletes(cx));
+                        window.close_dialog(cx);
+                        window.refresh();
+                    })),
+            )
+    });
 }
 
 /// Desktop's `syncExplanation` and `Preferences--lastSynced` ("Last import

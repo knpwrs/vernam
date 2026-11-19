@@ -181,6 +181,12 @@ impl Actor {
             return Outcome::Refused;
         };
         let (target, ours) = match self.db.find_message(conversation, target_author.as_deref(), *target_sent_at).await {
+            // A deleted message takes none, kept or not (Desktop's
+            // `handleReaction`, `ts/messageModifiers/Reactions`).
+            Ok(Some(message)) if message.deleted => {
+                info!("ignoring a reaction to a deleted message");
+                return Outcome::Refused;
+            }
             Ok(Some(message)) => (message.id, message.direction == Direction::Outgoing),
             Ok(None) => {
                 debug!("reaction target not found");
@@ -246,9 +252,12 @@ impl Actor {
             info!("ignoring a delete for everyone that came too late");
             return Outcome::Refused;
         }
+        // The author's: ours when we wrote it.
+        let keep = self.keeps_deleted(&message, target_author.is_none()).await;
         // A view-once message's media goes too.
         self.erase_view_once(message.id, signal_store::ViewOnce::Gone).await;
-        match self.db.mark_deleted(message.id).await {
+        let marked = if keep { self.db.keep_deleted(message.id).await.map(|_| ()) } else { self.db.mark_deleted(message.id).await };
+        match marked {
             Ok(()) => {
                 self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id: message.id });
                 self.emit(Event::ConversationsChanged);
@@ -259,6 +268,13 @@ impl Actor {
                 Outcome::Failed
             }
         }
+    }
+
+    /// Whether a delete for everyone, ours (from another device) or not,
+    /// keeps what `message` said (`deletes::keeps`).
+    async fn keeps_deleted(&self, message: &signal_store::Message, ours: bool) -> bool {
+        let setting = self.db.setting(crate::SETTING_KEEP_DELETED_MESSAGES).await.ok().flatten();
+        crate::deletes::keeps(message, ours, setting.as_deref())
     }
 
     async fn apply_admin_delete(&self, action: &Action) -> Outcome {
@@ -290,8 +306,10 @@ impl Actor {
             info!(reason, "ignoring an admin delete");
             return Outcome::Refused;
         }
+        // Ours when no other admin is named.
+        let keep = self.keeps_deleted(&message, by.is_none()).await;
         self.erase_view_once(message.id, signal_store::ViewOnce::Gone).await;
-        match self.db.mark_deleted_by_admin(message.id, &signal_store::DeletedByAdmin { by: by.clone() }).await {
+        match self.db.mark_deleted_by_admin(message.id, &signal_store::DeletedByAdmin { by: by.clone() }, keep).await {
             Ok(true) => {
                 self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id: message.id });
                 self.emit(Event::ConversationsChanged);
@@ -313,6 +331,13 @@ impl Actor {
             // View-once messages can't be edited (Desktop's `handleEditMessage`).
             Ok(Some(message)) if message.view_once.is_some() => {
                 info!("ignoring an edit to a view-once message");
+                return Outcome::Refused;
+            }
+            // Nor can a deleted one (Desktop's `handleEditMessage`), which
+            // keeps its text if kept: its formatting and long text mustn't
+            // land on it either.
+            Ok(Some(message)) if message.deleted => {
+                info!("ignoring an edit to a deleted message");
                 return Outcome::Refused;
             }
             Ok(Some(message)) => message.id,

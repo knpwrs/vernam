@@ -87,6 +87,11 @@ impl Actor {
             Ok(false) => return,
             Err(error) => return self.error("failed to mark a message viewed", error),
         }
+        // A deleted one ("Keep deleted messages" keeps its audio) is played
+        // here only: nobody, its author least of all, hears that it was.
+        if message.deleted {
+            return;
+        }
         let author = message.author.clone().unwrap_or_else(|| self.self_aci());
         if message.direction == Direction::Incoming
             && self.setting_on(crate::AccountSetting::ReadReceipts).await

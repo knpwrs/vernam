@@ -3238,6 +3238,13 @@ impl AppState {
         cx.notify();
     }
 
+    /// "Keep deleted messages" turned off, erasing what it kept
+    /// (`Command::EraseKeptDeletes`); the backend saves it off as well.
+    pub fn erase_kept_deletes(&mut self, cx: &mut Context<Self>) {
+        self.set_toggle(crate::prefs::Toggle::KeepDeletedMessages, false, cx);
+        self.send(Command::EraseKeptDeletes);
+    }
+
     /// Desktop's "Default timer for new chats", for the whole account.
     pub fn set_universal_timer(&mut self, seconds: u32, cx: &mut Context<Self>) {
         self.prefs.universal_timer = seconds;

@@ -32,6 +32,9 @@ pub struct MediaItem {
     pub sent_at: i64,
     /// Who sent it ("You" for ours).
     pub sender: String,
+    /// Its message was deleted and kept ("Keep deleted messages"): it can
+    /// be viewed and saved but not forwarded.
+    pub deleted: bool,
 }
 
 /// Where a viewed photo or video sits: its chat, its message and which
@@ -62,6 +65,13 @@ impl InChat {
         self.gallery.as_ref()?.get(to).cloned()
     }
 
+    /// Whether Forward is offered: not for a kept deleted message's media
+    /// (offered until the gallery says, since the backend skips deleted
+    /// messages anyway).
+    pub fn forwardable(&self) -> bool {
+        self.current().is_none_or(|item| !item.deleted)
+    }
+
     /// The item shown, once the gallery is loaded.
     pub fn current(&self) -> Option<&MediaItem> {
         self.gallery.as_ref()?.get(self.position()?)
@@ -76,7 +86,7 @@ pub fn gallery(newest_first: &[Message]) -> Vec<MediaItem> {
     let mut items = Vec::new();
     for message in newest_first.iter().rev() {
         // A shared contact, payment or gift isn't media.
-        if message.deleted || message.view_once.is_some() || message.content.is_some() {
+        if (message.deleted && !message.kept_deleted) || message.view_once.is_some() || message.content.is_some() {
             continue;
         }
         let sender = match message.direction {
@@ -100,6 +110,7 @@ pub fn gallery(newest_first: &[Message]) -> Vec<MediaItem> {
                 content_type: attachment.content_type.clone(),
                 sent_at: message.sent_at,
                 sender: sender.clone(),
+                deleted: message.deleted,
             });
         }
     }
@@ -267,6 +278,7 @@ mod tests {
             attachments,
             link_preview: None,
             deleted: false,
+            kept_deleted: false,
             edited: false,
             expires_in: 0,
             expire_start: None,
@@ -352,5 +364,18 @@ mod tests {
         assert_eq!(in_chat.step(-1).map(|i| i.message_id), Some(1));
         assert_eq!(in_chat.step(2), None);
         assert_eq!(in_chat.current().map(|i| i.sender.as_str()), Some("Ana"));
+        assert!(in_chat.forwardable());
+    }
+
+    #[test]
+    fn a_kept_deleted_messages_media_shows_but_doesnt_forward() {
+        let kept = Message { deleted: true, kept_deleted: true, ..message(1, vec![attachment("image/png", Some("/p"))]) };
+        let erased = Message { deleted: true, ..message(2, vec![attachment("image/png", Some("/q"))]) };
+        let items = gallery(&[erased, kept]);
+        assert_eq!(items.iter().map(|i| (i.message_id, i.deleted)).collect::<Vec<_>>(), [(1, true)]);
+        let mut in_chat = InChat::new(ConversationId("d:a".into()), 1, 0);
+        assert!(in_chat.forwardable(), "until the gallery loads");
+        in_chat.gallery = Some(Rc::new(items));
+        assert!(!in_chat.forwardable());
     }
 }

@@ -110,12 +110,17 @@ fn show(
             .when_some(sealed.clone().filter(|_| states.is_empty()), |d, sealed| d.child(row("Sealed sender", sealed)));
         // Desktop's "View edit history" (`MessageDetail.dom.tsx`, for
         // `isEditedMessage`), opening what clicking "Edited" does. A deleted
-        // message has no earlier versions.
+        // message has no earlier versions unless it was kept.
         if shows_edit_history(&message) {
             use gpui_kit::component::button::{Button, ButtonVariants as _};
             let (view, current) = (view.clone(), message.clone());
             let button = Button::new("details-edit-history").label("View edit history").icon(IconName::Pencil).ghost().on_click(
-                move |_, window, cx| crate::views::edit_history::open(view.clone(), current.clone(), window, cx),
+                move |_, window, cx| {
+                    // Drawn as the message is now, as Desktop's modal does;
+                    // a kept deleted one says so in its time line.
+                    let current = Message { deleted: false, ..current.clone() };
+                    crate::views::edit_history::open(view.clone(), current, window, cx)
+                },
             );
             body = body.child(div().pt_1().flex().child(div().debug_selector(|| "details-edit-history".into()).child(button)));
         }
@@ -195,10 +200,10 @@ fn show(
     });
 }
 
-/// Whether the details offer the edit history: an edited message that
-/// isn't deleted.
+/// Whether the details offer the edit history: an edited message, not
+/// deleted unless "Keep deleted messages" kept it.
 pub(crate) fn shows_edit_history(message: &Message) -> bool {
-    message.edited && !message.deleted
+    message.edited && (!message.deleted || message.kept_deleted)
 }
 
 /// Desktop's sealed sender icon in message details

@@ -337,6 +337,18 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
     once.attachments = image("demo-view-once.png", PHOTO_WIDTH, PHOTO_HEIGHT).into_iter().collect();
     db.insert_message_view_once(&once, Some(signal_store::ViewOnce::Ready)).await?;
     db.set_reaction(home_id, react("❤️", None)).await?;
+    // One she deleted for everyone, kept by "Keep deleted messages", just
+    // before another of hers.
+    let kept = db.insert_message(&incoming(MAYA, MAYA, now - 51 * MINUTE, "Oops, that was meant for the family chat")).await?;
+    // Kept while the setting is on (the store checks), which then goes
+    // back to what it was: off in a new demo.
+    let setting = db.setting(crate::SETTING_KEEP_DELETED_MESSAGES).await?;
+    db.set_setting(crate::SETTING_KEEP_DELETED_MESSAGES, "true").await?;
+    db.keep_deleted(kept).await?;
+    match setting {
+        Some(value) => db.set_setting(crate::SETTING_KEEP_DELETED_MESSAGES, &value).await?,
+        None => db.remove_setting(crate::SETTING_KEEP_DELETED_MESSAGES).await?,
+    }
     let mut article = incoming(MAYA, MAYA, now - 50 * MINUTE, "This is the post I was telling you about: https://signal.org/blog/");
     let article_image = image("demo-preview-square.png", 160, 160);
     article.link_preview = Some(LinkPreview {
@@ -1524,12 +1536,21 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 // group admin (we are one in the house group).
                 let Ok(Some(m)) = db.message(message_id).await else { continue };
                 let deleted = if m.direction == Direction::Incoming {
-                    db.mark_deleted_by_admin(message_id, &signal_store::DeletedByAdmin { by: None }).await.is_ok()
+                    db.mark_deleted_by_admin(message_id, &signal_store::DeletedByAdmin { by: None }, false).await.is_ok()
                 } else {
                     db.mark_deleted(message_id).await.is_ok()
                 };
                 if deleted {
                     emit(Event::MessageChanged { conversation: m.conversation_id, message_id });
+                }
+            }
+            Command::EraseKeptDeletes => {
+                let _ = db.set_setting(crate::SETTING_KEEP_DELETED_MESSAGES, "false").await;
+                if let Ok(erased) = db.erase_kept_deletes().await {
+                    for (conversation, message_id) in erased {
+                        emit(Event::MessageChanged { conversation, message_id });
+                    }
+                    let _ = events.unbounded_send(Event::ConversationsChanged);
                 }
             }
             Command::DeleteForMe { message_ids } => {

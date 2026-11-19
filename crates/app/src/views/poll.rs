@@ -342,7 +342,8 @@ pub fn open_votes(view: WeakEntity<ConversationView>, state: Option<Entity<AppSt
                     }
                 })
         });
-        let can_end = message.direction == signal_store::Direction::Outgoing && !poll.ended;
+        // Not a kept deleted poll (as the message menu), which takes no end.
+        let can_end = message.direction == signal_store::Direction::Outgoing && !poll.ended && !message.deleted;
         let end_state = state.clone();
         dialog
             .child(

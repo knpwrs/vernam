@@ -998,7 +998,11 @@ impl ConversationView {
         let pin = &self.pins[ix];
         let id = pin.id;
         let author = self.reactor_name(pin.author.as_deref(), cx);
-        let preview = if pin.view_once.is_some() {
+        let preview = if pin.deleted {
+            // A pin stays when its message is deleted for everyone; kept or
+            // not, it doesn't show what it said.
+            "This message was deleted".into()
+        } else if pin.view_once.is_some() {
             // Desktop's `PinnedMessagesBar__MessagePreview__Text--ViewOnceMedia`.
             "View-once media".into()
         } else if !pin.body.is_empty() {
@@ -1938,7 +1942,8 @@ impl ConversationView {
         }
         // Desktop's `PaymentEventNotification`: a payment activation event
         // shows as a notice.
-        if let Some(signal_store::MessageContent::Payment(event)) = message.content.as_ref().filter(|_| !message.deleted)
+        if let Some(signal_store::MessageContent::Payment(event)) =
+            message.content.as_ref().filter(|_| !message.deleted || message.kept_deleted)
             && !event.is_notification()
         {
             let sender = message.author.as_ref().map(|a| self.reactor_name(Some(a), cx));
@@ -2346,7 +2351,15 @@ impl ConversationView {
         palette: Palette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let show_meta = last;
+        // Kept by "Keep deleted messages": drawn as it was, its time line
+        // marked "Deleted". The message itself stays deleted, so the row's
+        // actions and menu offer no reply, reaction or forward.
+        if message.deleted && message.kept_deleted {
+            let shown = Message { deleted: false, ..message.clone() };
+            return self.render_bubble(&shown, show_author, first, last, palette, cx);
+        }
+        // A kept deleted message always shows its time line, which says so.
+        let show_meta = last || message.kept_deleted;
         let clicks = self.meta_clicks(message, cx);
         let outgoing = message.direction == Direction::Outgoing;
         let corners = Corners::for_bubble(outgoing, first, last);
@@ -2695,7 +2708,8 @@ impl ConversationView {
 
         // A poll shows in place of its text (its body is the question).
         let poll = message.poll.as_ref().filter(|_| !message.deleted).map(|poll| {
-            let can_vote = !self.id.is_signal()
+            let can_vote = !message.kept_deleted
+                && !self.id.is_signal()
                 && self.state.read(cx).conversation(&self.id).is_none_or(|c| !c.left && !c.blocked && !c.ended && c.accepted);
             let secondary = if outgoing { meta_color } else { palette.text_secondary };
             crate::views::poll::render_poll(message, poll, outgoing, fg, secondary, can_vote, palette, cx.entity().downgrade(), self.state.clone())
@@ -3372,7 +3386,9 @@ impl ConversationView {
                     .overflow_y_scroll()
                     .pb_2()
                     .children(reactions.into_iter().enumerate().map(|(ix, reaction)| {
-                        let mine = reaction.author.is_none();
+                        // A kept deleted message's reactions stay, but none
+                        // can be sent for it, removals included.
+                        let mine = reaction.author.is_none() && !message.deleted;
                         let name = self.reactor_name(reaction.author.as_deref(), cx);
                         let color = color_for(reaction.author.as_deref().unwrap_or(""));
                         let emoji = reaction.emoji.clone();
@@ -3594,9 +3610,13 @@ fn confirm_retry_delete(state: Entity<AppState>, message_id: i64, window: &mut W
     });
 }
 
+/// Before the time of a message kept by "Keep deleted messages".
+const KEPT_DELETED: &str = "Deleted ·";
+
 fn render_meta(message: &Message, color: Hsla, palette: Palette, clicks: &MetaClicks) -> AnyElement {
     let outgoing = message.direction == Direction::Outgoing;
-    if let Some(words) = (outgoing && !message.deleted).then(|| status_words(message.status)).flatten() {
+    // A kept deleted one's time line says "Deleted", not how its send went.
+    if let Some(words) = (outgoing && !message.deleted && !message.kept_deleted).then(|| status_words(message.status)).flatten() {
         return div()
             .debug_selector(move || format!("status-{words}"))
             .text_size(px(META_SIZE))
@@ -3615,6 +3635,9 @@ fn render_meta(message: &Message, color: Hsla, palette: Palette, clicks: &MetaCl
         .gap(px(META_GAP))
         .text_size(px(META_SIZE))
         .text_color(color)
+        .when(message.kept_deleted, |d| {
+            d.child(div().debug_selector(move || format!("kept-deleted-{id}")).italic().child(KEPT_DELETED))
+        })
         .when(message.edited, |d| match clicks.edited.clone() {
             Some(open) => d.child(
                 div()
@@ -3764,7 +3787,7 @@ fn render_preview_card(
 
 /// Emoji-only messages (up to five) render large, without a bubble.
 fn jumbo_count(message: &Message) -> Option<usize> {
-    (!message.deleted && message.quote.is_none() && message.attachments.is_empty())
+    ((!message.deleted || message.kept_deleted) && message.quote.is_none() && message.attachments.is_empty())
         .then(|| signal_emoji::jumbo_count(&message.body))
         .flatten()
 }
@@ -4001,10 +4024,13 @@ fn text_width(cx: &App, text: &str, size: f32) -> f32 {
 /// Width of what [`render_meta`] draws.
 fn meta_width(message: &Message, cx: &App) -> f32 {
     let outgoing = message.direction == Direction::Outgoing;
-    if let Some(words) = (outgoing && !message.deleted).then(|| status_words(message.status)).flatten() {
+    if let Some(words) = (outgoing && !message.deleted && !message.kept_deleted).then(|| status_words(message.status)).flatten() {
         return text_width(cx, words, META_SIZE);
     }
     let mut parts = vec![text_width(cx, &message_time(message.sent_at), META_SIZE)];
+    if message.kept_deleted {
+        parts.push(text_width(cx, KEPT_DELETED, META_SIZE));
+    }
     if message.edited {
         parts.push(text_width(cx, "Edited ·", META_SIZE));
     }
@@ -5263,7 +5289,9 @@ fn message_menu(
     // Desktop's "Download", first: a save dialog for one attachment, a
     // folder for several (as the hover button's).
     let downloadable = downloadable(message);
-    if !downloadable.is_empty() && !message.deleted {
+    // A kept deleted message's are still here to save and copy.
+    let readable = !message.deleted || message.kept_deleted;
+    if !downloadable.is_empty() && readable {
         menu = menu.item(
             PopupMenuItem::new("Download")
                 .icon(IconName::Download)
@@ -5339,7 +5367,7 @@ fn message_menu(
         );
     }
     // A poll has no text to copy (its body is the question).
-    if !message.body.is_empty() && !message.deleted && message.poll.is_none() {
+    if !message.body.is_empty() && readable && message.poll.is_none() {
         let body = message.body.clone();
         menu = menu.item(
             PopupMenuItem::new("Copy text")
@@ -5932,7 +5960,7 @@ impl ConversationView {
         let Some(message) = self.targeted_message() else { return };
         // View-once media can't be saved (Desktop's `canDownload`).
         let downloadable = downloadable(&message);
-        if !downloadable.is_empty() && !message.deleted {
+        if !downloadable.is_empty() && (!message.deleted || message.kept_deleted) {
             download_attachments(downloadable, cx);
         }
     }
@@ -5995,6 +6023,7 @@ mod tests {
             attachments: Vec::new(),
             link_preview: None,
             deleted: false,
+            kept_deleted: false,
             edited: false,
             expires_in: 0,
             expire_start: None,
@@ -7998,6 +8027,26 @@ mod tests {
         cx.simulate_click(button.center(), gpui_kit::Modifiers::none());
         bounds(&mut cx, "edit-history".into());
         bounds(&mut cx, "edit-version-2".into());
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn a_kept_deleted_message_shows_what_it_said(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        // Maya deleted one while "Keep deleted messages" was on, with
+        // another of hers after it: each kept one says so, not only a run's
+        // last.
+        let kept = wait_for_messages(&backend, MAYA, 1, |m| m.kept_deleted).remove(0);
+        assert!(kept.deleted && !kept.body.is_empty());
+        let (mut cx, _view) = open_view(cx, &backend, MAYA);
+        bounds(&mut cx, format!("kept-deleted-{}", kept.id));
+        bounds(&mut cx, format!("bubble-{}", kept.id));
+        // Its details don't offer an edit history it never had.
+        assert!(!crate::views::message_info::shows_edit_history(&kept));
+        let edited = signal_store::Message { edited: true, ..kept.clone() };
+        assert!(crate::views::message_info::shows_edit_history(&edited));
+        let erased = signal_store::Message { kept_deleted: false, ..edited };
+        assert!(!crate::views::message_info::shows_edit_history(&erased));
         backend.shutdown();
     }
 

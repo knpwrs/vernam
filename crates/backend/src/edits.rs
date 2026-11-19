@@ -41,6 +41,7 @@ mod tests {
             attachments: Vec::new(),
             link_preview: None,
             deleted: false,
+            kept_deleted: false,
             edited: false,
             expires_in: 0,
             expire_start: None,

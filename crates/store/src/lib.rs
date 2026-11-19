@@ -406,6 +406,9 @@ pub struct Message {
     pub link_preview: Option<LinkPreview>,
     /// Remote-deleted ("This message was deleted").
     pub deleted: bool,
+    /// Deleted by someone else while "Keep deleted messages" was on: still
+    /// `deleted`, but its content stays to be shown.
+    pub kept_deleted: bool,
     pub edited: bool,
     pub expires_in: u32,
     /// When its disappearing countdown started (unix millis); `None` until
@@ -1197,7 +1200,7 @@ fn photo_trusted_sql(sid: &str, direct: &str) -> String {
 }
 
 const MESSAGE_COLUMNS: &str = "id, conversation_id, sent_at, received_at, direction, author, \
-     author_name, body, status, reactions, quote, attachments, link_preview, deleted, edited, expires_in, expire_start, edit_count, notice, mentions, styles, cta, deleted_by_admin, long_text, poll, view_once, sealed_sender, is_read, content";
+     author_name, body, status, reactions, quote, attachments, link_preview, deleted, edited, expires_in, expire_start, edit_count, notice, mentions, styles, cta, deleted_by_admin, long_text, poll, view_once, sealed_sender, is_read, content, kept_deleted";
 
 /// SQL matching a message by `{author}` whose own timestamp, or one of its
 /// edits', is the bound parameter `{param}`. Not `author_key = … AND
@@ -1415,6 +1418,7 @@ fn message_from_row(row: &SqliteRow) -> Result<Message> {
         attachments: serde_json::from_str(row.try_get("attachments")?)?,
         link_preview: link_preview.as_deref().map(serde_json::from_str).transpose()?,
         deleted: row.try_get("deleted")?,
+        kept_deleted: row.try_get("kept_deleted")?,
         edited: row.try_get("edited")?,
         expires_in: row.try_get::<i64, _>("expires_in")? as u32,
         expire_start: row.try_get("expire_start")?,
@@ -2041,7 +2045,7 @@ impl AppDb {
     /// first: Desktop's unread mentions (`getUnreadMentions`).
     pub async fn unread_mentions(&self, id: &ConversationId, me: &str) -> Result<Vec<i64>> {
         Ok(sqlx::query_scalar(
-            "SELECT id FROM messages WHERE conversation_id = ?1 AND is_read = 0 AND mentions IS NOT NULL \
+            "SELECT id FROM messages WHERE conversation_id = ?1 AND is_read = 0 AND deleted = 0 AND mentions IS NOT NULL \
                AND EXISTS (SELECT 1 FROM json_each(mentions) WHERE json_extract(value, '$.aci') = ?2) \
              ORDER BY sent_at, id",
         )
@@ -2364,11 +2368,12 @@ impl AppDb {
     }
 
     /// A chat's messages with attachments or link previews, newest first
-    /// (Desktop's "All media").
+    /// (Desktop's "All media"), deleted ones only when kept ("Keep deleted
+    /// messages"; the lightbox shows theirs, All media doesn't).
     pub async fn media_messages(&self, conversation: &ConversationId, limit: u32) -> Result<Vec<Message>> {
         let rows = sqlx::query(AssertSqlSafe(format!(
             "SELECT {MESSAGE_COLUMNS} FROM messages \
-             WHERE conversation_id = ? AND deleted = 0 AND notice IS NULL AND view_once IS NULL \
+             WHERE conversation_id = ? AND (deleted = 0 OR kept_deleted = 1) AND notice IS NULL AND view_once IS NULL \
                AND (attachments != '[]' OR link_preview IS NOT NULL) \
              ORDER BY sent_at DESC, id DESC LIMIT ?"
         )))
@@ -2537,21 +2542,85 @@ impl AppDb {
         .await
     }
 
+    /// Marks a message deleted for everyone by its author but keeps what it
+    /// said ("Keep deleted messages", which isn't Desktop's): its text,
+    /// attachments, reactions and edit history stay, and it shows as
+    /// deleted. Its unread poll votes no longer count, as a deleted poll's.
+    /// Already deleted, it stays as it is. The setting is read again in the
+    /// same write: turned off meanwhile ([`Self::erase_kept_deletes`] may
+    /// already have run), it's erased as [`Self::mark_deleted`] would.
+    /// Returns whether the setting was on (so it was kept, if it wasn't
+    /// already deleted).
+    pub async fn keep_deleted(&self, message_id: i64) -> Result<bool> {
+        let mut tx = self.write().await?;
+        let keep = keeping_deleted(&mut tx).await?;
+        let sql = if keep {
+            "UPDATE messages SET deleted = 1, kept_deleted = 1, unread_poll_votes = 0 \
+             WHERE id = ? AND deleted = 0 RETURNING conversation_id"
+        } else {
+            "UPDATE messages SET deleted = 1, body = '', attachments = '[]', reactions = '[]', \
+             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL, long_text = NULL, poll = NULL, unread_poll_votes = 0, edit_history = NULL, content = NULL \
+             WHERE id = ? AND deleted = 0 RETURNING conversation_id"
+        };
+        let conversation: Option<String> = sqlx::query_scalar(sql).bind(message_id).fetch_optional(&mut *tx).await?;
+        if let Some(conversation) = &conversation {
+            if keep {
+                settle_kept_poll(&mut tx, message_id).await?;
+            }
+            refresh_preview(&mut tx, &ConversationId(conversation.clone())).await?;
+        }
+        tx.commit().await?;
+        Ok(keep)
+    }
+
+    /// Erases what every kept deleted message said ("Keep deleted messages"
+    /// turned off with "Erase"), as [`Self::mark_deleted`] would have when
+    /// it was deleted; who deleted it (`deleted_by_admin`) stays. Returns
+    /// each erased message's chat and id.
+    pub async fn erase_kept_deletes(&self) -> Result<Vec<(ConversationId, i64)>> {
+        let mut tx = self.write().await?;
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "UPDATE messages SET kept_deleted = 0, body = '', attachments = '[]', reactions = '[]', \
+             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL, long_text = NULL, poll = NULL, unread_poll_votes = 0, edit_history = NULL, content = NULL \
+             WHERE kept_deleted = 1 RETURNING conversation_id, id",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut chats: Vec<&String> = rows.iter().map(|(c, _)| c).collect();
+        chats.sort();
+        chats.dedup();
+        for chat in chats {
+            refresh_preview(&mut tx, &ConversationId(chat.clone())).await?;
+        }
+        tx.commit().await?;
+        Ok(rows.into_iter().map(|(c, id)| (ConversationId(c), id)).collect())
+    }
+
     /// Deletes a message for everyone on a group admin's say (Desktop's
     /// admin delete), noting who. Returns false when it was already deleted,
-    /// which keeps whoever deleted it first.
-    pub async fn mark_deleted_by_admin(&self, message_id: i64, by: &DeletedByAdmin) -> Result<bool> {
+    /// which keeps whoever deleted it first. With `keep` ("Keep deleted
+    /// messages"), what it said stays, as [`Self::keep_deleted`].
+    pub async fn mark_deleted_by_admin(&self, message_id: i64, by: &DeletedByAdmin, keep: bool) -> Result<bool> {
         let mut tx = self.write().await?;
-        let conversation: Option<String> = sqlx::query_scalar(
+        // Read again in this write, as `keep_deleted` does.
+        let keep = keep && keeping_deleted(&mut tx).await?;
+        let sql = if keep {
+            "UPDATE messages SET deleted = 1, kept_deleted = 1, deleted_by_admin = ?2, unread_poll_votes = 0 \
+             WHERE id = ?1 AND deleted = 0 RETURNING conversation_id"
+        } else {
             "UPDATE messages SET deleted = 1, deleted_by_admin = ?2, body = '', attachments = '[]', reactions = '[]', \
-             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL, long_text = NULL, poll = NULL, edit_history = NULL, content = NULL WHERE id = ?1 AND deleted = 0 \
-             RETURNING conversation_id",
-        )
+             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL, long_text = NULL, poll = NULL, unread_poll_votes = 0, edit_history = NULL, content = NULL \
+             WHERE id = ?1 AND deleted = 0 RETURNING conversation_id"
+        };
+        let conversation: Option<String> = sqlx::query_scalar(sql)
         .bind(message_id)
         .bind(serde_json::to_string(by)?)
         .fetch_optional(&mut *tx)
         .await?;
         if let Some(conversation) = &conversation {
+            if keep {
+                settle_kept_poll(&mut tx, message_id).await?;
+            }
             refresh_preview(&mut tx, &ConversationId(conversation.clone())).await?;
         }
         tx.commit().await?;
@@ -2641,7 +2710,7 @@ impl AppDb {
     /// Keeps (or with `None`, forgets) a message's long text still to come.
     pub async fn set_long_text(&self, message_id: i64, long_text: Option<&LongText>) -> Result<()> {
         let json = long_text.map(serde_json::to_string).transpose()?;
-        sqlx::query("UPDATE messages SET long_text = ? WHERE id = ? AND deleted = 0")
+        sqlx::query("UPDATE messages SET long_text = ? WHERE id = ? AND (deleted = 0 OR kept_deleted = 1)")
             .bind(json)
             .bind(message_id)
             .execute(&self.writer)
@@ -2708,7 +2777,7 @@ impl AppDb {
     /// at most `limit`.
     pub async fn long_texts_to_resume(&self, limit: usize) -> Result<Vec<(i64, Option<i64>)>> {
         let rows: Vec<(i64, String)> = sqlx::query_as(
-            "SELECT id, long_text FROM messages WHERE long_text IS NOT NULL AND deleted = 0 ORDER BY id DESC",
+            "SELECT id, long_text FROM messages WHERE long_text IS NOT NULL AND (deleted = 0 OR kept_deleted = 1) ORDER BY id DESC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -2882,7 +2951,7 @@ impl AppDb {
 
     /// Replaces a message's link preview (an edit's); a deleted message keeps none.
     pub async fn set_link_preview(&self, message_id: i64, preview: Option<&LinkPreview>) -> Result<()> {
-        sqlx::query("UPDATE messages SET link_preview = ? WHERE id = ? AND deleted = 0")
+        sqlx::query("UPDATE messages SET link_preview = ? WHERE id = ? AND (deleted = 0 OR kept_deleted = 1)")
             .bind(preview.map(serde_json::to_string).transpose()?)
             .bind(message_id)
             .execute(&self.writer)
@@ -3440,11 +3509,36 @@ async fn ensure_conversation(
 /// Recomputes the conversation's preview from its newest message.
 /// A live message's long text still to come, if any.
 async fn current_long_text(conn: &mut sqlx::SqliteConnection, message_id: i64) -> Result<Option<LongText>> {
-    let json: Option<Option<String>> = sqlx::query_scalar("SELECT long_text FROM messages WHERE id = ? AND deleted = 0")
+    let json: Option<Option<String>> = sqlx::query_scalar("SELECT long_text FROM messages WHERE id = ? AND (deleted = 0 OR kept_deleted = 1)")
         .bind(message_id)
         .fetch_optional(&mut *conn)
         .await?;
     Ok(json.flatten().map(|j| serde_json::from_str(&j)).transpose()?)
+}
+
+/// Settings key: `"true"` to keep what a message said when someone else
+/// deletes it for everyone, shown marked as deleted ("Keep deleted
+/// messages"). Not a Signal setting (Desktop always erases it); unset is off.
+pub const KEEP_DELETED_MESSAGES: &str = "keep_deleted_messages";
+
+/// A kept deleted poll's votes of ours still sending are given up, as no
+/// more will go (Desktop sends none to a deleted message).
+async fn settle_kept_poll(conn: &mut sqlx::SqliteConnection, message_id: i64) -> Result<()> {
+    let json: Option<String> =
+        sqlx::query_scalar::<_, Option<String>>("SELECT poll FROM messages WHERE id = ?").bind(message_id).fetch_optional(&mut *conn).await?.flatten();
+    let Some(json) = json else { return Ok(()) };
+    let mut poll: Poll = serde_json::from_str(&json)?;
+    if poll.give_up_votes() {
+        sqlx::query("UPDATE messages SET poll = ? WHERE id = ?").bind(serde_json::to_string(&poll)?).bind(message_id).execute(&mut *conn).await?;
+    }
+    Ok(())
+}
+
+/// Whether "Keep deleted messages" is on, read inside a write.
+async fn keeping_deleted(conn: &mut sqlx::SqliteConnection) -> Result<bool> {
+    let value: Option<String> =
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = ?").bind(KEEP_DELETED_MESSAGES).fetch_optional(&mut *conn).await?;
+    Ok(value.as_deref() == Some("true"))
 }
 
 async fn refresh_preview(conn: &mut sqlx::SqliteConnection, id: &ConversationId) -> Result<()> {

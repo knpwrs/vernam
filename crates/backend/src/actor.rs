@@ -1060,6 +1060,7 @@ impl Actor {
                 Command::DismissServerAlert(alert) => self.dismiss_server_alert(alert).await,
                 Command::Typing { conversation, started } => self.typing(conversation, started).await,
                 Command::DeleteForMe { message_ids } => self.delete_for_me(message_ids).await,
+                Command::EraseKeptDeletes => self.erase_kept_deletes().await,
                 Command::RetrySend { message_id } => self.retry_send(message_id).await,
                 Command::EditMessage { message_id, body, mentions, styles, preview } => {
                     self.edit_message(message_id, body, mentions, styles, preview).await
@@ -3810,6 +3811,26 @@ impl Actor {
         });
     }
 
+    /// `Command::EraseKeptDeletes`. The setting is saved off here too, before
+    /// erasing, so a delete arriving meanwhile isn't kept after the erase.
+    async fn erase_kept_deletes(self: Rc<Self>) {
+        if let Err(error) = self.db.set_setting(crate::SETTING_KEEP_DELETED_MESSAGES, "false").await {
+            self.error("failed to turn off keeping deleted messages", error);
+            return;
+        }
+        match self.db.erase_kept_deletes().await {
+            Ok(erased) => {
+                for (conversation, message_id) in &erased {
+                    self.emit(Event::MessageChanged { conversation: conversation.clone(), message_id: *message_id });
+                }
+                if !erased.is_empty() {
+                    self.emit(Event::ConversationsChanged);
+                }
+            }
+            Err(error) => self.error("failed to erase kept deleted messages", error),
+        }
+    }
+
     /// Removes a message here and tells our other devices (Signal's
     /// "delete for me").
     async fn delete_for_me(self: Rc<Self>, message_ids: Vec<i64>) {
@@ -4477,7 +4498,7 @@ impl Actor {
         self.maybe_apply_universal_timer(&conversation).await;
         let timestamp = self.next_timestamp();
         let quoted = match quote {
-            Some(id) => self.db.message(id).await.ok().flatten(),
+            Some(id) => self.db.message(id).await.ok().flatten().map(crate::deletes::quotable),
             None => None,
         };
         let quote = quoted.as_ref().map(|m| Quote {
@@ -4557,7 +4578,8 @@ impl Actor {
     }
 
     async fn react(self: Rc<Self>, message_id: i64, emoji: String, remove: bool) {
-        let Some(target) = self.db.message(message_id).await.ok().flatten() else {
+        // A deleted message takes no reaction, nor a removal of one it kept.
+        let Some(target) = self.db.message(message_id).await.ok().flatten().filter(|m| !m.deleted) else {
             return;
         };
         let timestamp = self.next_timestamp();
@@ -4626,7 +4648,7 @@ impl Actor {
         let marked = match kind {
             crate::deletes::Kind::Normal => self.db.mark_deleted(message_id).await.map(|()| true),
             crate::deletes::Kind::Admin => {
-                self.db.mark_deleted_by_admin(message_id, &signal_store::DeletedByAdmin { by: None }).await
+                self.db.mark_deleted_by_admin(message_id, &signal_store::DeletedByAdmin { by: None }, false).await
             }
         };
         match marked {

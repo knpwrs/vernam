@@ -302,8 +302,9 @@ impl Actor {
         vote_count: u32,
         attempt: u32,
     ) {
-        // Deleted, or no longer a poll: nothing to send.
-        let Some(message) = self.db.message(message_id).await.ok().flatten() else { return };
+        // Deleted (a kept poll's votes were settled then), or no longer a
+        // poll: nothing to send.
+        let Some(message) = self.db.message(message_id).await.ok().flatten().filter(|m| !m.deleted) else { return };
         let Some(poll) = &message.poll else { return };
         // A newer vote replaced it (and has its own send), or it's done.
         let Some(mut vote) = poll.our_pending_vote().filter(|v| v.vote_count == vote_count).cloned() else { return };

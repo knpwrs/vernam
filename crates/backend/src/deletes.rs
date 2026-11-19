@@ -181,6 +181,36 @@ pub fn can_receive(target: &Message, note_to_self: bool, deleted_at: i64) -> boo
     !note_to_self && !target.deleted && (deleted_at - target.sent_at).abs() <= max_age_ms() + RECEIVE_GRACE_MS
 }
 
+/// Whether a delete for everyone that came in keeps what `target` said,
+/// shown marked as deleted ("Keep deleted messages", not Desktop's):
+/// the setting (`setting`, as stored) is on, someone else deleted it
+/// (`ours`: we did, on another device), and it isn't view-once, whose
+/// media goes once deleted as once viewed.
+pub fn keeps(target: &Message, ours: bool, setting: Option<&str>) -> bool {
+    !ours && target.view_once.is_none() && crate::setting_on(setting)
+}
+
+/// A message as a reply may quote it: a deleted one as nothing but who
+/// wrote it and when, as if its content were erased, even when "Keep
+/// deleted messages" kept it here. (A reply started before the delete
+/// still names it.)
+pub fn quotable(message: Message) -> Message {
+    if !message.deleted {
+        return message;
+    }
+    Message {
+        body: String::new(),
+        styles: Vec::new(),
+        mentions: Vec::new(),
+        attachments: Vec::new(),
+        link_preview: None,
+        poll: None,
+        content: None,
+        long_text: None,
+        ..message
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,6 +232,7 @@ mod tests {
             attachments: Vec::new(),
             link_preview: None,
             deleted: false,
+            kept_deleted: false,
             edited: false,
             expires_in: 0,
             expire_start: None,
@@ -280,6 +311,27 @@ mod tests {
         // Never sent: no normal delete, and no admin delete either.
         let failed = message(Direction::Outgoing, DeliveryStatus::Failed, now - 1000);
         assert_eq!(send_kind(&failed, GROUP, now), None);
+    }
+
+    #[test]
+    fn a_kept_deleted_message_is_quoted_without_its_content() {
+        let theirs = Message { body: "secret".into(), ..message(Direction::Incoming, DeliveryStatus::Read, 5) };
+        assert_eq!(quotable(theirs.clone()).body, "secret");
+        let kept = Message { deleted: true, kept_deleted: true, ..theirs };
+        let quoted = quotable(kept);
+        assert!(quoted.body.is_empty() && quoted.attachments.is_empty() && quoted.poll.is_none());
+        assert_eq!(quoted.sent_at, 5, "still names the message");
+    }
+
+    #[test]
+    fn only_someone_elses_delete_keeps_the_message_with_the_setting_on() {
+        let theirs = message(Direction::Incoming, DeliveryStatus::Read, 0);
+        assert!(keeps(&theirs, false, Some("true")));
+        assert!(!keeps(&theirs, false, Some("false")));
+        assert!(!keeps(&theirs, false, None), "off by default");
+        assert!(!keeps(&theirs, true, Some("true")), "our own delete erases it");
+        let once = Message { view_once: Some(signal_store::ViewOnce::Ready), ..theirs };
+        assert!(!keeps(&once, false, Some("true")), "view-once media goes");
     }
 
     #[test]

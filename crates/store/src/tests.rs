@@ -471,7 +471,7 @@ async fn admin_deletes_note_the_admin_once() {
     db.set_reaction(id, Reaction { emoji: "👍".into(), author: Some("b".into()), sent_at: 11 }).await.unwrap();
 
     let admin = DeletedByAdmin { by: Some("b".into()) };
-    assert!(db.mark_deleted_by_admin(id, &admin).await.unwrap());
+    assert!(db.mark_deleted_by_admin(id, &admin, false).await.unwrap());
     reacted = db.message(id).await.unwrap().unwrap();
     assert!(reacted.deleted && reacted.body.is_empty() && reacted.reactions.is_empty());
     assert_eq!(reacted.deleted_by_admin, Some(admin.clone()));
@@ -479,13 +479,93 @@ async fn admin_deletes_note_the_admin_once() {
     assert!(preview.ends_with("This message was deleted"), "{preview}");
 
     // A second delete, ours this time, changes nothing.
-    assert!(!db.mark_deleted_by_admin(id, &DeletedByAdmin { by: None }).await.unwrap());
+    assert!(!db.mark_deleted_by_admin(id, &DeletedByAdmin { by: None }, false).await.unwrap());
     assert_eq!(db.message(id).await.unwrap().unwrap().deleted_by_admin, Some(admin));
 
     // The author's own delete leaves it unset.
     let own = db.insert_message(&incoming("g:x", "a", 20, "mine")).await.unwrap();
     db.mark_deleted(own).await.unwrap();
     assert!(db.message(own).await.unwrap().unwrap().deleted_by_admin.is_none());
+}
+
+#[tokio::test]
+async fn kept_deletes_keep_what_the_message_said() {
+    let db = test_db().await;
+    let mut m = incoming("g:x", "a", 10, "meet at 9");
+    m.attachments = vec![AttachmentMeta {
+        content_type: "image/png".into(),
+        file_name: Some("map.png".into()),
+        size: 10,
+        width: Some(1),
+        height: Some(1),
+        local_path: Some("/tmp/map.png".into()),
+        sticker: false,
+        gif: false,
+        voice: false,
+        remote: None,
+        thumbnail_path: None,
+        sticker_pack: None,
+        transcode: false,
+    }];
+    let id = db.insert_message(&m).await.unwrap();
+    db.edit_message(id, "meet at 9:30", 11).await.unwrap();
+    db.set_reaction(id, Reaction { emoji: "👍".into(), author: Some("b".into()), sent_at: 12 }).await.unwrap();
+
+    // Off, the store erases it after all (the setting may have changed
+    // since the caller read it).
+    let unset = db.insert_message(&incoming("g:x", "a", 5, "erased")).await.unwrap();
+    assert!(!db.keep_deleted(unset).await.unwrap());
+    assert!(db.message(unset).await.unwrap().unwrap().body.is_empty());
+    let admin_unset = db.insert_message(&incoming("g:x", "a", 6, "erased too")).await.unwrap();
+    assert!(db.mark_deleted_by_admin(admin_unset, &DeletedByAdmin { by: Some("b".into()) }, true).await.unwrap());
+    assert!(!db.message(admin_unset).await.unwrap().unwrap().kept_deleted);
+
+    db.set_setting(KEEP_DELETED_MESSAGES, "true").await.unwrap();
+    assert!(db.keep_deleted(id).await.unwrap());
+    let kept = db.message(id).await.unwrap().unwrap();
+    assert!(kept.deleted && kept.kept_deleted);
+    assert_eq!(kept.body, "meet at 9:30");
+    assert_eq!(kept.attachments.len(), 1);
+    assert_eq!(kept.reactions.len(), 1);
+    assert_eq!(db.edit_history(id).await.unwrap().len(), 1, "its earlier version stays");
+    // The chat's preview says it was deleted, as for any deleted message.
+    let preview = db.conversation(&conv("g:x")).await.unwrap().unwrap().last_message_preview.unwrap();
+    assert!(preview.ends_with("This message was deleted"), "{preview}");
+    // Deleted, it takes no edit.
+    db.edit_message(id, "meet at 10", 13).await.unwrap();
+    assert_eq!(db.message(id).await.unwrap().unwrap().body, "meet at 9:30");
+
+    // An admin's delete kept says who, and a later delete changes nothing.
+    let other = db.insert_message(&incoming("g:x", "a", 20, "off topic")).await.unwrap();
+    let admin = DeletedByAdmin { by: Some("b".into()) };
+    assert!(db.mark_deleted_by_admin(other, &admin, true).await.unwrap());
+    let kept = db.message(other).await.unwrap().unwrap();
+    assert!(kept.deleted && kept.kept_deleted && kept.body == "off topic");
+    assert_eq!(kept.deleted_by_admin, Some(admin));
+    db.keep_deleted(other).await.unwrap();
+    assert!(!db.mark_deleted_by_admin(other, &DeletedByAdmin { by: None }, false).await.unwrap());
+    assert_eq!(db.message(other).await.unwrap().unwrap().body, "off topic");
+
+    // Without keeping, nothing of it stays.
+    let gone = db.insert_message(&incoming("g:x", "a", 30, "gone")).await.unwrap();
+    db.mark_deleted(gone).await.unwrap();
+    let gone = db.message(gone).await.unwrap().unwrap();
+    assert!(gone.deleted && !gone.kept_deleted && gone.body.is_empty());
+
+    // Erasing what was kept leaves both as if never kept, the admin's name
+    // still on the second; a message that isn't deleted is untouched.
+    let live = db.insert_message(&incoming("g:x", "a", 40, "still here")).await.unwrap();
+    let mut erased = db.erase_kept_deletes().await.unwrap();
+    erased.sort_by_key(|(_, id)| *id);
+    assert_eq!(erased, vec![(conv("g:x"), id), (conv("g:x"), other)]);
+    let first = db.message(id).await.unwrap().unwrap();
+    assert!(first.deleted && !first.kept_deleted && first.body.is_empty() && first.attachments.is_empty() && first.reactions.is_empty());
+    assert!(db.edit_history(id).await.unwrap().is_empty());
+    let second = db.message(other).await.unwrap().unwrap();
+    assert!(second.deleted && !second.kept_deleted && second.body.is_empty());
+    assert_eq!(second.deleted_by_admin, Some(DeletedByAdmin { by: Some("b".into()) }));
+    assert_eq!(db.message(live).await.unwrap().unwrap().body, "still here");
+    assert!(db.erase_kept_deletes().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1142,6 +1222,8 @@ async fn drop_later_migrations(db: &AppDb) {
     sqlx::query("ALTER TABLE messages DROP COLUMN edit_history").execute(&db.writer).await.unwrap();
     sqlx::query("DROP TABLE scheduled_attachments").execute(&db.writer).await.unwrap();
     sqlx::query("DROP TABLE scheduled_messages").execute(&db.writer).await.unwrap();
+    sqlx::query("DROP INDEX messages_kept_deleted").execute(&db.writer).await.unwrap();
+    sqlx::query("ALTER TABLE messages DROP COLUMN kept_deleted").execute(&db.writer).await.unwrap();
 }
 
 /// Rewrites the migration history to look like a pre-squash database that
@@ -2026,6 +2108,21 @@ fn poll_votes_follow_desktops_rules() {
     assert!(!poll.apply_vote(vote(Some("b"), &[0], 1, 60), VoteSource::Other));
 }
 
+#[tokio::test]
+async fn a_kept_polls_vote_stops_sending() {
+    let db = test_db().await;
+    db.set_setting(KEEP_DELETED_MESSAGES, "true").await.unwrap();
+    let id = db.insert_message(&incoming("g:x", "a", 10, "Lunch?")).await.unwrap();
+    db.set_poll(id, &lunch()).await.unwrap();
+    // Ours, sending, when the poll's author deletes it.
+    let pending = PollVote { pending: true, ..our_vote(&[1], 1, 11, &["a"]) };
+    assert!(db.update_poll(id, |p| p.apply_vote(pending, VoteSource::ThisDevice)).await.unwrap());
+    assert!(db.keep_deleted(id).await.unwrap());
+    let poll = db.message(id).await.unwrap().unwrap().poll.unwrap();
+    assert!(poll.our_pending_vote().is_none(), "it reached no one, so it's gone");
+    assert_eq!(poll.question, "Lunch?");
+}
+
 /// Ours from here, to `to`.
 fn our_vote(options: &[u32], vote_count: u32, sent_at: i64, to: &[&str]) -> PollVote {
     PollVote { sends: to.iter().map(|t| (t.to_string(), false)).collect(), ..vote(None, options, vote_count, sent_at) }
@@ -2904,7 +3001,7 @@ async fn deleting_a_message_clears_its_content() {
 
     let admin = db.insert_message(&incoming("d:a", "a", 2_000, "")).await.unwrap();
     db.set_content(admin, &contact()).await.unwrap();
-    assert!(db.mark_deleted_by_admin(admin, &DeletedByAdmin { by: None }).await.unwrap());
+    assert!(db.mark_deleted_by_admin(admin, &DeletedByAdmin { by: None }, false).await.unwrap());
     assert_eq!(db.message(admin).await.unwrap().unwrap().content, None);
 }
 

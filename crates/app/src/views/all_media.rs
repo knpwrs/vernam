@@ -308,7 +308,8 @@ fn files(items: &[Item], state: &Entity<AppState>, palette: Palette) -> gpui_kit
 }
 
 fn links(messages: &[Message], palette: Palette) -> gpui_kit::AnyElement {
-    let previews: Vec<_> = messages.iter().filter_map(|m| m.link_preview.clone()).collect();
+    // Not a kept deleted message's, as `items` leaves its media out.
+    let previews: Vec<_> = messages.iter().filter(|m| !m.deleted).filter_map(|m| m.link_preview.clone()).collect();
     if previews.is_empty() {
         return empty("No links", palette);
     }

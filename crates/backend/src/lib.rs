@@ -234,6 +234,10 @@ pub const SETTING_STORIES_DISABLED: &str = "stories_disabled";
 /// (Desktop's `storyViewReceiptsEnabled`; unset follows read receipts).
 pub const SETTING_STORY_VIEW_RECEIPTS: &str = "story_view_receipts";
 
+/// Settings key: "Keep deleted messages" (`signal_store::KEEP_DELETED_MESSAGES`,
+/// which the store reads too).
+pub const SETTING_KEEP_DELETED_MESSAGES: &str = signal_store::KEEP_DELETED_MESSAGES;
+
 /// Settings key: lossless optimization of images we send (`max`, `fast` or
 /// `off`; see [`media::Optimization`]). Not a Signal setting.
 pub const SETTING_IMAGE_OPTIMIZATION: &str = "image_optimization";
@@ -442,6 +446,10 @@ pub enum Command {
     Typing { conversation: ConversationId, started: bool },
     /// Deletes messages on this device and your other devices.
     DeleteForMe { message_ids: Vec<i64> },
+    /// "Keep deleted messages" turned off with "Erase": it's saved off,
+    /// then every kept deleted message loses what it said, on this device
+    /// only (each device keeps its own).
+    EraseKeptDeletes,
     /// Pins a message for everyone in the chat; `duration` in seconds,
     /// `None` for forever.
     PinMessage { message_id: i64, duration: Option<u32> },

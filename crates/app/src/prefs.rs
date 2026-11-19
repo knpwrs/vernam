@@ -133,10 +133,14 @@ pub enum Toggle {
     /// "Spell check text entered in message composition box" (Desktop's
     /// `spellCheck`, on by default).
     SpellCheck,
+    /// "Keep deleted messages": someone else's delete for everyone leaves
+    /// what the message said, marked as deleted (the backend reads it).
+    /// Not Desktop's; off by default.
+    KeepDeletedMessages,
 }
 
 impl Toggle {
-    pub const ALL: [Toggle; 7] = [
+    pub const ALL: [Toggle; 8] = [
         Self::IncomingCalls,
         Self::CallSounds,
         Self::AlwaysRelayCalls,
@@ -144,6 +148,7 @@ impl Toggle {
         Self::MessageSounds,
         Self::TextFormatting,
         Self::SpellCheck,
+        Self::KeepDeletedMessages,
     ];
 
     pub fn key(self) -> &'static str {
@@ -155,6 +160,7 @@ impl Toggle {
             Self::MessageSounds => "message_sounds",
             Self::TextFormatting => "text_formatting",
             Self::SpellCheck => "spell_check",
+            Self::KeepDeletedMessages => signal_backend::SETTING_KEEP_DELETED_MESSAGES,
         }
     }
 

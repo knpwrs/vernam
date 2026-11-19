@@ -232,7 +232,9 @@ impl gpui_kit::Render for VideoViewer {
                     .pl(px(92.))
                     .child(lightbox::header(self.video.in_chat.as_ref(), self.video.file_name.as_deref()))
                     .when(in_chat.is_some(), |d| {
-                        d.child(tool("forward-video", IconName::Forward).on_click(cx.listener(|this, _, window, cx| this.leave_for(true, window, cx))))
+                        d.when(in_chat.as_ref().is_some_and(|c| c.forwardable()), |d| {
+                            d.child(tool("forward-video", IconName::Forward).on_click(cx.listener(|this, _, window, cx| this.leave_for(true, window, cx))))
+                        })
                             .child(
                                 tool("go-to-video-message", IconName::MessageSquareShare)
                                     .on_click(cx.listener(|this, _, window, cx| this.leave_for(false, window, cx))),
