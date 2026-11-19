@@ -1067,7 +1067,7 @@ impl Actor {
                 }
                 Command::PinMessage { message_id, duration } => self.set_pin(message_id, true, duration).await,
                 Command::UnpinMessage { message_id } => self.set_pin(message_id, false, None).await,
-                Command::Forward { message_ids, conversations } => self.forward(message_ids, conversations).await,
+                Command::Forward { message_ids, conversations, edit } => self.forward(message_ids, conversations, edit).await,
                 Command::DeleteConversation { conversation } => self.delete_conversation(conversation).await,
                 Command::AnswerMessageRequest { conversation, answer } => {
                     self.answer_message_request(conversation, answer).await
@@ -4062,7 +4062,9 @@ impl Actor {
 
     /// Desktop's "Forward": a new message per chat with the same text and
     /// media. Attachments we haven't downloaded can't go along.
-    async fn forward(self: Rc<Self>, message_ids: Vec<i64>, conversations: Vec<ConversationId>) {
+    async fn forward(self: Rc<Self>, message_ids: Vec<i64>, conversations: Vec<ConversationId>, edit: Option<crate::forwards::ForwardEdit>) {
+        // The editor changes one message only.
+        let edit = edit.as_ref().filter(|_| message_ids.len() == 1);
         // Desktop's `maybeForwardMessages` refuses ended groups.
         for conversation in &conversations {
             if self.is_ended(conversation).await {
@@ -4073,38 +4075,21 @@ impl Actor {
         for conversation in &conversations {
             for message_id in &message_ids {
                 let Some(message) = self.db.message(*message_id).await.ok().flatten() else { continue };
-                // A forward goes as the file is: never re-encoded (Desktop
-                // reuses the attachment), whether or not the original's
-                // re-encode has happened yet.
-                let attachments: Vec<AttachmentMeta> = message
-                    .attachments
-                    .iter()
-                    .filter(|a| a.local_path.is_some() && !a.sticker)
-                    .map(|a| AttachmentMeta { transcode: false, ..a.clone() })
-                    .collect();
-                // Desktop doesn't forward polls or view-once messages
-                // (`canForward`).
-                if message.deleted
-                    || message.poll.is_some()
-                    || message.view_once.is_some()
-                    || attachments.len() < message.attachments.len()
-                    || (message.body.is_empty() && attachments.is_empty())
-                {
+                let Some((body, attachments, link_preview)) = crate::forwards::content(&message, edit) else {
                     skipped += 1;
                     continue;
-                }
-                let Some((id, data, timestamp)) = self
-                    .store_outgoing(conversation, message.body.clone(), None, attachments.clone(), message.link_preview.clone())
-                    .await
+                };
+                let Some((id, data, timestamp)) =
+                    self.store_outgoing(conversation, body, None, attachments.clone(), link_preview.clone()).await
                 else {
                     continue;
                 };
-                self.enqueue_with_media(conversation.clone(), id, data, timestamp, &attachments, message.link_preview.as_ref());
+                self.enqueue_with_media(conversation.clone(), id, data, timestamp, &attachments, link_preview.as_ref());
             }
         }
         if skipped > 0 {
             self.emit(Event::Error(
-                "Some messages couldn't be forwarded: polls, stickers and view-once media can't be, nor attachments that haven't downloaded yet".into(),
+                "Some messages couldn't be forwarded: polls, stickers, view-once media and deleted messages can't be, nor attachments that haven't downloaded yet or a message left with nothing to send".into(),
             ));
         }
     }

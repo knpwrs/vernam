@@ -1608,10 +1608,12 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     emit(Event::MessageChanged { conversation: m.conversation_id, message_id });
                 }
             }
-            Command::Forward { message_ids, conversations } => {
+            Command::Forward { message_ids, conversations, edit } => {
+                let edit = edit.as_ref().filter(|_| message_ids.len() == 1);
                 for conversation in conversations {
                     for message_id in &message_ids {
                         let Ok(Some(original)) = db.message(*message_id).await else { continue };
+                        let Some((body, attachments, link_preview)) = crate::forwards::content(&original, edit) else { continue };
                         let sent_at = next_sent_at();
                         let copy = NewMessage {
                             conversation_id: conversation.clone(),
@@ -1620,11 +1622,11 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                             direction: Direction::Outgoing,
                             author: None,
                             author_name: None,
-                            body: original.body.clone(),
+                            body,
                             status: DeliveryStatus::Sent,
                             quote: None,
-                            attachments: original.attachments.clone(),
-                            link_preview: original.link_preview.clone(),
+                            attachments,
+                            link_preview,
                             expires_in: 0,
                         };
                         if let Ok(id) = db.insert_message(&copy).await {

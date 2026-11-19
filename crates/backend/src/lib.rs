@@ -35,6 +35,7 @@ pub mod sticker_upload;
 pub mod stickers;
 pub mod deletes;
 pub mod edits;
+pub mod forwards;
 pub mod long_text;
 pub mod release_notes;
 pub mod megaphones;
@@ -467,8 +468,9 @@ pub enum Command {
     /// Sends a failed message again, with its original timestamp.
     RetrySend { message_id: i64 },
     /// Sends copies of messages (text, photos, GIFs, link previews) to
-    /// other chats, as Desktop's "Forward".
-    Forward { message_ids: Vec<i64>, conversations: Vec<ConversationId> },
+    /// other chats, as Desktop's "Forward". `edit` is what the forward
+    /// editor changed, for a single message (ignored for several).
+    Forward { message_ids: Vec<i64>, conversations: Vec<ConversationId>, edit: Option<forwards::ForwardEdit> },
     /// Deletes a whole chat on this device and your other devices.
     DeleteConversation { conversation: ConversationId },
     /// Answers a message request as Desktop's message request bar does:

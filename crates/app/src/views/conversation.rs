@@ -7389,11 +7389,67 @@ mod tests {
         backend.send(Command::Forward {
             message_ids: vec![original.id],
             conversations: vec![ConversationId(GROUP.into()), ConversationId(NOTE_TO_SELF.into())],
+            edit: None,
         });
         for chat in [GROUP, NOTE_TO_SELF] {
             let copy = wait_for_messages(&backend, chat, 1, |m| m.body == original.body && m.direction == Direction::Outgoing);
             assert_eq!(copy.len(), 1, "{chat}");
         }
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn a_forward_can_change_its_text_before_sending(cx: &mut TestAppContext) {
+        use gpui_kit::test::TestWindowExt as _;
+        let (backend, _dir) = demo_backend(cx);
+        let photo = wait_for_messages(&backend, GROUP, 1, |m| m.body.starts_with("View from the top") && !m.attachments.is_empty()).remove(0);
+        let (mut cx, view) = open_view(cx, &backend, GROUP);
+        let state = view.read_with(&cx, |v, _| v.state.clone());
+        // The chats to pick from.
+        state.update_in(&mut cx, |s, _, cx| s.reload_conversations(cx));
+        for _ in 0..300 {
+            cx.run_until_parked();
+            if state.read_with(&cx, |s, _| s.conversations.iter().any(|c| c.id.0 == NOTE_TO_SELF)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(state.read_with(&cx, |s, _| s.conversations.iter().any(|c| c.id.0 == NOTE_TO_SELF)), "chats loaded");
+        let click = |cx: &mut VisualTestContext, id: String| {
+            cx.update(|window, cx| {
+                window.render_frame(cx);
+                window.click(SharedString::from(id), cx)
+            });
+            cx.run_until_parked();
+        };
+        let shown = |cx: &mut VisualTestContext, id: &'static str| {
+            cx.update(|window, cx| {
+                window.render_frame(cx);
+                window.try_find(id).is_some()
+            })
+        };
+        cx.update(|window, cx| crate::views::forward::open(state.clone(), vec![photo.id], window, cx));
+        for _ in 0..300 {
+            cx.run_until_parked();
+            if shown(&mut cx, "forward-continue") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let row = bounds(&mut cx, format!("forward-{NOTE_TO_SELF}"));
+        cx.simulate_click(row.center(), gpui_kit::Modifiers::none());
+        cx.run_until_parked();
+        click(&mut cx, "forward-continue".into());
+        // The editor, with the photo and its text.
+        assert!(shown(&mut cx, "forward-send"));
+        bounds(&mut cx, "forward-remove-attachment-0".into());
+        // The text erased: the photo goes alone.
+        cx.simulate_keystrokes("cmd-a backspace");
+        click(&mut cx, "forward-send".into());
+        let copy = wait_for_messages(&backend, NOTE_TO_SELF, 1, |m| m.direction == Direction::Outgoing && m.sent_at > photo.sent_at && m.attachments.len() == 1)
+            .remove(0);
+        assert!(copy.body.is_empty(), "{:?}", copy.body);
+        assert!(!shown(&mut cx, "forward-send"), "closed");
         backend.shutdown();
     }
 
