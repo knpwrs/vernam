@@ -1566,6 +1566,22 @@ async fn renaming_an_author_looks_up_their_messages_by_index() {
 }
 
 #[tokio::test]
+async fn a_receipt_finds_its_message_without_walking_the_authors_messages() {
+    let db = test_db().await;
+    let sql = format!(
+        "EXPLAIN QUERY PLAN SELECT id FROM messages WHERE direction = 1 AND deleted = 0 AND {}",
+        sent_at_matches("''", "?1")
+    );
+    let rows: Vec<(i64, i64, i64, String)> =
+        sqlx::query_as(sqlx::AssertSqlSafe(sql)).bind(5_i64).fetch_all(&db.pool).await.unwrap();
+    let plan = rows.into_iter().map(|r| r.3).collect::<Vec<_>>().join("; ");
+    // Both halves seek: the message by author and time, the edit by time.
+    assert!(plan.contains("messages_author (author_key=? AND sent_at=?)"), "{plan}");
+    assert!(plan.contains("message_edits_sent_at (sent_at=?)"), "{plan}");
+    assert!(!plan.contains("(author_key=?)"), "walks the author's messages: {plan}");
+}
+
+#[tokio::test]
 async fn stored_paths_follow_a_moved_data_directory() {
     let db = test_db().await;
     let (old, new) = ("/Users/me/Library/Application Support/old", "/Users/me/Library/Application Support/io.github.knpwrs.Vernam");

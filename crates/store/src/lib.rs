@@ -1204,11 +1204,15 @@ const MESSAGE_COLUMNS: &str = "id, conversation_id, sent_at, received_at, direct
 /// (sent_at = … OR id IN (…))`: SQLite can't use an index for that `OR`, and
 /// read every message by the author (every one we sent, for a receipt).
 /// Nothing outside should test `author_key` either, or the planner may walk
-/// the author's messages and filter them against this list.
+/// the author's messages and filter them against this list. The edits'
+/// half is a `CROSS JOIN`, which SQLite never reorders: as a plain join,
+/// with no statistics, it started from the author's messages and looked up
+/// each one's edits, 600 ms a receipt on a real account, rather than from
+/// the edits sent at that time.
 fn sent_at_matches(author: &str, param: &str) -> String {
     format!(
         "id IN (SELECT id FROM messages WHERE author_key = {author} AND sent_at = {param} \
-         UNION SELECT e.message_id FROM message_edits e JOIN messages m ON m.id = e.message_id \
+         UNION SELECT e.message_id FROM message_edits e CROSS JOIN messages m ON m.id = e.message_id \
          WHERE e.sent_at = {param} AND m.author_key = {author})"
     )
 }
