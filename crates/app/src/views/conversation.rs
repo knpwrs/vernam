@@ -8611,6 +8611,27 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn the_schedule_shortcut_asks_when_only_with_a_draft(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        wait_for_messages(&backend, MAYA, 1, |_| true);
+        let (mut cx, view) = open_view(cx, &backend, MAYA);
+        cx.update(|_, cx| crate::shortcuts::bind_keys(cx));
+        let composer = view.read_with(&cx, |v, _| v.composer.clone());
+        cx.update(|window, cx| composer.update(cx, |c, cx| c.focus(window, cx)));
+        // Nothing to schedule yet.
+        cx.simulate_keystrokes("cmd-shift-enter");
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("schedule-dialog").is_none());
+        cx.simulate_input("later");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-shift-enter");
+        bounds(&mut cx, "schedule-dialog".into());
+        assert_eq!(cx.update(|_, cx| composer.read(cx).input.read(cx).value().to_owned()), "later", "not sent");
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
     fn a_due_message_waits_until_the_account_is_online(cx: &mut TestAppContext) {
         let (backend, _dir) = demo_backend(cx);
         wait_for_messages(&backend, MAYA, 1, |_| true);

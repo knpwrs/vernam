@@ -42,6 +42,9 @@ gpui_kit::actions!(composer, [RecordVoice]);
 // Desktop's large composer (`CompositionArea`'s `large`, ⌘⇧K; bound in
 // `shortcuts.rs`).
 gpui_kit::actions!(composer, [ToggleLargeComposer]);
+// Schedules the draft (⌘⇧Enter, bound in `shortcuts.rs`): the normal
+// composer has no Send button to right-click, as in Desktop.
+gpui_kit::actions!(composer, [ScheduleMessage]);
 // The spell check menu's disabled "No Suggestions".
 gpui_kit::actions!(composer, [NoSuggestions]);
 
@@ -1064,8 +1067,12 @@ impl Composer {
     }
 
     /// Whether the draft can be scheduled (`crate::scheduled`): something
-    /// to send, and not an edit or a view-once photo.
+    /// to send, and not an edit or a view-once photo, nor while the last
+    /// scheduled draft is still saving (`submit_at` would drop a second).
     fn can_schedule(&self, cx: &App) -> bool {
+        if self.scheduling {
+            return false;
+        }
         let something = !self.input.read(cx).value().trim().is_empty() || !self.images.is_empty() || !self.files.is_empty();
         something && self.editing.is_none() && !self.view_once_active() && self.voice_draft.is_none() && self.recording.is_none()
     }
@@ -1244,6 +1251,8 @@ impl Composer {
             files,
         };
         self.scheduling = true;
+        // Schedule message… greys out until it's saved.
+        cx.notify();
         let saving = self.state.update(cx, |state, cx| state.schedule(message, cx));
         cx.spawn_in(window, async move |this, cx| {
             let saved = saving.await;
@@ -1252,6 +1261,8 @@ impl Composer {
                 if saved {
                     this.clear_scheduled(&went, window, cx);
                 }
+                // Schedule message… was greyed out while it saved.
+                cx.notify();
             });
         })
         .detach();
@@ -1767,13 +1778,15 @@ impl Composer {
 
     /// Desktop's add button (`composerAddMenuButton` in `CompositionArea`):
     /// a plus opening Photos & videos, File, Poll where polls can be made,
-    /// and Contact with `desktop.shareContact` on.
+    /// and Contact with `desktop.shareContact` on. Then Vernam's own
+    /// Schedule message…, which Desktop doesn't have.
     fn render_add_button(&self, palette: Palette, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         use gpui_kit::component::button::{Button, ButtonVariants as _};
         use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
         let polls = !self.conversation.is_signal()
             && self.state.read(cx).conversation(&self.conversation).is_some_and(|c| signal_backend::can_create_poll(c.kind, &self.state.read(cx).remote_config()));
         let contacts = !self.conversation.is_signal() && self.state.read(cx).remote_config().share_contact();
+        let schedulable = self.can_schedule(cx);
         let this = cx.entity().downgrade();
         let (state, conversation) = (self.state.clone(), self.conversation.clone());
         Button::new("add-button")
@@ -1781,9 +1794,9 @@ impl Composer {
             .ghost()
             .rounded_full()
             .icon(Icon::new(IconName::Plus).size_5().text_color(palette.text))
-            .tooltip("Add attachment or poll")
+            .tooltip("Add an attachment or poll, or schedule")
             .dropdown_menu(move |menu, _, _| {
-                let (media, file) = (this.clone(), this.clone());
+                let (media, file, schedule) = (this.clone(), this.clone(), this.clone());
                 let (state, conversation) = (state.clone(), conversation.clone());
                 menu.item(PopupMenuItem::new("Photos & videos").icon(IconName::Image).on_click(move |_, window, cx| {
                     let _ = media.update(cx, |this, cx| this.pick_files(true, window, cx));
@@ -1802,6 +1815,15 @@ impl Composer {
                         crate::views::share_contact::open(state.clone(), conversation.clone(), window, cx);
                     }))
                 })
+                // Also on Send's right-click menu, but the normal composer
+                // shows Send only for an edit or a view-once photo, which
+                // can't be scheduled.
+                .separator()
+                .item(PopupMenuItem::new("Schedule message…").icon(IconName::Clock).disabled(!schedulable).on_click(
+                    move |_, window, cx| {
+                        let _ = schedule.update(cx, |this, cx| this.open_schedule(window, cx));
+                    },
+                ))
             })
             .into_any_element()
     }
@@ -2119,6 +2141,7 @@ impl Render for Composer {
             .on_action(cx.listener(|this, _: &FormatSpoiler, window, cx| this.format(TextStyle::Spoiler, window, cx)))
             .on_action(cx.listener(|this, _: &RecordVoice, window, cx| this.start_recording(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleLargeComposer, _, cx| this.set_large(!this.large, cx)))
+            .on_action(cx.listener(|this, _: &ScheduleMessage, window, cx| this.open_schedule(window, cx)))
             .on_action(cx.listener(|this, action: &ReplaceMisspelling, window, cx| this.replace_misspelling(action, window, cx)))
             .id("composer")
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {

@@ -117,6 +117,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-s", SaveAttachment, MAIN),
         KeyBinding::new("cmd-shift-d", DeleteMessages, MAIN),
         KeyBinding::new("cmd-shift-k", crate::views::composer::ToggleLargeComposer, Some("Composer")),
+        KeyBinding::new("cmd-shift-enter", crate::views::composer::ScheduleMessage, Some("Composer")),
         KeyBinding::new("cmd-shift-s", ForwardMessages, MAIN),
         KeyBinding::new("up", timeline::SelectPrevious, Some(TIMELINE)),
         KeyBinding::new("down", timeline::SelectNext, Some(TIMELINE)),
@@ -153,7 +154,8 @@ const fn s(description: &'static str, keys: &'static [&'static [&'static str]]) 
 }
 
 /// Desktop's guide, in its order and words, with its macOS key labels;
-/// only the shortcuts this app has.
+/// only the shortcuts this app has, plus its own (Schedule message, which
+/// Desktop lacks).
 pub const GUIDE: &[(&str, &[Shortcut])] = &[
     (
         "Navigation",
@@ -199,6 +201,7 @@ pub const GUIDE: &[(&str, &[Shortcut])] = &[
             s("Add newline to message", &[&["Shift", "Enter"]]),
             s("Expand composer", &[&["⌘", "Shift", "K"]]),
             s("Send (in expanded composer)", &[&["⌘", "Enter"]]),
+            s("Schedule message", &[&["⌘", "Shift", "Enter"]]),
             s("Attach file", &[&["⌘", "U"]]),
             s("Remove draft link preview", &[&["⌘", "P"]]),
             s("Remove all draft attachments", &[&["⌘", "Shift", "P"]]),
