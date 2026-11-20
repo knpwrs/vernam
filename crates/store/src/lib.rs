@@ -2255,6 +2255,19 @@ impl AppDb {
         Ok(id)
     }
 
+    /// Of these messages, the ones still unread. A message read since (on
+    /// this device or another), deleted for everyone, or gone isn't listed.
+    pub async fn unread_among(&self, ids: &[i64]) -> Result<Vec<i64>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = serde_json::to_string(ids).expect("integers serialize");
+        Ok(sqlx::query_scalar("SELECT id FROM messages WHERE id IN (SELECT value FROM json_each(?)) AND is_read = 0 AND deleted = 0")
+            .bind(ids)
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
     pub async fn message(&self, id: i64) -> Result<Option<Message>> {
         let row = sqlx::query(AssertSqlSafe(format!("SELECT {MESSAGE_COLUMNS} FROM messages WHERE id = ?")))
             .bind(id)

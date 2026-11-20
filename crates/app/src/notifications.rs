@@ -112,6 +112,17 @@ impl AccountNotifier {
         self.notifier.remove(&ids);
     }
 
+    /// Takes down every notification on screen for these chats except the
+    /// ones `keep` (given an id as posted) spares, including ones this run
+    /// didn't post (from before the app restarted). Desktop's
+    /// `removeBy({ conversationId })` (ts/services/notifications.preload.ts).
+    /// Only notifications delivered before `before` go.
+    pub fn remove_in_chats(&self, chats: &[ConversationId], before: std::time::SystemTime, keep: impl Fn(&str) -> bool + 'static) {
+        let threads = chats.iter().map(|chat| self.scoped(&chat.0)).collect();
+        let prefix = self.scoped("");
+        self.notifier.remove_in_threads(threads, before, Box::new(move |id| id.strip_prefix(prefix.as_str()).is_some_and(&keep)));
+    }
+
     /// This account's unread count; the Dock shows every account's.
     pub fn set_badge(&self, count: usize) {
         let total = {
@@ -159,11 +170,20 @@ impl Notifier {
     }
     pub fn post(&self, _notification: &Notification) {}
     pub fn remove(&self, _ids: &[String]) {}
+    pub fn remove_in_threads(
+        &self,
+        _threads: std::collections::HashSet<String>,
+        _before: std::time::SystemTime,
+        _keep: Box<dyn Fn(&str) -> bool>,
+    ) {
+    }
     pub fn set_badge(&self, _count: usize) {}
 }
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use std::collections::HashSet;
+    use std::ptr::NonNull;
     use std::sync::OnceLock;
 
     use block2::RcBlock;
@@ -326,6 +346,39 @@ mod macos {
             }
             let ids: Vec<Retained<NSString>> = ids.iter().map(|id| NSString::from_str(id)).collect();
             self.center.removeDeliveredNotificationsWithIdentifiers(&NSArray::from_retained_slice(&ids));
+        }
+
+        /// Takes notifications in these threads (chats) delivered before
+        /// `before` off screen, except those whose id `keep` spares. Asks the
+        /// system what's delivered, so it reaches notifications from before
+        /// a restart too.
+        pub fn remove_in_threads(&self, threads: HashSet<String>, before: std::time::SystemTime, keep: Box<dyn Fn(&str) -> bool>) {
+            if threads.is_empty() {
+                return;
+            }
+            let center = self.center.clone();
+            // One posted since (a new message in a chat just read) stays.
+            let before = before.duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+            // Called on a background queue; the center is thread safe.
+            let found = RcBlock::new(move |delivered: NonNull<NSArray<UNNotification>>| {
+                let delivered = unsafe { delivered.as_ref() };
+                let ids: Vec<Retained<NSString>> = delivered
+                    .iter()
+                    .filter_map(|notification| {
+                        if notification.date().timeIntervalSince1970() >= before {
+                            return None;
+                        }
+                        let request = notification.request();
+                        let id = request.identifier();
+                        let thread = request.content().threadIdentifier().to_string();
+                        (threads.contains(&thread) && !keep(&id.to_string())).then_some(id)
+                    })
+                    .collect();
+                if !ids.is_empty() {
+                    center.removeDeliveredNotificationsWithIdentifiers(&NSArray::from_retained_slice(&ids));
+                }
+            });
+            self.center.getDeliveredNotificationsWithCompletionHandler(&found);
         }
 
         /// The unread count on the Dock icon.

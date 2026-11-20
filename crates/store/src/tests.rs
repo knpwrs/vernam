@@ -676,6 +676,18 @@ async fn read_sync_marks_single_message() {
 }
 
 #[tokio::test]
+async fn unread_among_lists_only_unread_messages() {
+    let db = test_db().await;
+    let one = db.insert_message(&incoming("d:a", "a", 1, "one")).await.unwrap();
+    let two = db.insert_message(&incoming("d:a", "a", 2, "two")).await.unwrap();
+    let three = db.insert_message(&incoming("d:a", "a", 3, "three")).await.unwrap();
+    db.mark_message_read("a", 2).await.unwrap();
+    db.remove_message(three).await.unwrap();
+    assert_eq!(db.unread_among(&[one, two, three, 9_999]).await.unwrap(), vec![one]);
+    assert_eq!(db.unread_among(&[]).await.unwrap(), Vec::<i64>::new());
+}
+
+#[tokio::test]
 async fn last_outgoing_status_follows_latest_message() {
     let db = test_db().await;
     db.upsert_conversation(&conv("d:jon"), ConversationUpdate::default()).await.unwrap();

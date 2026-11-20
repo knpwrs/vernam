@@ -399,8 +399,12 @@ pub struct AppState {
     /// System notifications for this account (`None` where they can't be
     /// shown), set by `crate::accounts`.
     pub(crate) notifier: Option<std::rc::Rc<crate::notifications::AccountNotifier>>,
-    /// Notifications on screen per chat, taken down once it's read.
-    shown_notifications: HashMap<ConversationId, Vec<String>>,
+    /// Notifications on screen per chat, with when each was posted, taken
+    /// down once it's read.
+    shown_notifications: HashMap<ConversationId, Vec<(String, Instant)>>,
+    /// Chats unread at the last `sync_notifications` (`None` before the
+    /// first): one read since has its notifications taken down.
+    unread_chats: Option<std::collections::HashSet<ConversationId>>,
     pub notification_setting: crate::notifications::NotificationSetting,
     /// The main window is in front showing this account (no notifications
     /// for the open chat, and chats read as they're seen).
@@ -446,7 +450,7 @@ pub struct AppState {
     held_notification: Option<(ConversationId, i64, Mentions)>,
     /// Reaction notifications on screen per chat, taken down once it's
     /// opened (they don't make it unread).
-    reaction_notifications: HashMap<ConversationId, Vec<String>>,
+    reaction_notifications: HashMap<ConversationId, Vec<(String, Instant)>>,
     /// Checks for unread reminders hourly while an account is linked.
     reminder_task: Option<Task<()>>,
     /// The account's scheduled messages, soonest first, without their
@@ -610,6 +614,7 @@ impl AppState {
             auto_select: std::env::var_os("SIGNAL_GPUI_DEMO").is_some(),
             notifier: None,
             shown_notifications: HashMap::new(),
+            unread_chats: None,
             notification_setting: Default::default(),
             window_active: true,
             shown: true,
@@ -662,8 +667,8 @@ impl AppState {
     /// badge (it's unlinked, or leaving the app).
     pub fn forget_notifications(&mut self) {
         if let Some(notifier) = self.notifier.clone() {
-            let mut shown: Vec<String> = self.shown_notifications.drain().flat_map(|(_, ids)| ids).collect();
-            shown.extend(self.reaction_notifications.drain().flat_map(|(_, ids)| ids));
+            let mut shown: Vec<String> = self.shown_notifications.drain().flat_map(|(_, ids)| ids.into_iter().map(|(id, _)| id)).collect();
+            shown.extend(self.reaction_notifications.drain().flat_map(|(_, ids)| ids.into_iter().map(|(id, _)| id)));
             shown.push(INCOMING_CALL_NOTIFICATION.to_owned());
             notifier.remove(&shown);
             notifier.set_badge(0);
@@ -724,6 +729,10 @@ impl AppState {
         });
         cx.spawn(async move |this, cx| {
             let Ok((Some(chat), Some(message))) = query.await else { return };
+            // Read meanwhile (on another device): its chat's sweep may be done.
+            if message.is_read {
+                return;
+            }
             let direct = chat.kind != signal_store::ConversationKind::Group;
             if chat.blocked || (chat.muted && !allowed_while_muted(direct, mentions, &prefs)) {
                 return;
@@ -738,7 +747,7 @@ impl AppState {
                 // says (`getNotificationTextForMessage`).
                 let preview = if chat.accepted { notification_preview(&message) } else { "Message Request".into() };
                 let (title, body) = setting.text(&sender, group, &preview);
-                let id = format!("{}:{message_id}", chat.id.0);
+                let id = message_notification_id(&chat.id, message_id);
                 notifier.post(&crate::notifications::Notification {
                     id: &id,
                     conversation: &chat.id,
@@ -747,7 +756,7 @@ impl AppState {
                     body: &body,
                     sound,
                 });
-                this.shown_notifications.entry(chat.id.clone()).or_default().push(id);
+                track_notification(&mut this.shown_notifications, &chat.id, id);
             });
         })
         .detach();
@@ -792,7 +801,7 @@ impl AppState {
                     body: &body,
                     sound: this.prefs.on(crate::prefs::Toggle::NotificationSounds),
                 });
-                this.shown_notifications.entry(chat.id.clone()).or_default().push(id);
+                track_notification(&mut this.shown_notifications, &chat.id, id);
             });
         })
         .detach();
@@ -815,7 +824,7 @@ impl AppState {
         let id = format!("{}:{message_id}:react-{author}", conversation.0);
         let Some(emoji) = emoji else {
             if let Some(ids) = self.reaction_notifications.get_mut(&conversation)
-                && let Some(ix) = ids.iter().position(|shown| *shown == id)
+                && let Some(ix) = ids.iter().position(|(shown, _)| *shown == id)
             {
                 ids.remove(ix);
                 if let Some(notifier) = &self.notifier {
@@ -860,10 +869,7 @@ impl AppState {
                     body: &body,
                     sound: this.prefs.on(crate::prefs::Toggle::NotificationSounds),
                 });
-                let shown = this.reaction_notifications.entry(chat.id.clone()).or_default();
-                if !shown.contains(&id) {
-                    shown.push(id);
-                }
+                track_notification(&mut this.reaction_notifications, &chat.id, id);
             });
         })
         .detach();
@@ -988,7 +994,7 @@ impl AppState {
             body: &body,
             sound: self.prefs.on(crate::prefs::Toggle::NotificationSounds),
         });
-        self.shown_notifications.entry(chat.clone()).or_default().push(id);
+        track_notification(&mut self.shown_notifications, &chat, id);
         let db = self.backend.db().clone();
         let save = self.backend.spawn(async move {
             use crate::reminders::{REMINDED_KEY, Reminded};
@@ -1003,25 +1009,93 @@ impl AppState {
     }
 
     /// Takes down notifications for chats that have been read (here or on
-    /// another device) and updates the Dock's unread count.
-    fn sync_notifications(&mut self) {
+    /// another device) and updates the Dock's unread count. A chat read
+    /// loses every notification in it, reactions and ones from before a
+    /// restart included, as Desktop's `removeBy({ conversationId })`
+    /// (ts/services/notifications.preload.ts). A chat read only up to some
+    /// message elsewhere (newer ones still unread) loses the notifications
+    /// this run showed for those messages. `loaded` is when the chats were
+    /// read from the database (`loaded_at` on the clock the system dates
+    /// notifications by): a notification posted since is for a message or
+    /// reaction they may not count yet, so it stays.
+    fn sync_notifications(&mut self, loaded: Instant, loaded_at: std::time::SystemTime, cx: &mut Context<Self>) {
         let Some(notifier) = self.notifier.clone() else { return };
         let all = || self.conversations.iter().chain(&self.archived);
-        let read: Vec<ConversationId> = all()
-            .filter(|c| c.unread_count == 0 && !c.unread_poll_votes && self.shown_notifications.contains_key(&c.id))
-            .map(|c| c.id.clone())
-            .collect();
-        for id in read {
-            if let Some(ids) = self.shown_notifications.remove(&id) {
-                notifier.remove(&ids);
+        let first = self.unread_chats.is_none();
+        let ReadChats { unread, read, tracked } = chats_read_since(
+            all().map(|c| (&c.id, c.unread_count > 0 || c.unread_poll_votes)),
+            self.unread_chats.as_ref(),
+            &self.shown_notifications,
+        );
+        for chat in read.iter().chain(&tracked) {
+            take_down_older(&mut self.shown_notifications, chat, loaded, &notifier);
+        }
+        // The first time, as the system's sweep below.
+        if !first {
+            for chat in &read {
+                take_down_older(&mut self.reaction_notifications, chat, loaded, &notifier);
             }
         }
+        // A ringing call's notification stays until the call is answered or
+        // over (none rings at launch). The first time, a reaction's stays
+        // too: it doesn't make its chat unread, so a read chat may have one
+        // not yet seen.
+        notifier.remove_in_chats(&read, loaded_at, move |id| if first { id.contains(":react-") } else { id == INCOMING_CALL_NOTIFICATION });
+        self.unread_chats = Some(unread);
         // As Desktop: unread messages in unmuted chats, and one per chat marked unread.
         let badge: usize = all()
             .filter(|c| !c.muted)
             .map(|c| if c.unread_count == 0 && c.marked_unread { 1 } else { c.unread_count as usize })
             .sum();
         notifier.set_badge(badge);
+        self.drop_read_message_notifications(cx);
+    }
+
+    /// Takes down notifications for messages read since they were shown in
+    /// chats that are still unread (read on another device up to an older
+    /// message than the newest).
+    fn drop_read_message_notifications(&mut self, cx: &mut Context<Self>) {
+        let shown: Vec<(ConversationId, String, i64)> = self
+            .shown_notifications
+            .iter()
+            .flat_map(|(chat, ids)| ids.iter().filter_map(move |(id, _)| Some((chat.clone(), id.clone(), message_notification(chat, id)?))))
+            .collect();
+        if shown.is_empty() {
+            return;
+        }
+        let db = self.backend.db().clone();
+        let messages: Vec<i64> = shown.iter().map(|(_, _, message)| *message).collect();
+        let query = self.backend.spawn(async move { db.unread_among(&messages).await });
+        cx.spawn(async move |this, cx| {
+            let unread: std::collections::HashSet<i64> = match query.await {
+                Ok(unread) => unread.into_iter().collect(),
+                Err(e) => {
+                    tracing::warn!("checking which notified messages are read: {e}");
+                    return;
+                }
+            };
+            let _ = this.update(cx, |this, _| {
+                let Some(notifier) = this.notifier.clone() else { return };
+                let mut read = Vec::new();
+                for (chat, id, message) in shown {
+                    if unread.contains(&message) {
+                        continue;
+                    }
+                    // Still listed (not already taken down with its chat).
+                    if let Some(ids) = this.shown_notifications.get_mut(&chat)
+                        && let Some(ix) = ids.iter().position(|(shown, _)| *shown == id)
+                    {
+                        ids.remove(ix);
+                        if ids.is_empty() {
+                            this.shown_notifications.remove(&chat);
+                        }
+                        read.push(id);
+                    }
+                }
+                notifier.remove(&read);
+            });
+        })
+        .detach();
     }
 
     fn start_catch_up(&mut self, cx: &mut Context<Self>) {
@@ -1478,6 +1552,7 @@ impl AppState {
                 self.history = None;
                 self.catching_up = None;
                 self.held_notification = None;
+                self.unread_chats = None;
                 self.reminder_task = None;
                 self.scheduled.clear();
                 self.scheduled_task = None;
@@ -1547,6 +1622,7 @@ impl AppState {
             self.reload_pending = true;
             return;
         }
+        let (loaded, loaded_at) = (Instant::now(), std::time::SystemTime::now());
         let db = self.backend.db().clone();
         let query = self
             .backend
@@ -1578,7 +1654,7 @@ impl AppState {
                         this.contact_avatars = contact_avatars
                             .and_then(|json| serde_json::from_str::<HashMap<String, std::path::PathBuf>>(&json).ok())
                             .unwrap_or_default();
-                        this.sync_notifications();
+                        this.sync_notifications(loaded, loaded_at, cx);
                         cx.emit(AppEvent::ConversationsChanged);
                         if std::mem::take(&mut this.auto_select) && this.selected.is_none() {
                             let first = this.conversations.first().map(|c| c.id.clone());
@@ -3329,7 +3405,7 @@ impl AppState {
             && let Some(ids) = self.reaction_notifications.remove(opened)
             && let Some(notifier) = &self.notifier
         {
-            notifier.remove(&ids);
+            notifier.remove(&ids.into_iter().map(|(id, _)| id).collect::<Vec<_>>());
         }
         self.selected = id;
         cx.emit(AppEvent::SelectionChanged);
@@ -3436,6 +3512,85 @@ fn poll_activity_text(sender: &str, group: Option<&str>, question: &str, ended: 
     format!("{title} voted in the poll \"{}\"", signal_store::poll_preview(question))
 }
 
+/// What `chats_read_since` finds.
+#[derive(Debug, PartialEq)]
+struct ReadChats {
+    unread: std::collections::HashSet<ConversationId>,
+    /// Read since the last check: every notification in them goes.
+    read: Vec<ConversationId>,
+    /// Read then and now, with notifications this run showed (a poll that
+    /// ended, or a message read between checks): those go, and only those,
+    /// as a reaction in them may not have been seen.
+    tracked: Vec<ConversationId>,
+}
+
+/// Sorts `chats` (each with whether it's unread) by what happens to their
+/// notifications, given those unread at the last check (`before`). The
+/// first time (`before` is `None`), every read chat counts as read since,
+/// as the system may still show notifications from the last run. A chat
+/// unread before and missing now (moving between the archived and the
+/// unarchived list as they were read) stays unread until seen.
+fn chats_read_since<'a, T>(
+    chats: impl Iterator<Item = (&'a ConversationId, bool)>,
+    before: Option<&std::collections::HashSet<ConversationId>>,
+    shown: &HashMap<ConversationId, T>,
+) -> ReadChats {
+    let mut found = ReadChats { unread: Default::default(), read: Vec::new(), tracked: Vec::new() };
+    let mut seen = std::collections::HashSet::new();
+    for (id, is_unread) in chats {
+        seen.insert(id.clone());
+        if is_unread {
+            found.unread.insert(id.clone());
+        } else if before.is_none_or(|before| before.contains(id)) {
+            found.read.push(id.clone());
+        } else if shown.contains_key(id) {
+            found.tracked.push(id.clone());
+        }
+    }
+    if let Some(before) = before {
+        found.unread.extend(before.iter().filter(|id| !seen.contains(*id)).cloned());
+    }
+    found
+}
+
+/// Notes a notification just posted in `chat`. One posted again under the
+/// same id (a changed reaction, another poll vote) replaced the one shown,
+/// so its time moves rather than a second entry being added.
+fn track_notification(shown: &mut HashMap<ConversationId, Vec<(String, Instant)>>, chat: &ConversationId, id: String) {
+    let ids = shown.entry(chat.clone()).or_default();
+    ids.retain(|(shown, _)| *shown != id);
+    ids.push((id, Instant::now()));
+}
+
+/// Takes down a chat's notifications in `shown` posted before `loaded`,
+/// keeping later ones (for what the chat list read then didn't count).
+fn take_down_older(
+    shown: &mut HashMap<ConversationId, Vec<(String, Instant)>>,
+    chat: &ConversationId,
+    loaded: Instant,
+    notifier: &crate::notifications::AccountNotifier,
+) {
+    let Some(ids) = shown.remove(chat) else { return };
+    let (old, new): (Vec<_>, Vec<_>) = ids.into_iter().partition(|(_, posted)| *posted < loaded);
+    notifier.remove(&old.into_iter().map(|(id, _)| id).collect::<Vec<_>>());
+    if !new.is_empty() {
+        shown.insert(chat.clone(), new);
+    }
+}
+
+/// A new message's notification id (polls', reactions' and reminders'
+/// add to it), unique per message so it can be taken down once read.
+fn message_notification_id(chat: &ConversationId, message_id: i64) -> String {
+    format!("{}:{message_id}", chat.0)
+}
+
+/// The message a notification in `chat` is for, if it's a new message's
+/// (not a poll's, a reaction's or a reminder's).
+fn message_notification(chat: &ConversationId, id: &str) -> Option<i64> {
+    let message = id.strip_prefix(chat.0.as_str())?.strip_prefix(':')?;
+    message.bytes().all(|b| b.is_ascii_digit()).then(|| message.parse().ok()).flatten()
+}
+
 fn notification_preview(message: &signal_store::Message) -> String {
     // Desktop's "📊 Poll: …" (`getNotificationDataForMessage`).
     if let Some(poll) = &message.poll {
@@ -3495,6 +3650,57 @@ fn parse_recent_stickers(value: &str) -> Vec<(Vec<u8>, u32)> {
         .collect()
 }
 
+
+#[cfg(test)]
+mod notification_id_tests {
+    use super::*;
+
+    #[test]
+    fn only_new_message_notifications_name_a_message() {
+        let chat = ConversationId("g:Ab/c+d==".into());
+        assert_eq!(message_notification(&chat, &message_notification_id(&chat, 42)), Some(42));
+        assert_eq!(message_notification(&chat, "g:Ab/c+d==:42:poll-vote"), None);
+        assert_eq!(message_notification(&chat, "g:Ab/c+d==:42:react-aci"), None);
+        assert_eq!(message_notification(&chat, "g:Ab/c+d==:unread-reminder"), None);
+        assert_eq!(message_notification(&chat, "g:Ab/c+d==:"), None);
+        assert_eq!(message_notification(&chat, "g:Ab/c+d==:-1"), None);
+        assert_eq!(message_notification(&ConversationId("g:Ab".into()), "g:Ab/c+d==:42"), None);
+    }
+
+    #[test]
+    fn notifications_go_for_chats_read_since_the_last_check() {
+        let id = |s: &str| ConversationId(s.into());
+        let chats = [(id("d:read-now"), false), (id("d:unread"), true), (id("d:always-read"), false), (id("d:shown"), false)];
+        let shown = HashMap::from([(id("d:shown"), vec!["d:shown:1".to_owned()])]);
+        let names = |v: Vec<ConversationId>| v.into_iter().map(|c| c.0).collect::<Vec<_>>();
+
+        // First time: every read chat.
+        let found = chats_read_since(chats.iter().map(|(c, u)| (c, *u)), None, &shown);
+        assert_eq!(names(found.read), ["d:read-now", "d:always-read", "d:shown"]);
+        assert!(found.tracked.is_empty());
+        assert_eq!(found.unread, std::collections::HashSet::from([id("d:unread")]));
+
+        // Later: chats read since, and apart from them, read chats with
+        // notifications shown.
+        let before = std::collections::HashSet::from([id("d:read-now"), id("d:unread")]);
+        let found = chats_read_since(chats.iter().map(|(c, u)| (c, *u)), Some(&before), &shown);
+        assert_eq!(names(found.read), ["d:read-now"]);
+        assert_eq!(names(found.tracked), ["d:shown"]);
+
+        // A notification posted again is listed once, as of the last time.
+        let mut tracked = HashMap::new();
+        track_notification(&mut tracked, &id("d:a"), "d:a:1:poll-vote".into());
+        let first = tracked[&id("d:a")][0].1;
+        track_notification(&mut tracked, &id("d:a"), "d:a:1:poll-vote".into());
+        assert_eq!(tracked[&id("d:a")].len(), 1);
+        assert!(tracked[&id("d:a")][0].1 >= first);
+
+        // A chat missing from the lists stays unread.
+        let before = std::collections::HashSet::from([id("d:moving")]);
+        let found = chats_read_since(chats.iter().map(|(c, u)| (c, *u)), Some(&before), &shown);
+        assert!(found.unread.contains(&id("d:moving")));
+    }
+}
 
 #[cfg(test)]
 mod sticker_tests {
