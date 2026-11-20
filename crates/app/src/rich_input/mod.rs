@@ -334,7 +334,7 @@ impl RichInput {
     }
 
     /// The fonts the first line was last drawn in, run by run.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub fn drawn_fonts(&self) -> Vec<gpui_kit::FontId> {
         let Some(line) = self.laid.as_ref().and_then(|l| l.lines.first()) else { return Vec::new() };
         line.unwrapped_layout.runs.iter().map(|r| r.font_id).collect()

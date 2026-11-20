@@ -752,7 +752,6 @@ impl AppState {
                     id: &id,
                     conversation: &chat.id,
                     title: &title,
-                    subtitle: None,
                     body: &body,
                     sound,
                 });
@@ -797,7 +796,6 @@ impl AppState {
                     id: &id,
                     conversation: &chat.id,
                     title: &title,
-                    subtitle: None,
                     body: &body,
                     sound: this.prefs.on(crate::prefs::Toggle::NotificationSounds),
                 });
@@ -865,7 +863,6 @@ impl AppState {
                     id: &id,
                     conversation: &chat.id,
                     title: &title,
-                    subtitle: None,
                     body: &body,
                     sound: this.prefs.on(crate::prefs::Toggle::NotificationSounds),
                 });
@@ -990,7 +987,6 @@ impl AppState {
             id: &id,
             conversation: &chat,
             title: &title,
-            subtitle: None,
             body: &body,
             sound: self.prefs.on(crate::prefs::Toggle::NotificationSounds),
         });
@@ -3190,7 +3186,6 @@ impl AppState {
             id: INCOMING_CALL_NOTIFICATION,
             conversation: &conversation,
             title: &title,
-            subtitle: None,
             body,
             sound: false,
         });

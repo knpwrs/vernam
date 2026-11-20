@@ -64,6 +64,18 @@ objc2-core-media = { version = "0.3", default-features = false, features = ["std
 objc2-core-video = { version = "0.3", default-features = false, features = ["std", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFString"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Audio playback and microphone capture. Decoding stays with the ffmpeg
+# command-line tool (see audio.rs), which plays everything Signal sends
+# (AAC/M4A, MP3, Opus), so rodio needs no decoders.
+rodio = { version = "0.23", default-features = false, features = ["playback", "recording"] }
+# D-Bus: the freedesktop Notifications daemon, logind's wake signal, the
+# Dock badge's Unity launcher signal.
+zbus = "6"
+# Hunspell dictionaries for the composer's spell checking.
+spellbook = "0.4"
+# The user's id, for the single-instance socket's name.
+libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 # macOS's text system for the rich input's layout tests: the default test

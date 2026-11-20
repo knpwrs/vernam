@@ -449,6 +449,7 @@ mod tests {
         (vcx, laid, clicked)
     }
 
+    #[cfg(target_os = "macos")]
     fn row_texts(text: &str, laid: &Laid) -> Vec<String> {
         let mut starts: Vec<usize> = laid.rows.iter().map(|(start, _)| *start).collect();
         starts.push(text.len());
