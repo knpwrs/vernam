@@ -204,7 +204,7 @@ impl Actor {
             // Unread until the chat is, here or on another device, which
             // takes down its notification (Desktop's `addReaction` with
             // `ReactionReadStatus.Unread`).
-            self.db.set_unread_reaction(target, reaction).await
+            self.db.set_unread_reaction(target, reaction, *target_sent_at).await
         } else {
             self.db.set_reaction(target, reaction).await
         };

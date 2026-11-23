@@ -815,13 +815,14 @@ impl AppState {
         .detach();
     }
 
-    /// Takes down the notifications shown for reactions to one message,
-    /// read on another device while its chat may still be unread.
-    fn drop_reaction_notifications(&mut self, conversation: &ConversationId, message_id: i64) {
-        let prefix = format!("{}:{message_id}:react-", conversation.0);
+    /// Takes down the notifications shown for these people's reactions to
+    /// one message, read on another device while its chat may still be
+    /// unread.
+    fn drop_reaction_notifications(&mut self, conversation: &ConversationId, message_id: i64, authors: &[String]) {
+        let gone: Vec<String> = authors.iter().map(|author| format!("{}:{message_id}:react-{author}", conversation.0)).collect();
         let Some(ids) = self.reaction_notifications.get_mut(conversation) else { return };
-        let read: Vec<String> = ids.iter().filter(|(id, _)| id.starts_with(&prefix)).map(|(id, _)| id.clone()).collect();
-        ids.retain(|(id, _)| !id.starts_with(&prefix));
+        let read: Vec<String> = ids.iter().filter(|(id, _)| gone.contains(id)).map(|(id, _)| id.clone()).collect();
+        ids.retain(|(id, _)| !gone.contains(id));
         if ids.is_empty() {
             self.reaction_notifications.remove(conversation);
         }
@@ -1379,7 +1380,9 @@ impl AppState {
             Event::Reacted { conversation, message_id, author, sender, emoji } => {
                 self.notify_reaction(conversation, message_id, author, sender, emoji, cx)
             }
-            Event::ReactionsRead { conversation, message_id } => self.drop_reaction_notifications(&conversation, message_id),
+            Event::ReactionsRead { conversation, message_id, authors } => {
+                self.drop_reaction_notifications(&conversation, message_id, &authors)
+            }
             Event::PollActivity { conversation, message_id, sender, ended } => {
                 self.notify_poll(conversation, message_id, sender, ended, cx)
             }

@@ -1227,6 +1227,8 @@ async fn notices_dont_hide_the_last_receipt() {
 /// Undoes the migrations after the init, which an old database never had.
 async fn drop_later_migrations(db: &AppDb) {
     sqlx::query("DELETE FROM _sqlx_migrations WHERE version > ?").bind(INIT_VERSION).execute(&db.writer).await.unwrap();
+    // Newest first: its trigger reads `kept_deleted`.
+    undo_reactions_table(db).await;
     sqlx::query("DROP INDEX messages_author").execute(&db.writer).await.unwrap();
     sqlx::query("DROP INDEX messages_quote_author").execute(&db.writer).await.unwrap();
     sqlx::query("ALTER TABLE messages DROP COLUMN styles").execute(&db.writer).await.unwrap();
@@ -1268,8 +1270,18 @@ async fn drop_later_migrations(db: &AppDb) {
     sqlx::query("DROP TABLE scheduled_messages").execute(&db.writer).await.unwrap();
     sqlx::query("DROP INDEX messages_kept_deleted").execute(&db.writer).await.unwrap();
     sqlx::query("ALTER TABLE messages DROP COLUMN kept_deleted").execute(&db.writer).await.unwrap();
-    sqlx::query("DROP INDEX messages_unread_reactions").execute(&db.writer).await.unwrap();
-    sqlx::query("ALTER TABLE messages DROP COLUMN unread_reactions").execute(&db.writer).await.unwrap();
+}
+
+/// Undoes the reactions table's migration and the unread flag's before it:
+/// reactions back in `messages.reactions`, as JSON.
+async fn undo_reactions_table(db: &AppDb) {
+    for sql in [
+        "DROP TRIGGER messages_deleted_reactions",
+        "DROP TABLE reactions",
+        "ALTER TABLE messages ADD COLUMN reactions TEXT NOT NULL DEFAULT '[]'",
+    ] {
+        sqlx::query(AssertSqlSafe(sql)).execute(&db.writer).await.unwrap();
+    }
 }
 
 /// Rewrites the migration history to look like a pre-squash database that
@@ -2462,6 +2474,40 @@ async fn votes_in_our_poll_are_unread_until_the_chat_is() {
 }
 
 #[tokio::test]
+async fn reactions_replace_per_author_and_go_with_their_message() {
+    let db = test_db().await;
+    let id = db.insert_message(&outgoing("g:aa", 10, "Lunch?")).await.unwrap();
+    let react = |emoji: &str, author: Option<&str>, sent_at| Reaction { emoji: emoji.into(), author: author.map(Into::into), sent_at };
+    db.set_reaction(id, react("👍", Some("bob"), 20)).await.unwrap();
+    db.set_reaction(id, react("❤️", None, 21)).await.unwrap();
+    db.set_reaction(id, react("😂", Some("bob"), 22)).await.unwrap();
+    // Oldest first; a changed one moves to the end.
+    let list = db.message(id).await.unwrap().unwrap().reactions;
+    assert_eq!(list, vec![react("❤️", None, 21), react("😂", Some("bob"), 22)]);
+    db.remove_reaction(id, None).await.unwrap();
+    assert_eq!(db.message(id).await.unwrap().unwrap().reactions, vec![react("😂", Some("bob"), 22)]);
+    // Kept deleted, they stay until it's erased.
+    let kept = db.insert_message(&incoming("g:aa", "bob", 30, "hi")).await.unwrap();
+    db.set_reaction(kept, react("👍", None, 31)).await.unwrap();
+    db.set_setting(crate::KEEP_DELETED_MESSAGES, "true").await.unwrap();
+    assert!(db.keep_deleted(kept).await.unwrap());
+    assert_eq!(db.message(kept).await.unwrap().unwrap().reactions.len(), 1);
+    db.erase_kept_deletes().await.unwrap();
+    assert!(db.message(kept).await.unwrap().unwrap().reactions.is_empty());
+    // Or erased by a plain delete.
+    let again = db.insert_message(&incoming("g:aa", "bob", 32, "hey")).await.unwrap();
+    db.set_reaction(again, react("👍", None, 33)).await.unwrap();
+    assert!(db.keep_deleted(again).await.unwrap());
+    db.mark_deleted(again).await.unwrap();
+    assert!(db.message(again).await.unwrap().unwrap().reactions.is_empty());
+    // Deleted, they go.
+    db.mark_deleted(id).await.unwrap();
+    assert!(db.message(id).await.unwrap().unwrap().reactions.is_empty());
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reactions").fetch_one(&db.pool).await.unwrap();
+    assert_eq!(rows, 0);
+}
+
+#[tokio::test]
 async fn reactions_to_our_messages_are_unread_until_the_chat_is() {
     let db = test_db().await;
     let ours = db.insert_message(&outgoing("g:aa", 10, "Lunch?")).await.unwrap();
@@ -2476,35 +2522,45 @@ async fn reactions_to_our_messages_are_unread_until_the_chat_is() {
     // counting as an unread message.
     db.set_reaction(theirs, react(None, 25)).await.unwrap();
     assert!(!chat(&db).await.unread_reactions);
-    db.set_unread_reaction(ours, react(Some("bob"), 30)).await.unwrap();
+    db.set_unread_reaction(ours, react(Some("bob"), 30), 10).await.unwrap();
     let c = chat(&db).await;
     assert!(c.unread_reactions);
     assert_eq!(c.unread_count, 0);
-    // A later change doesn't read it.
+    // Ours alongside doesn't read it.
     db.set_reaction(ours, react(None, 35)).await.unwrap();
     assert!(chat(&db).await.unread_reactions);
-    // Reading the chat takes it, naming our message for a read sync.
+    // Nor does the history import writing Bob's again; it's still named
+    // as he named it.
+    db.set_reaction(ours, react(Some("bob"), 30)).await.unwrap();
+    assert!(chat(&db).await.unread_reactions);
     assert_eq!(db.take_unread_reactions(&conv("g:aa")).await.unwrap(), vec![10]);
+    db.set_unread_reaction(ours, react(Some("bob"), 30), 10).await.unwrap();
+    // Reading the chat takes it, naming our message as the reaction did,
+    // once for each timestamp named (Desktop's `markConversationRead`).
+    db.edit_message(ours, "Lunch at noon?", 40).await.unwrap();
+    db.set_unread_reaction(ours, react(Some("cat"), 45), 40).await.unwrap();
+    db.set_unread_reaction(ours, react(Some("dan"), 46), 40).await.unwrap();
+    assert_eq!(db.take_unread_reactions(&conv("g:aa")).await.unwrap(), vec![10, 40]);
     assert!(db.take_unread_reactions(&conv("g:aa")).await.unwrap().is_empty());
     assert!(!chat(&db).await.unread_reactions);
-    // Edited, it's named by its latest edit.
-    db.edit_message(ours, "Lunch at noon?", 40).await.unwrap();
-    db.set_unread_reaction(ours, react(Some("bob"), 45)).await.unwrap();
-    assert_eq!(db.take_unread_reactions(&conv("g:aa")).await.unwrap(), vec![40]);
-    // Or a read sync from another device naming it, by any of its times.
-    for named in [10, 40] {
-        db.set_unread_reaction(ours, react(Some("bob"), 50)).await.unwrap();
-        assert_eq!(db.mark_reactions_read(named).await.unwrap(), Some((conv("g:aa"), ours)));
-        assert_eq!(db.mark_reactions_read(named).await.unwrap(), None);
-    }
+    // Or a read sync from another device naming it as reactions did: those
+    // are read, others not (Desktop's `markReactionAsRead`).
+    db.set_unread_reaction(ours, react(Some("bob"), 50), 10).await.unwrap();
+    db.set_unread_reaction(ours, react(Some("cat"), 51), 40).await.unwrap();
+    assert_eq!(db.mark_reactions_read(10).await.unwrap(), vec![(conv("g:aa"), ours, "bob".into())]);
+    assert!(chat(&db).await.unread_reactions);
+    assert!(db.mark_reactions_read(10).await.unwrap().is_empty());
+    assert_eq!(db.mark_reactions_read(40).await.unwrap(), vec![(conv("g:aa"), ours, "cat".into())]);
+    assert!(!chat(&db).await.unread_reactions);
     // Only ours: Bob's message sent at 20 has nothing to read.
-    assert_eq!(db.mark_reactions_read(20).await.unwrap(), None);
-    // Taken back, nothing's left to read; another's left still is.
-    db.set_unread_reaction(ours, react(Some("bob"), 51)).await.unwrap();
+    assert!(db.mark_reactions_read(20).await.unwrap().is_empty());
+    // Taken back, it's no longer unread; another still unread stays so, and
+    // a read one doesn't make it unread.
+    db.set_unread_reaction(ours, react(Some("bob"), 52), 40).await.unwrap();
     db.remove_reaction(ours, Some("bob")).await.unwrap();
     assert!(!chat(&db).await.unread_reactions);
-    db.set_unread_reaction(ours, react(Some("bob"), 52)).await.unwrap();
-    db.set_unread_reaction(ours, react(Some("cat"), 53)).await.unwrap();
+    db.set_unread_reaction(ours, react(Some("bob"), 53), 40).await.unwrap();
+    db.set_unread_reaction(ours, react(Some("dan"), 54), 40).await.unwrap();
     db.remove_reaction(ours, Some("bob")).await.unwrap();
     assert!(chat(&db).await.unread_reactions);
     // A read sync for their newer message reads it, as Desktop reads the
@@ -2516,14 +2572,68 @@ async fn reactions_to_our_messages_are_unread_until_the_chat_is() {
     assert_eq!(db.apply_read_sync("bob", 55).await.unwrap(), ReadSync::Read(conv("g:aa")));
     assert!(!chat(&db).await.unread_reactions);
     // Even with its messages read already.
-    db.set_unread_reaction(ours, react(Some("bob"), 56)).await.unwrap();
+    db.set_unread_reaction(ours, react(Some("bob"), 56), 40).await.unwrap();
     assert_eq!(db.apply_read_sync("bob", 55).await.unwrap(), ReadSync::Read(conv("g:aa")));
     assert!(!chat(&db).await.unread_reactions);
     assert_eq!(db.apply_read_sync("bob", 55).await.unwrap(), ReadSync::AlreadyRead);
-    // Deleted: nothing left to read.
-    db.set_unread_reaction(ours, react(Some("bob"), 60)).await.unwrap();
+    // Deleted (kept or not): nothing left to read.
+    db.set_unread_reaction(ours, react(Some("bob"), 60), 40).await.unwrap();
     db.mark_deleted(ours).await.unwrap();
     assert!(!chat(&db).await.unread_reactions);
+    let kept = db.insert_message(&outgoing("g:aa", 70, "Dinner?")).await.unwrap();
+    db.set_unread_reaction(kept, react(Some("bob"), 71), 70).await.unwrap();
+    db.set_setting(crate::KEEP_DELETED_MESSAGES, "true").await.unwrap();
+    assert!(db.keep_deleted(kept).await.unwrap());
+    assert!(!chat(&db).await.unread_reactions);
+    // Nor does a deleted message take an unread one.
+    db.set_unread_reaction(ours, react(Some("bob"), 80), 10).await.unwrap();
+    assert!(!chat(&db).await.unread_reactions);
+}
+
+#[tokio::test]
+async fn reactions_move_from_their_messages_into_a_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.db");
+    let key = [7u8; 32];
+    let (ours, theirs) = {
+        let db = AppDb::open(&path, &key).await.unwrap();
+        let ours = db.insert_message(&outgoing("g:aa", 10, "Lunch?")).await.unwrap();
+        let theirs = db.insert_message(&incoming("g:aa", "bob", 20, "Sure")).await.unwrap();
+        db.insert_message(&incoming("g:aa", "bob", 30, "none")).await.unwrap();
+        db.edit_message(ours, "Lunch at noon?", 15).await.unwrap();
+        undo_reactions_table(&db).await;
+        // As the unread flag's migration left it.
+        sqlx::query("ALTER TABLE messages ADD COLUMN unread_reactions INTEGER NOT NULL DEFAULT 0").execute(&db.writer).await.unwrap();
+        sqlx::query("CREATE INDEX messages_unread_reactions ON messages (conversation_id) WHERE unread_reactions = 1")
+            .execute(&db.writer)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 20261130000000").execute(&db.writer).await.unwrap();
+        let mine = r#"[{"emoji":"👍","author":"bob","sent_at":11},{"emoji":"❤️","author":"cat","sent_at":12},{"emoji":"😂","author":null,"sent_at":13}]"#;
+        sqlx::query("UPDATE messages SET reactions = ?, unread_reactions = 1 WHERE id = ?").bind(mine).bind(ours).execute(&db.writer).await.unwrap();
+        sqlx::query("UPDATE messages SET reactions = ? WHERE id = ?")
+            .bind(r#"[{"emoji":"🎉","author":null,"sent_at":21}]"#)
+            .bind(theirs)
+            .execute(&db.writer)
+            .await
+            .unwrap();
+        db.close().await;
+        (ours, theirs)
+    };
+    let db = AppDb::open(&path, &key).await.unwrap();
+    let react = |emoji: &str, author: Option<&str>, sent_at| Reaction { emoji: emoji.into(), author: author.map(Into::into), sent_at };
+    assert_eq!(
+        db.message(ours).await.unwrap().unwrap().reactions,
+        vec![react("👍", Some("bob"), 11), react("❤️", Some("cat"), 12), react("😂", None, 13)]
+    );
+    assert_eq!(db.message(theirs).await.unwrap().unwrap().reactions, vec![react("🎉", None, 21)]);
+    // Someone else's to ours were unread, named by its latest edit; ours
+    // never are.
+    let unread: Vec<(String, i64)> =
+        sqlx::query_as("SELECT author, target_sent_at FROM reactions WHERE unread = 1 ORDER BY author").fetch_all(&db.pool).await.unwrap();
+    assert_eq!(unread, vec![("bob".into(), 15), ("cat".into(), 15)]);
+    assert_eq!(db.take_unread_reactions(&conv("g:aa")).await.unwrap(), vec![15]);
+    db.close().await;
 }
 
 #[tokio::test]
@@ -2583,15 +2693,20 @@ async fn pending_votes_and_unread_votes_are_found_by_index() {
     };
     let list = plan(format!("SELECT {CONVERSATION_COLUMNS} FROM conversations")).await;
     assert!(list.contains("messages_unread_poll_votes"), "{list}");
-    assert!(list.contains("messages_unread_reactions"), "{list}");
-    let reactions = plan(
-        "UPDATE messages SET unread_reactions = 0 WHERE unread_reactions = 1 AND author_key = '' AND id IN ( \
-            SELECT id FROM messages WHERE author_key = '' AND sent_at = 1 \
-            UNION SELECT message_id FROM message_edits WHERE sent_at = 1)"
-            .into(),
-    )
-    .await;
-    assert!(!reactions.contains("SCAN messages"), "{reactions}");
+    // One probe of the chat's unread reactions.
+    assert!(list.contains("SEARCH r USING COVERING INDEX reactions_unread (conversation_id=?)"), "{list}");
+    let one = plan(format!("SELECT {MESSAGE_COLUMNS} FROM messages WHERE id = 1")).await;
+    assert!(!one.contains("SCAN r"), "{one}");
+    // Reading reactions goes through the unread ones only.
+    for sql in [
+        "UPDATE reactions INDEXED BY reactions_unread SET unread = 0 WHERE unread = 1 AND conversation_id = 'g:aa' \
+         AND EXISTS (SELECT 1 FROM messages m WHERE m.id = reactions.message_id AND m.sent_at <= 5)",
+        "UPDATE reactions INDEXED BY reactions_unread SET unread = 0 WHERE unread = 1 AND target_sent_at = 1 \
+         AND EXISTS (SELECT 1 FROM messages m WHERE m.id = reactions.message_id AND m.author_key = '')",
+    ] {
+        let found = plan(sql.into()).await;
+        assert!(!found.contains("SCAN messages") && !found.contains("SCAN m ") && !found.contains("SCAN message_edits"), "{found}");
+    }
     let sync =
         plan("UPDATE messages SET unread_poll_votes = 0 WHERE author_key = '' AND sent_at = 1 AND unread_poll_votes = 1".into()).await;
     assert!(sync.contains("sent_at=?"), "{sync}");

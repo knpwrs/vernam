@@ -1909,11 +1909,20 @@ impl Actor {
                     // `maybeItIsAPollVoteReadSync`).
                     if entry.0 == me {
                         match self.db.mark_reactions_read(entry.1).await {
-                            Ok(Some((conversation, message_id))) => {
-                                changed = true;
-                                self.emit(Event::ReactionsRead { conversation, message_id });
+                            Ok(read) => {
+                                // Sorted by message, so one event each.
+                                let mut by_message: Vec<(ConversationId, i64, Vec<String>)> = Vec::new();
+                                for (conversation, message_id, author) in read {
+                                    match by_message.last_mut() {
+                                        Some((_, id, authors)) if *id == message_id => authors.push(author),
+                                        _ => by_message.push((conversation, message_id, vec![author])),
+                                    }
+                                }
+                                for (conversation, message_id, authors) in by_message {
+                                    changed = true;
+                                    self.emit(Event::ReactionsRead { conversation, message_id, authors });
+                                }
                             }
-                            Ok(None) => {}
                             Err(error) => self.error("failed to apply read sync", error),
                         }
                         match self.db.mark_poll_votes_read(entry.1).await {

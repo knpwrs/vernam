@@ -8400,7 +8400,8 @@ mod tests {
     fn reactions_to_our_message_are_unread_until_the_chat_is_read(cx: &mut TestAppContext) {
         let (backend, _dir) = demo_backend(cx);
         wait_for_messages(&backend, GROUP, 1, |m| m.body.contains("first aid kit"));
-        let ours = wait_for_messages(&backend, GROUP, 1, |m| m.direction == signal_store::Direction::Outgoing && !m.deleted)[0].id;
+        let ours = wait_for_messages(&backend, GROUP, 1, |m| m.direction == signal_store::Direction::Outgoing && !m.deleted)[0].clone();
+        let (ours, ours_sent_at) = (ours.id, ours.sent_at);
         let chat = |backend: &Backend| {
             let db = backend.db().clone();
             futures::executor::block_on(backend.spawn(async move { db.conversation(&ConversationId(GROUP.into())).await }))
@@ -8409,7 +8410,7 @@ mod tests {
         };
         let db = backend.db().clone();
         let reaction = signal_store::Reaction { emoji: "👍".into(), author: Some("someone".into()), sent_at: 1 };
-        futures::executor::block_on(backend.spawn(async move { db.set_unread_reaction(ours, reaction).await })).unwrap();
+        futures::executor::block_on(backend.spawn(async move { db.set_unread_reaction(ours, reaction, ours_sent_at).await })).unwrap();
         assert!(chat(&backend).unread_reactions);
         // Opening the chat reads it.
         let (mut cx, view) = open_view(cx, &backend, GROUP);
