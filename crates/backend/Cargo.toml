@@ -32,25 +32,25 @@ base64 = "0.22"
 bincode = "1.3"
 hex = "0.4"
 # Signal's libraries, all at the release presage's vendored
-# libsignal-service uses (Desktop 8.36 uses v0.106.0). RingRTC brings its
+# libsignal-service uses (Desktop 8.39 uses v0.108.0). RingRTC brings its
 # own older zkgroup and libsignal-core for call links.
 #
 # Message history at link time ("link and sync"): the backup format's
 # frames and keys. (`test-util` only makes its generated protobuf types
 # public.)
-libsignal-message-backup = { git = "https://github.com/signalapp/libsignal", tag = "v0.106.1", features = ["test-util"] }
-libsignal-account-keys = { git = "https://github.com/signalapp/libsignal", tag = "v0.106.1" }
+libsignal-message-backup = { git = "https://github.com/signalapp/libsignal", tag = "v0.108.0", features = ["test-util"] }
+libsignal-account-keys = { git = "https://github.com/signalapp/libsignal", tag = "v0.108.0" }
 # Attachments in the backup (media) tier: backup auth credentials and the
 # key that signs their presentations (Signal's servers use version 1
 # "standard" generic server params, which zkgroup reads from v0.101).
-zkgroup = { git = "https://github.com/signalapp/libsignal", tag = "v0.106.1" }
-libsignal-core = { git = "https://github.com/signalapp/libsignal", tag = "v0.106.1" }
+zkgroup = { git = "https://github.com/signalapp/libsignal", tag = "v0.108.0" }
+libsignal-core = { git = "https://github.com/signalapp/libsignal", tag = "v0.108.0" }
 # Key transparency (automatic key verification in safety numbers): libsignal's
 # client and verifier, driven over presage's unauthenticated websocket.
-libsignal-net-chat = { git = "https://github.com/signalapp/libsignal", tag = "v0.106.1" }
-usernames = { git = "https://github.com/signalapp/libsignal", tag = "v0.106.1" }
-libsignal-keytrans = {git = "https://github.com/signalapp/libsignal", tag = "v0.106.1" }
-libsignal-net = { git = "https://github.com/signalapp/libsignal", tag = "v0.106.1" }
+libsignal-net-chat = { git = "https://github.com/signalapp/libsignal", tag = "v0.108.0" }
+usernames = { git = "https://github.com/signalapp/libsignal", tag = "v0.108.0" }
+libsignal-keytrans = {git = "https://github.com/signalapp/libsignal", tag = "v0.108.0" }
+libsignal-net = { git = "https://github.com/signalapp/libsignal", tag = "v0.108.0" }
 async-trait = "0.1"
 protobuf = "3"
 hkdf = "0.13"

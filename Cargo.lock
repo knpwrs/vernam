@@ -674,7 +674,7 @@ dependencies = [
 [[package]]
 name = "attest"
 version = "0.1.0"
-source = "git+https://github.com/signalapp/libsignal?tag=v0.106.1#904c8dc8216073b078a5f2f5090e3da8382e6a92"
+source = "git+https://github.com/signalapp/libsignal?tag=v0.108.0#8be00c282001caa3585d18de0f044c6d500348ab"
 dependencies = [
  "asn1",
  "bitflags 2.13.2",
@@ -682,12 +682,13 @@ dependencies = [
  "boring",
  "chacha20poly1305",
  "chrono",
+ "ciborium",
  "const-str",
  "displaydoc",
  "hex",
  "libc",
  "libcrux-ml-kem",
- "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
+ "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
  "log",
  "prost",
  "prost-build",
@@ -698,6 +699,7 @@ dependencies = [
  "snow",
  "static_assertions",
  "strum 0.28.0",
+ "subtle",
  "thiserror 2.0.21",
  "uuid",
  "x25519-dalek",
@@ -845,7 +847,7 @@ dependencies = [
  "bitflags 2.13.2",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.11.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -1011,8 +1013,8 @@ dependencies = [
 
 [[package]]
 name = "boring"
-version = "5.3.0"
-source = "git+https://github.com/signalapp/boring?tag=signal-v5.3.0#b518db81426b8b53e84b1cb1cda43fdfd021022c"
+version = "5.4.0"
+source = "git+https://github.com/signalapp/boring?tag=signal-v5.4.0#cf8e8093c66fc8b446a2d5bd64a485dc02053473"
 dependencies = [
  "bitflags 2.13.2",
  "boring-sys",
@@ -1023,8 +1025,8 @@ dependencies = [
 
 [[package]]
 name = "boring-sys"
-version = "5.3.0"
-source = "git+https://github.com/signalapp/boring?tag=signal-v5.3.0#b518db81426b8b53e84b1cb1cda43fdfd021022c"
+version = "5.4.0"
+source = "git+https://github.com/signalapp/boring?tag=signal-v5.4.0#cf8e8093c66fc8b446a2d5bd64a485dc02053473"
 dependencies = [
  "bindgen 0.72.1",
  "cmake",
@@ -1691,7 +1693,7 @@ version = "0.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee3344d349528f449816cfa85e558c439bdca5a6d8a738cfb21e69f0b2b1952f"
 dependencies = [
- "hax-lib",
+ "hax-lib 0.3.7",
  "pastey 0.2.3",
  "rand 0.10.3",
 ]
@@ -4294,7 +4296,18 @@ version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "01a33cb227f97ee5c419064c31d7c55a7d895f28d8019ccdadc311cc036500c4"
 dependencies = [
- "hax-lib-macros",
+ "hax-lib-macros 0.3.7",
+ "num-bigint",
+ "num-traits",
+]
+
+[[package]]
+name = "hax-lib"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04ce2d088d3d46cb20f1136005ebb161316f766b037aa79f9f6f14a0327105d2"
+dependencies = [
+ "hax-lib-macros 0.5.0",
  "num-bigint",
  "num-traits",
 ]
@@ -4305,8 +4318,20 @@ version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28da835a5f153e9f3d0cc1f42ee605a1cfa9093c93348193793d60a1b0908b51"
 dependencies = [
- "hax-lib-macros-types",
+ "hax-lib-macros-types 0.3.7",
  "proc-macro-error2",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "hax-lib-macros"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8b31ce88f4a629cf244df7e086b84c915dcb53251268a5ab2cfe9371c3f352d"
+dependencies = [
+ "hax-lib-macros-types 0.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -4317,6 +4342,19 @@ name = "hax-lib-macros-types"
 version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eed327e9a28d6ee018a4a9ba842d4ee27e378c8a591d2beb6f42f32b24a02fcb"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "hax-lib-macros-types"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "611ab31405888422952fdcd3ff4c028efa8162d01d387083d75897a27c1ac686"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4603,7 +4641,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.57.0",
 ]
 
 [[package]]
@@ -5273,7 +5311,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "98a0c574d4eb81d0814bc2b91e4a433d7e0b35851b1d62eb5dd95c064f1f76d0"
 dependencies = [
  "core-models",
- "hax-lib",
+ "hax-lib 0.3.7",
 ]
 
 [[package]]
@@ -5292,7 +5330,7 @@ version = "0.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d8160f7d64fd2716b4fd05cc886a042f8dcda18d9206c0d506e2c67bdf97daa"
 dependencies = [
- "hax-lib",
+ "hax-lib 0.3.7",
  "libcrux-intrinsics",
  "libcrux-platform",
  "libcrux-secrets",
@@ -5316,7 +5354,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "79054fc9037cb70d6a546cf094cea7d7df06af5e49d230ba24103d27ccc886f1"
 dependencies = [
  "crabgrind",
- "hax-lib",
+ "hax-lib 0.3.7",
 ]
 
 [[package]]
@@ -5336,7 +5374,7 @@ version = "0.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c09f5c39afae0528e1f70a3c1e3c6ee649ec1f19dda26fc9b6ea91108fb879ef"
 dependencies = [
- "hax-lib",
+ "hax-lib 0.3.7",
  "libcrux-intrinsics",
  "libcrux-platform",
  "libcrux-traits",
@@ -5408,7 +5446,7 @@ dependencies = [
 [[package]]
 name = "libsignal-account-keys"
 version = "0.1.0"
-source = "git+https://github.com/signalapp/libsignal?tag=v0.106.1#904c8dc8216073b078a5f2f5090e3da8382e6a92"
+source = "git+https://github.com/signalapp/libsignal?tag=v0.108.0#8be00c282001caa3585d18de0f044c6d500348ab"
 dependencies = [
  "aes 0.9.4",
  "argon2",
@@ -5417,7 +5455,7 @@ dependencies = [
  "displaydoc",
  "hkdf 0.13.0",
  "hmac 0.13.0",
- "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
+ "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
  "libsignal-protocol",
  "partial-default",
  "password-hash",
@@ -5462,7 +5500,7 @@ dependencies = [
 [[package]]
 name = "libsignal-core"
 version = "0.1.0"
-source = "git+https://github.com/signalapp/libsignal?tag=v0.106.1#904c8dc8216073b078a5f2f5090e3da8382e6a92"
+source = "git+https://github.com/signalapp/libsignal?tag=v0.108.0#8be00c282001caa3585d18de0f044c6d500348ab"
 dependencies = [
  "curve25519-dalek",
  "derive_more",
@@ -5500,7 +5538,7 @@ dependencies = [
 [[package]]
 name = "libsignal-debug"
 version = "0.1.0"
-source = "git+https://github.com/signalapp/libsignal?tag=v0.106.1#904c8dc8216073b078a5f2f5090e3da8382e6a92"
+source = "git+https://github.com/signalapp/libsignal?tag=v0.108.0#8be00c282001caa3585d18de0f044c6d500348ab"
 dependencies = [
  "cfg-if 1.0.5",
 ]
@@ -5516,7 +5554,7 @@ dependencies = [
 [[package]]
 name = "libsignal-keytrans"
 version = "0.1.0"
-source = "git+https://github.com/signalapp/libsignal?tag=v0.106.1#904c8dc8216073b078a5f2f5090e3da8382e6a92"
+source = "git+https://github.com/signalapp/libsignal?tag=v0.108.0#8be00c282001caa3585d18de0f044c6d500348ab"
 dependencies = [
  "curve25519-dalek",
  "displaydoc",
@@ -5533,7 +5571,7 @@ dependencies = [
 [[package]]
 name = "libsignal-message-backup"
 version = "0.1.0"
-source = "git+https://github.com/signalapp/libsignal?tag=v0.106.1#904c8dc8216073b078a5f2f5090e3da8382e6a92"
+source = "git+https://github.com/signalapp/libsignal?tag=v0.108.0#8be00c282001caa3585d18de0f044c6d500348ab"
 dependencies = [
  "aes 0.9.4",
  "arrayvec",
@@ -5550,8 +5588,8 @@ dependencies = [
  "hmac 0.13.0",
  "intmap",
  "itertools 0.15.0",
- "libsignal-account-keys 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
- "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
+ "libsignal-account-keys 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
+ "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
  "libsignal-message-backup-macros",
  "libsignal-protocol",
  "libsignal-svrb",
@@ -5566,7 +5604,7 @@ dependencies = [
  "serde",
  "serde_with",
  "sha2 0.11.1",
- "signal-crypto 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
+ "signal-crypto 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
  "static_assertions",
  "strum 0.28.0",
  "subtle",
@@ -5575,14 +5613,14 @@ dependencies = [
  "usernames",
  "uuid",
  "visibility",
- "zkcredential 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
- "zkgroup 0.9.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
+ "zkcredential 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
+ "zkgroup 0.9.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
 ]
 
 [[package]]
 name = "libsignal-message-backup-macros"
 version = "0.1.0"
-source = "git+https://github.com/signalapp/libsignal?tag=v0.106.1#904c8dc8216073b078a5f2f5090e3da8382e6a92"
+source = "git+https://github.com/signalapp/libsignal?tag=v0.108.0#8be00c282001caa3585d18de0f044c6d500348ab"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -5593,7 +5631,7 @@ dependencies = [
 [[package]]
 name = "libsignal-net"
 version = "0.1.0"
-source = "git+https://github.com/signalapp/libsignal?tag=v0.106.1#904c8dc8216073b078a5f2f5090e3da8382e6a92"
+source = "git+https://github.com/signalapp/libsignal?tag=v0.108.0#8be00c282001caa3585d18de0f044c6d500348ab"
 dependencies = [
  "assert_matches",
  "async-trait",
@@ -5616,8 +5654,8 @@ dependencies = [
  "hyper",
  "hyper-util",
  "itertools 0.15.0",
- "libsignal-account-keys 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
- "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
+ "libsignal-account-keys 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
+ "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
  "libsignal-keytrans",
  "libsignal-net-infra",
  "libsignal-protocol",
@@ -5636,7 +5674,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
- "signal-crypto 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
+ "signal-crypto 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
  "static_assertions",
  "strum 0.28.0",
  "subtle",
@@ -5655,8 +5693,9 @@ dependencies = [
 [[package]]
 name = "libsignal-net-chat"
 version = "0.1.0"
-source = "git+https://github.com/signalapp/libsignal?tag=v0.106.1#904c8dc8216073b078a5f2f5090e3da8382e6a92"
+source = "git+https://github.com/signalapp/libsignal?tag=v0.108.0#8be00c282001caa3585d18de0f044c6d500348ab"
 dependencies = [
+ "aes-gcm",
  "assert_matches",
  "async-trait",
  "base64 0.22.1",
@@ -5672,8 +5711,9 @@ dependencies = [
  "http-body",
  "http-body-util",
  "itertools 0.15.0",
- "libsignal-account-keys 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
- "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
+ "libcrux-sha3",
+ "libsignal-account-keys 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
+ "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
  "libsignal-keytrans",
  "libsignal-net",
  "libsignal-net-grpc",
@@ -5683,10 +5723,12 @@ dependencies = [
  "prost",
  "prost-types",
  "rand 0.9.5",
+ "rand_chacha 0.9.0",
  "ref-cast",
  "serde",
  "serde_json",
  "serde_with",
+ "sha2 0.11.1",
  "static_assertions",
  "strum 0.28.0",
  "subtle",
@@ -5698,17 +5740,17 @@ dependencies = [
  "usernames",
  "uuid",
  "visibility",
- "zkgroup 0.9.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
+ "zkgroup 0.9.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
 ]
 
 [[package]]
 name = "libsignal-net-grpc"
 version = "0.1.0"
-source = "git+https://github.com/signalapp/libsignal?tag=v0.106.1#904c8dc8216073b078a5f2f5090e3da8382e6a92"
+source = "git+https://github.com/signalapp/libsignal?tag=v0.108.0#8be00c282001caa3585d18de0f044c6d500348ab"
 dependencies = [
  "const-str",
  "derive-where",
- "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
+ "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
  "prost",
  "prost-types",
  "strum 0.28.0",
@@ -5720,7 +5762,7 @@ dependencies = [
 [[package]]
 name = "libsignal-net-infra"
 version = "0.1.0"
-source = "git+https://github.com/signalapp/libsignal?tag=v0.106.1#904c8dc8216073b078a5f2f5090e3da8382e6a92"
+source = "git+https://github.com/signalapp/libsignal?tag=v0.108.0#8be00c282001caa3585d18de0f044c6d500348ab"
 dependencies = [
  "assert_matches",
  "async-trait",
@@ -5742,7 +5784,7 @@ dependencies = [
  "hyper-util",
  "indexmap 2.14.2",
  "itertools 0.15.0",
- "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
+ "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
  "log",
  "nonzero_ext",
  "once_cell",
@@ -5772,7 +5814,7 @@ dependencies = [
 [[package]]
 name = "libsignal-protocol"
 version = "0.1.0"
-source = "git+https://github.com/signalapp/libsignal?tag=v0.106.1#904c8dc8216073b078a5f2f5090e3da8382e6a92"
+source = "git+https://github.com/signalapp/libsignal?tag=v0.108.0#8be00c282001caa3585d18de0f044c6d500348ab"
 dependencies = [
  "aes 0.9.4",
  "aes-gcm-siv 0.12.1",
@@ -5791,7 +5833,7 @@ dependencies = [
  "indexmap 2.14.2",
  "itertools 0.15.0",
  "libcrux-ml-kem",
- "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
+ "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
  "libsignal-debug 0.1.0",
  "log",
  "prost",
@@ -5800,7 +5842,7 @@ dependencies = [
  "rayon",
  "serde",
  "sha2 0.11.1",
- "signal-crypto 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
+ "signal-crypto 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
  "spqr",
  "subtle",
  "thiserror 2.0.21",
@@ -5826,8 +5868,8 @@ dependencies = [
  "hex",
  "hkdf 0.13.0",
  "hmac 0.13.0",
- "libsignal-account-keys 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
- "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
+ "libsignal-account-keys 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
+ "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
  "libsignal-net",
  "libsignal-net-infra",
  "libsignal-protocol",
@@ -5841,7 +5883,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
- "signal-crypto 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
+ "signal-crypto 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -5849,13 +5891,13 @@ dependencies = [
  "url",
  "usernames",
  "uuid",
- "zkgroup 0.9.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
+ "zkgroup 0.9.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
 ]
 
 [[package]]
 name = "libsignal-svrb"
 version = "0.1.0"
-source = "git+https://github.com/signalapp/libsignal?tag=v0.106.1#904c8dc8216073b078a5f2f5090e3da8382e6a92"
+source = "git+https://github.com/signalapp/libsignal?tag=v0.108.0#8be00c282001caa3585d18de0f044c6d500348ab"
 dependencies = [
  "aes-gcm-siv 0.12.1",
  "curve25519-dalek",
@@ -7717,7 +7759,7 @@ dependencies = [
 [[package]]
 name = "poksho"
 version = "0.7.0"
-source = "git+https://github.com/signalapp/libsignal?tag=v0.106.1#904c8dc8216073b078a5f2f5090e3da8382e6a92"
+source = "git+https://github.com/signalapp/libsignal?tag=v0.108.0#8be00c282001caa3585d18de0f044c6d500348ab"
 dependencies = [
  "curve25519-dalek",
  "hmac 0.13.0",
@@ -8041,8 +8083,8 @@ version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
- "heck 0.5.0",
- "itertools 0.14.0",
+ "heck 0.4.1",
+ "itertools 0.11.0",
  "log",
  "multimap",
  "petgraph",
@@ -8063,7 +8105,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.11.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -9550,8 +9592,8 @@ dependencies = [
  "imagesize 0.15.0",
  "jpeg-decoder",
  "jpeg-encoder",
- "libsignal-account-keys 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
- "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
+ "libsignal-account-keys 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
+ "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
  "libsignal-keytrans",
  "libsignal-message-backup",
  "libsignal-net",
@@ -9593,7 +9635,7 @@ dependencies = [
  "url",
  "usernames",
  "uuid",
- "zkgroup 0.9.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
+ "zkgroup 0.9.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
 ]
 
 [[package]]
@@ -9611,7 +9653,7 @@ dependencies = [
 [[package]]
 name = "signal-crypto"
 version = "0.1.0"
-source = "git+https://github.com/signalapp/libsignal?tag=v0.106.1#904c8dc8216073b078a5f2f5090e3da8382e6a92"
+source = "git+https://github.com/signalapp/libsignal?tag=v0.108.0#8be00c282001caa3585d18de0f044c6d500348ab"
 dependencies = [
  "aes 0.9.4",
  "cbc 0.2.1",
@@ -9623,7 +9665,7 @@ dependencies = [
  "hmac 0.13.0",
  "hpke-rs",
  "hpke-rs-crypto",
- "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
+ "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
  "libsignal-debug 0.1.0",
  "rand_chacha 0.9.0",
  "rand_core 0.9.5",
@@ -9933,11 +9975,11 @@ dependencies = [
 
 [[package]]
 name = "spqr"
-version = "1.6.0"
-source = "git+https://github.com/signalapp/SparsePostQuantumRatchet.git?tag=v1.6.0#06959b4708f9b7b1e94d0f8cc835f3958c077e94"
+version = "1.7.0"
+source = "git+https://github.com/signalapp/SparsePostQuantumRatchet.git?tag=v1.7.0#3a69df8f01179fce970693f072b710a8ab8dc6c2"
 dependencies = [
  "cpufeatures 0.3.1",
- "hax-lib",
+ "hax-lib 0.5.0",
  "hkdf 0.13.0",
  "libcrux-hmac",
  "libcrux-ml-kem",
@@ -10673,8 +10715,8 @@ dependencies = [
 
 [[package]]
 name = "tokio-boring"
-version = "5.3.0"
-source = "git+https://github.com/signalapp/boring?tag=signal-v5.3.0#b518db81426b8b53e84b1cb1cda43fdfd021022c"
+version = "5.4.0"
+source = "git+https://github.com/signalapp/boring?tag=signal-v5.4.0#cf8e8093c66fc8b446a2d5bd64a485dc02053473"
 dependencies = [
  "boring",
  "boring-sys",
@@ -10854,6 +10896,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bytes",
+ "flate2",
  "http",
  "http-body",
  "http-body-util",
@@ -11247,19 +11290,19 @@ dependencies = [
 [[package]]
 name = "usernames"
 version = "0.1.0"
-source = "git+https://github.com/signalapp/libsignal?tag=v0.106.1#904c8dc8216073b078a5f2f5090e3da8382e6a92"
+source = "git+https://github.com/signalapp/libsignal?tag=v0.108.0#8be00c282001caa3585d18de0f044c6d500348ab"
 dependencies = [
  "curve25519-dalek",
  "displaydoc",
  "hkdf 0.13.0",
  "hmac 0.13.0",
  "log",
- "poksho 0.7.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
+ "poksho 0.7.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
  "prost",
  "prost-build",
  "rand 0.9.5",
  "sha2 0.11.1",
- "signal-crypto 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
+ "signal-crypto 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
  "subtle",
  "thiserror 2.0.21",
 ]
@@ -11967,7 +12010,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -13052,14 +13095,14 @@ dependencies = [
 [[package]]
 name = "zkcredential"
 version = "0.1.0"
-source = "git+https://github.com/signalapp/libsignal?tag=v0.106.1#904c8dc8216073b078a5f2f5090e3da8382e6a92"
+source = "git+https://github.com/signalapp/libsignal?tag=v0.108.0#8be00c282001caa3585d18de0f044c6d500348ab"
 dependencies = [
  "cfg-if 1.0.5",
  "curve25519-dalek",
  "derive-where",
  "displaydoc",
  "partial-default",
- "poksho 0.7.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
+ "poksho 0.7.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
  "rayon",
  "serde",
  "sha2 0.11.1",
@@ -13088,7 +13131,7 @@ dependencies = [
 [[package]]
 name = "zkgroup"
 version = "0.9.0"
-source = "git+https://github.com/signalapp/libsignal?tag=v0.106.1#904c8dc8216073b078a5f2f5090e3da8382e6a92"
+source = "git+https://github.com/signalapp/libsignal?tag=v0.108.0#8be00c282001caa3585d18de0f044c6d500348ab"
 dependencies = [
  "aes 0.9.4",
  "aes-gcm-siv 0.12.1",
@@ -13100,10 +13143,10 @@ dependencies = [
  "displaydoc",
  "hex",
  "hkdf 0.13.0",
- "libsignal-account-keys 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
- "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
+ "libsignal-account-keys 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
+ "libsignal-core 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
  "partial-default",
- "poksho 0.7.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
+ "poksho 0.7.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
  "rand 0.9.5",
  "rayon",
  "serde",
@@ -13113,7 +13156,7 @@ dependencies = [
  "subtle",
  "thiserror 2.0.21",
  "uuid",
- "zkcredential 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.106.1)",
+ "zkcredential 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.0)",
 ]
 
 [[package]]

@@ -51,12 +51,17 @@ pub(crate) struct RemoteProfile {
     pub payment_address: Option<String>,
 }
 
+/// The version of `key` for `aci` as the profile endpoints take it: hex.
+/// (libsignal v0.108 hands back its bytes; before, the hex string.)
+pub(crate) fn profile_key_version(key: ProfileKey, aci: Aci) -> String {
+    hex::encode(key.get_profile_key_version(aci).bytes)
+}
+
 /// Their profile, fetched with their profile key.
 pub(crate) async fn fetch(manager: &SignalManager, aci: Aci, key: ProfileKey) -> anyhow::Result<RemoteProfile> {
     let service = crate::storage::push_service(manager)?;
-    let version = key.get_profile_key_version(aci);
     let uuid: presage::libsignal_service::prelude::Uuid = aci.into();
-    let path = format!("/v1/profile/{uuid}/{}", version.as_ref());
+    let path = format!("/v1/profile/{uuid}/{}", profile_key_version(key, aci));
     let response = service
         .request(reqwest::Method::GET, Endpoint::service(path), HttpAuthOverride::NoOverride)?
         .send()
@@ -341,11 +346,10 @@ pub(crate) fn profile_request(
         AvatarChange::Remove => (false, false, None),
         AvatarChange::New(bytes) => (true, false, Some(encrypt(bytes, key, rng)?)),
     };
-    let version = key.get_profile_key_version(aci);
     let commitment = bincode::serialize(&key.get_commitment(aci))?;
     let b64 = |bytes: &[u8]| BASE64_STANDARD.encode(bytes);
     let body = serde_json::json!({
-        "version": version.as_ref(),
+        "version": profile_key_version(key, aci),
         "name": b64(&name),
         "about": about.as_deref().map(b64),
         "aboutEmoji": emoji.as_deref().map(b64),
@@ -389,6 +393,19 @@ mod tests {
 
     fn key() -> ProfileKey {
         ProfileKey::create([9; 32])
+    }
+
+    /// libsignal's own test vectors (`profile_key_version.rs`), as hex.
+    #[test]
+    fn the_profile_key_version_goes_as_hex() {
+        assert_eq!(
+            profile_key_version(ProfileKey::create([1; 32]), Aci::from_uuid_bytes([0xa; 16])),
+            "540169ba2813a4d92326faec4a07de372db4319ab3bb812827019fc8a771a38f"
+        );
+        assert_eq!(
+            profile_key_version(ProfileKey::create([2; 32]), Aci::from_uuid_bytes([0xb; 16])),
+            "4a471108a53e1b278f43be5a8d18c6b5f26cd038ebec80c2cf3058059f3e8950"
+        );
     }
 
     fn aci() -> Aci {
@@ -444,8 +461,7 @@ mod tests {
     fn the_request_names_the_key_version_and_commitment() {
         let request = request(&edit(), true);
         let body = &request.body;
-        let version = key().get_profile_key_version(aci());
-        assert_eq!(body["version"].as_str(), Some(version.as_ref()));
+        assert_eq!(body["version"].as_str(), Some(profile_key_version(key(), aci()).as_str()));
         assert_eq!(body["version"].as_str().unwrap().len(), 64, "hex");
         let commitment = bincode::serialize(&key().get_commitment(aci())).unwrap();
         assert_eq!(field(body, "commitment"), commitment);

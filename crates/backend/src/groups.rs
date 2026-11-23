@@ -144,7 +144,7 @@ impl GroupSession {
         let path = format!(
             "/v1/profile/{}/{}/{}?credentialType=expiringProfileKey",
             uuid_of(aci),
-            key.get_profile_key_version(aci).as_ref(),
+            crate::profiles::profile_key_version(key, aci),
             hex::encode(zkgroup::serialize(&context.get_request())),
         );
         let response = self

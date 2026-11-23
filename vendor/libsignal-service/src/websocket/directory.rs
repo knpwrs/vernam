@@ -5,6 +5,8 @@
 use libsignal_core::ServiceId;
 use libsignal_net::auth::Auth;
 use libsignal_net::cdsi::{CdsiConnection, LookupResponseEntry};
+// signal-gpui: libsignal v0.108 moved `enclave_websocket_provider` onto this trait.
+use libsignal_net::enclave::AnyEnclaveEndpoint as _;
 use libsignal_net::connect_state::{
     ConnectState, ConnectionResources, SUGGESTED_CONNECT_CONFIG,
 };

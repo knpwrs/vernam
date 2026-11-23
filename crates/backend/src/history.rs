@@ -332,9 +332,10 @@ fn private_reply_fits(conversation: &ConversationId, direction: Direction, quote
 /// A quote's private reply group, from its `privateReplyDescriptor` (Desktop's
 /// backup import, commit 98032f98): `privateReplyGroupRecipientId` (7)
 /// names the group, `unknownPrivateReply` (6) says there was one we don't
-/// know. libsignal v0.106.1's `Backup.proto` predates both, so they're read
-/// from the quote's unknown fields. A recipient that isn't a group leaves
-/// an ordinary quote, as in Desktop.
+/// know. libsignal v0.108.0's `Backup.proto` predates both, so they're read
+/// from the quote's unknown fields. A libsignal that knows them would hide
+/// them from `unknown_fields`: the private reply import test catches that.
+/// A recipient that isn't a group leaves an ordinary quote, as in Desktop.
 fn private_reply(quote: &proto::Quote, people: &HashMap<u64, Who>) -> Option<signal_store::PrivateReply> {
     use protobuf::UnknownValueRef;
     let unknown = quote.special_fields.unknown_fields();

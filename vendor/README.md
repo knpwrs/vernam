@@ -102,9 +102,11 @@ whisperfish/libsignal-service-rs at `7a7526741dfd9ad4c4894717f22651eb0506fb7e`
 Powers for signal-gpui since 2026-10-15; the changes were replayed onto
 this revision on 2026-11-05. Changes:
 
-- `Cargo.toml`, `src/cipher.rs`: libsignal v0.106.1 rather than upstream's
-  v0.99.0, as Signal Desktop 8.36 uses v0.106.0. `message_decrypt_prekey`
+- `Cargo.toml`, `src/cipher.rs`: libsignal v0.108.0 rather than upstream's
+  v0.99.0, as Signal Desktop 8.39 uses v0.108.0. `message_decrypt_prekey`
   now returns a `PreKeyDecryptResult`, whose `plaintext` is taken.
+- `src/websocket/directory.rs`: imports `AnyEnclaveEndpoint`, the trait
+  libsignal v0.108 moved `enclave_websocket_provider` onto.
 - `src/cipher.rs`: an unsealed message's padding is stripped by the
   message's own version, not the active session's. libsignal 0.106
   (Tahini) can decrypt on an archived session without making it active, or
