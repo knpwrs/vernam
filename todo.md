@@ -19,6 +19,7 @@ made-up config; the fetch hasn't been run against Signal's server.
 | `adminDelete.receive` / `.send` | Group admins deleting anyone's message for everyone. | Done, following both flags. People whose clients don't know `adminDelete` yet still see the message. |
 | `stickerReply.send` | Sending a sticker as a reply (with a quote). | Done, following the flag. GIFs reply too; Desktop opens a dialog to caption a GIF with the draft first (`DraftGifMessageSendModal`), and here a GIF goes at once, so the draft and the reply stay in the composer, as for a sticker. |
 | `stickerFavorites` | Favorite stickers: a Favorites section first in the sticker picker (Desktop commit 8e3dc06). | Follows the flag for the picker: its section, and "Add to favorites" / "Remove from favorites" in a sticker's right-click menu, as Desktop's picker has them; and "Add to Favorites" / "Remove from Favorites" in a sticker message's menu, for messages that kept the sticker's id (those received or sent from this version on, and transferred history); and, in a pack's preview, a click on a sticker shows it large with "Add to Favorites" (installed packs) or "Remove from Favorites" (Desktop commit 4cbe353). A transferred backup's favorites (its `FavoriteStickerList`, Desktop commit e345f39) are added at link time, up to the 500 limit. Records are read, merged and written again whatever the flag, as Desktop's storage sync does. See "Sticker manager" below. |
+| `stickerPackHiding` | Hiding a received pack from the sticker manager (Desktop commits 5edf85d and 8049395). | Follows the flag for the action only: "Hide" in a "Shared With You" pack's right-click menu, which asks first ("Hide Sticker Pack?"), uninstalls an installed pack, hides it, and shows "Sticker pack hidden" with Undo. Records are read, merged and written whatever the flag, as Desktop's storage sync does, and a transferred backup's hidden packs are kept. See "Hidden sticker packs" below. |
 | `pollSend1to1` | Creating polls in 1:1 chats (groups always have polls). | Follows the flag. Received 1:1 polls show and can be voted in either way. |
 | `shareContact` | Sharing one of your contacts from the composer's add menu ("Contact", `ShareContactDialog`). | Done, following the flag: the picker (Signal connections with a name and account or a number, and anyone else with a number), the share step with the number, nickname and note to check, "Edit name" and "Select a photo", sent as Desktop's `enqueueSharedContactForSend` builds it, photo uploaded with it (`signal_backend::share_contact`). Differences: an address-book name is kept here as one string, so it goes as the first name; there are no address-book photos, only the profile photo; nobody is left out for being unregistered (not tracked); the search is a plain match on name and number rather than Desktop's fuzzy one; no safety-number check before sending (as for polls). Unit and headless UI tested against the demo; not sent to a real account. |
 | `groupMemberLabels.edit` | Editing your own member label in a group. | Done (Group settings), following the flag: whether you may set one follows the group's label access, as Desktop's `getCanAddLabel`. |
@@ -782,10 +783,40 @@ has been written to or read from Signal's servers. Differences:
   change not yet written wins over the remote record until it's written.
 - **Aged-out tombstones** are dropped here but their records stay in
   Storage Service; Desktop deletes them from the manifest.
-- **Hidden sticker packs** (`HiddenStickerPackRecord`, type 10) aren't
-  read: Desktop doesn't read them yet either (not in `validRecordTypes`).
-  Their identifiers, like every other type's, are kept when we rewrite
-  the manifest.
+- **Hidden sticker packs** are read and written now; see below.
 - **Search** doesn't look in favorites from packs that aren't installed,
   as in Desktop, and "Move to top" isn't offered (Desktop has none yet).
+
+### Hidden sticker packs
+
+Following Desktop commits 5edf85d and 8049395 (`markStickerPackAsHidden`,
+`maybeUnhideStickerPack`, `mergeHiddenStickerPackRecord`): with
+`stickerPackHiding` on, a "Shared With You" pack's menu has Hide, which
+asks first, uninstalls the pack if it's installed, and hides it from the
+list; "Sticker pack hidden" offers Undo, which unhides it without
+installing it again. Hidden packs are kept in the `hidden_sticker_packs`
+setting as JSON, with tombstones for unhidden ones that keep the pack's
+key, so hiding again needs no lookup (and a tombstone from another device,
+which has no key, takes the key `sticker_packs` has). Installing a hidden
+pack from anywhere (the manager, a link, a sync message, Storage Service,
+a transferred backup) unhides it. Each change writes its
+`HiddenStickerPackRecord`; Storage Service's records are merged at each
+sync (tombstones older than the message queue time dropped, ours and
+those read), and a transferred backup's `hiddenStickerPack` frames are added
+as already written. Tested with store, merge, wire-format and import
+tests and a demo-mode UI test; no record has been written to or read from
+Signal's servers. Differences:
+
+- **Pending writes, aged-out tombstones:** as for favorites above (written
+  again at the next sync, at most 20; an aged-out tombstone's record
+  stays in Storage Service).
+- **Deleting a pack** unhides it in Desktop (`deletePack`,
+  `deletePackReference`, when the last message using a downloaded pack
+  goes); packs are never deleted here, so that case doesn't arise.
+- **A backup's hidden pack without a 16-byte id and 32-byte key** is
+  skipped; Desktop's import fails on it.
+- **The toast** shows when Hide is confirmed; Desktop's shows once the
+  hide is saved.
+- **Backup export** of hidden packs (Desktop's `export.preload.ts`) isn't
+  done: there's no backup export here.
 

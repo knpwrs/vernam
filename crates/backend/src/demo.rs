@@ -935,6 +935,7 @@ const DEMO_REMOTE_CONFIG: &[(&str, &str)] = &[
     ("desktop.adminDelete.send.prod", "8.30.0"),
     ("desktop.stickerReply.send.prod", "8.30.0"),
     ("desktop.stickerFavorites.prod", "8.30.0"),
+    ("desktop.stickerPackHiding.prod", "8.30.0"),
     ("desktop.groupMemberLabels.edit.prod", "8.30.0"),
     ("desktop.groupTerminate.send.prod", "8.30.0"),
     ("desktop.keyTransparency.prod", "8.30.0"),

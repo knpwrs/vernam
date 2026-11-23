@@ -2,7 +2,9 @@
 //! `StickerManagerHeader`, `StickerManagerPackRow`) and the pack preview
 //! (`StickerPreviewModal.dom.tsx`). Desktop shows the manager as a panel of
 //! the open chat; here it's a dialog. Installed packs are reordered with
-//! a pack's menu (Move up, Move down) where Desktop drags them.
+//! a pack's menu (Move up, Move down) where Desktop drags them. With
+//! `stickerPackHiding` on, a "Shared With You" pack's menu has Hide
+//! (Desktop commits 5edf85d and 8049395).
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
@@ -61,13 +63,52 @@ fn uninstall(state: Entity<AppState>, pack: StickerPackSummary, window: &mut Win
     });
 }
 
+/// Desktop's `HidePackDialog`: hiding a received pack, once confirmed.
+pub fn confirm_hide(state: Entity<AppState>, pack: StickerPackSummary, window: &mut Window, cx: &mut App) {
+    window.open_alert_dialog(cx, move |alert, _, _| {
+        let (state, pack) = (state.clone(), pack.clone());
+        alert
+            .title("Hide Sticker Pack?")
+            .description("This will remove the sticker pack. You can't add it again without a link or sticker message.")
+            .confirm()
+            .ok_text("Hide")
+            .ok_variant(ButtonVariant::Danger)
+            .on_ok(move |_, window, cx| {
+                hide(state.clone(), pack.clone(), window, cx);
+                true
+            })
+    });
+}
+
+/// Hides a pack (uninstalling it first if it's installed) and says so,
+/// with Undo (Desktop's `StickerPackHidden` toast). Undo unhides it but
+/// doesn't install it again, as in Desktop.
+fn hide(state: Entity<AppState>, pack: StickerPackSummary, window: &mut Window, cx: &mut App) {
+    state.read(cx).send(Command::HideStickerPack { id: pack.id.clone(), key: pack.key.clone() });
+    let id = pack.id;
+    let toast = Notification::new()
+        .message("Sticker pack hidden")
+        .action(move |_, _, _| {
+            let (state, id) = (state.clone(), id.clone());
+            Button::new("sticker-hidden-undo").label("Undo").ghost().small().on_click(move |_, window, cx| {
+                state.read(cx).send(Command::UnhideStickerPack { id: id.clone() });
+                window.push_notification(Notification::new().message("Sticker pack unhidden"), cx);
+            })
+        })
+        // An action keeps a toast up; Desktop's goes after a while.
+        .autohide(true);
+    window.push_notification(toast, cx);
+}
+
 /// One pack's row (`StickerManagerPackRow`): opens the pack; Install, or
-/// Installed; Add or Remove on right-click; in My Stickers, moves.
+/// Installed; Add or Remove on right-click, and Hide where `hide` (a
+/// received pack, with `stickerPackHiding` on); in My Stickers, moves.
 fn pack_row(
     id: SharedString,
     pack: &StickerPackSummary,
     install_button: bool,
     moves: Option<Moves>,
+    hide: bool,
     state: &Entity<AppState>,
     palette: Palette,
 ) -> AnyElement {
@@ -125,13 +166,18 @@ fn pack_row(
                 }
             }
             let (state, pack) = (menu_state.clone(), menu_pack.clone());
-            if pack.installed {
+            let menu = if pack.installed {
                 menu.item(PopupMenuItem::new("Remove").on_click(move |_, window, cx| uninstall(state.clone(), pack.clone(), window, cx)))
             } else {
                 menu.item(PopupMenuItem::new("Add").on_click(move |_, _, cx| {
                     state.read(cx).send(Command::InstallStickerPack { id: pack.id.clone(), key: pack.key.clone() })
                 }))
+            };
+            if !hide {
+                return menu;
             }
+            let (state, pack) = (menu_state.clone(), menu_pack.clone());
+            menu.item(PopupMenuItem::new("Hide").on_click(move |_, window, cx| confirm_hide(state.clone(), pack.clone(), window, cx)))
         })
         .into_any_element()
 }
@@ -144,6 +190,7 @@ pub fn open(state: Entity<AppState>, window: &mut Window, cx: &mut App) {
         let palette = Palette::get(cx);
         let current = *tab.read(cx);
         let view = state.read(cx).sticker_manager.clone().unwrap_or_default();
+        let hiding = state.read(cx).remote_config().sticker_pack_hiding();
         let tab_button = |id: &'static str, label: &'static str, which: Tab| {
             let tab = tab.clone();
             Button::new(id).label(label).small().map(|b| if current == which { b.primary() } else { b.ghost() }).on_click(move |_, window, cx| {
@@ -158,13 +205,13 @@ pub fn open(state: Entity<AppState>, window: &mut Window, cx: &mut App) {
                     .blessed
                     .iter()
                     .enumerate()
-                    .map(|(ix, p)| pack_row(format!("sticker-blessed-{ix}").into(), p, true, None, &state, palette))
+                    .map(|(ix, p)| pack_row(format!("sticker-blessed-{ix}").into(), p, true, None, false, &state, palette))
                     .collect();
                 let received: Vec<AnyElement> = view
                     .received
                     .iter()
                     .enumerate()
-                    .map(|(ix, p)| pack_row(format!("sticker-received-{ix}").into(), p, true, None, &state, palette))
+                    .map(|(ix, p)| pack_row(format!("sticker-received-{ix}").into(), p, true, None, hiding, &state, palette))
                     .collect();
                 div()
                     .flex()
@@ -217,7 +264,7 @@ pub fn open(state: Entity<AppState>, window: &mut Window, cx: &mut App) {
                     .children(view.installed.iter().enumerate().map(|(ix, p)| {
                         let up = (ix > 0).then(|| moved(ix, ix - 1));
                         let down = (ix + 1 < ids.len()).then(|| moved(ix, ix + 1));
-                        pack_row(format!("sticker-installed-{ix}").into(), p, false, Some((up, down)), &state, palette)
+                        pack_row(format!("sticker-installed-{ix}").into(), p, false, Some((up, down)), false, &state, palette)
                     }))
                     .into_any_element()
             }
@@ -436,7 +483,7 @@ pub fn open_preview(state: Entity<AppState>, window: &mut Window, cx: &mut App) 
 
 #[cfg(test)]
 mod tests {
-    use gpui_kit::TestAppContext;
+    use gpui_kit::{TestAppContext, VisualTestContext};
 
     use super::*;
     use crate::views::test_support::{click_at, demo, press, shows, wait};
@@ -467,6 +514,45 @@ mod tests {
         wait(&mut cx, "the preview", &mut |cx| shows(cx, "sticker-preview"));
         let Some(StickerPreview::Ready(preview)) = cx.read(|cx| state.read(cx).sticker_preview.clone()) else { panic!() };
         assert_eq!((preview.stickers.len(), preview.pack.installed), (4, true));
+    }
+
+    #[gpui_kit::test]
+    fn a_shared_pack_hides_once_confirmed_and_installing_unhides_it(cx: &mut TestAppContext) {
+        let (_backend, state, mut cx, _dir) = demo(cx);
+        cx.update(|window, cx| open(state.clone(), window, cx));
+        wait(&mut cx, "the manager's packs and config", &mut |cx| {
+            cx.read(|cx| state.read(cx).sticker_manager.is_some() && state.read(cx).remote_config().sticker_pack_hiding())
+        });
+        let received = |cx: &mut VisualTestContext| -> Vec<StickerPackSummary> {
+            cx.read(|cx| state.read(cx).sticker_manager.clone().unwrap().received)
+        };
+        let garden = received(&mut cx).into_iter().find(|p| p.title == "Garden dots").unwrap();
+        assert!(!garden.installed);
+        let lists = |cx: &mut VisualTestContext, id: &[u8]| received(cx).iter().any(|p| p.id == id);
+        let hide = |cx: &mut VisualTestContext, pack: &StickerPackSummary| {
+            let pack = pack.clone();
+            cx.update(|window, cx| confirm_hide(state.clone(), pack, window, cx));
+            press(cx, "ok");
+        };
+
+        // Hidden from "Shared With You" once confirmed; Undo brings it back.
+        hide(&mut cx, &garden);
+        wait(&mut cx, "the hide", &mut |cx| !lists(cx, &garden.id));
+        state.read_with(&cx, |s, _| s.send(Command::UnhideStickerPack { id: garden.id.clone() }));
+        wait(&mut cx, "the undo", &mut |cx| lists(cx, &garden.id));
+
+        // Hidden again, then installed (as from a link): unhidden.
+        hide(&mut cx, &garden);
+        wait(&mut cx, "the second hide", &mut |cx| !lists(cx, &garden.id));
+        state.read_with(&cx, |s, _| s.send(Command::InstallStickerPack { id: garden.id.clone(), key: garden.key.clone() }));
+        wait(&mut cx, "the install", &mut |cx| received(cx).iter().any(|p| p.id == garden.id && p.installed));
+
+        // Hiding an installed pack uninstalls it too, as Desktop's does.
+        let installed = received(&mut cx).into_iter().find(|p| p.id == garden.id).unwrap();
+        hide(&mut cx, &installed);
+        wait(&mut cx, "the hide and uninstall", &mut |cx| {
+            !lists(cx, &garden.id) && cx.read(|cx| !state.read(cx).sticker_packs.iter().any(|p| p.id == garden.id))
+        });
     }
 
     #[gpui_kit::test]

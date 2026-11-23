@@ -135,6 +135,15 @@ impl RemoteConfig {
         self.feature("stickerFavorites")
     }
 
+    /// Hiding a received pack from the sticker manager
+    /// (`stickerPackHiding`, Desktop's `isHidingStickerPacksEnabled`,
+    /// `ts/util/stickers.preload.ts`, commit 8049395). Only the action
+    /// follows it: hidden packs' records are merged and written whatever
+    /// the flag, as Desktop's storage sync does.
+    pub fn sticker_pack_hiding(&self) -> bool {
+        self.feature("stickerPackHiding")
+    }
+
     /// Setting our own member label in a group (`groupMemberLabels.edit`).
     pub fn group_member_labels_edit(&self) -> bool {
         self.feature("groupMemberLabels.edit")
@@ -437,6 +446,8 @@ mod tests {
         assert!(RemoteConfig::from_pairs([("desktop.internalUser", "true")]).group_terminate_send());
         assert!(RemoteConfig::from_pairs([("desktop.shareContact.prod", "8.30.0")]).share_contact());
         assert!(!RemoteConfig::from_pairs([("desktop.shareContact.beta", "8.30.0")]).share_contact());
+        assert!(RemoteConfig::from_pairs([("desktop.stickerPackHiding.prod", "8.30.0")]).sticker_pack_hiding());
+        assert!(!RemoteConfig::from_pairs([("desktop.stickerPackHiding.beta", "8.30.0")]).sticker_pack_hiding());
     }
 
     #[test]
