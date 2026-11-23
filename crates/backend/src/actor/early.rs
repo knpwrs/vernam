@@ -197,12 +197,16 @@ impl Actor {
                 return Outcome::Failed;
             }
         };
+        let reaction = Reaction { emoji: emoji.clone(), author: author.clone(), sent_at: *sent_at };
         let result = if *remove {
             self.db.remove_reaction(target, author.as_deref()).await
+        } else if ours && author.is_some() {
+            // Unread until the chat is, here or on another device, which
+            // takes down its notification (Desktop's `addReaction` with
+            // `ReactionReadStatus.Unread`).
+            self.db.set_unread_reaction(target, reaction).await
         } else {
-            self.db
-                .set_reaction(target, Reaction { emoji: emoji.clone(), author: author.clone(), sent_at: *sent_at })
-                .await
+            self.db.set_reaction(target, reaction).await
         };
         match result {
             Ok(()) => {

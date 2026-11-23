@@ -815,6 +815,23 @@ impl AppState {
         .detach();
     }
 
+    /// Takes down the notifications shown for reactions to one message,
+    /// read on another device while its chat may still be unread.
+    fn drop_reaction_notifications(&mut self, conversation: &ConversationId, message_id: i64) {
+        let prefix = format!("{}:{message_id}:react-", conversation.0);
+        let Some(ids) = self.reaction_notifications.get_mut(conversation) else { return };
+        let read: Vec<String> = ids.iter().filter(|(id, _)| id.starts_with(&prefix)).map(|(id, _)| id.clone()).collect();
+        ids.retain(|(id, _)| !id.starts_with(&prefix));
+        if ids.is_empty() {
+            self.reaction_notifications.remove(conversation);
+        }
+        if let Some(notifier) = &self.notifier
+            && !read.is_empty()
+        {
+            notifier.remove(&read);
+        }
+    }
+
     /// Desktop's reaction notifications (`maybeNotify`, kind `reaction`):
     /// someone else reacted to one of our messages ("Alice reacted 👍 to:
     /// …"), with "Reaction notifications" on, under the same rules as a
@@ -1031,7 +1048,7 @@ impl AppState {
         let all = || self.conversations.iter().chain(&self.archived);
         let first = self.unread_chats.is_none();
         let ReadChats { unread, read, tracked } = chats_read_since(
-            all().map(|c| (&c.id, c.unread_count > 0 || c.unread_poll_votes)),
+            all().map(|c| (&c.id, c.unread_count > 0 || c.unread_poll_votes || c.unread_reactions)),
             self.unread_chats.as_ref(),
             &self.shown_notifications,
         );
@@ -1046,8 +1063,8 @@ impl AppState {
         }
         // A ringing call's notification stays until the call is answered or
         // over (none rings at launch). The first time, a reaction's stays
-        // too: it doesn't make its chat unread, so a read chat may have one
-        // not yet seen.
+        // too: one that came before reactions were kept unread doesn't make
+        // its chat unread, so a read chat may have one not yet seen.
         notifier.remove_in_chats(&read, loaded_at, move |id| if first { id.contains(":react-") } else { id == INCOMING_CALL_NOTIFICATION });
         self.unread_chats = Some(unread);
         // As Desktop: unread messages in unmuted chats, and one per chat marked unread.
@@ -1362,6 +1379,7 @@ impl AppState {
             Event::Reacted { conversation, message_id, author, sender, emoji } => {
                 self.notify_reaction(conversation, message_id, author, sender, emoji, cx)
             }
+            Event::ReactionsRead { conversation, message_id } => self.drop_reaction_notifications(&conversation, message_id),
             Event::PollActivity { conversation, message_id, sender, ended } => {
                 self.notify_poll(conversation, message_id, sender, ended, cx)
             }

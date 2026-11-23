@@ -641,6 +641,7 @@ impl ReviewPerson {
             avatar_withheld: false,
             last_outgoing_status: None,
             unread_poll_votes: false,
+            unread_reactions: false,
             accepted: true,
             message_request: Default::default(),
             reported: false,

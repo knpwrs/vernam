@@ -1903,9 +1903,19 @@ impl Actor {
                 let mut changed = false;
                 let me = self.self_aci();
                 for entry in entries {
-                    // One naming our own poll: its votes were read there
-                    // (Desktop's `maybeItIsAPollVoteReadSync`).
+                    // One naming our own message: its reactions, or our
+                    // poll's votes, were read there (Desktop's
+                    // `maybeItIsAReactionReadSync` and
+                    // `maybeItIsAPollVoteReadSync`).
                     if entry.0 == me {
+                        match self.db.mark_reactions_read(entry.1).await {
+                            Ok(Some((conversation, message_id))) => {
+                                changed = true;
+                                self.emit(Event::ReactionsRead { conversation, message_id });
+                            }
+                            Ok(None) => {}
+                            Err(error) => self.error("failed to apply read sync", error),
+                        }
                         match self.db.mark_poll_votes_read(entry.1).await {
                             Ok(Some(_)) => changed = true,
                             Ok(None) => {}
@@ -4849,6 +4859,16 @@ impl Actor {
                 Vec::new()
             }
         };
+        // So are reactions to our messages; our other devices hear of them
+        // by a read sync naming the message reacted to, which takes down
+        // their notification there (Desktop's `markConversationRead`).
+        let reactions = match self.db.take_unread_reactions(&conversation).await {
+            Ok(messages) => messages,
+            Err(error) => {
+                self.error("failed to mark reactions read", error);
+                Vec::new()
+            }
+        };
         // Release notes are only here: no receipts to the Signal chat's
         // made-up account, and nothing for our other devices to sync.
         unread.retain(|(author, _)| author != signal_store::SIGNAL_ACI);
@@ -4857,7 +4877,7 @@ impl Actor {
         self.emit(Event::ConversationsChanged);
         // Its calls are read too (Desktop's `markConversationRead`).
         self.mark_calls_read(Some(conversation.clone())).await;
-        if unread.is_empty() && poll_votes.is_empty() {
+        if unread.is_empty() && poll_votes.is_empty() && reactions.is_empty() {
             return;
         }
 
@@ -4888,9 +4908,13 @@ impl Actor {
 
         let config = crate::remote_config::current();
         let me = self.self_aci();
+        // One per message: a poll of ours can have votes and reactions.
+        let mut ours: Vec<i64> = poll_votes.into_iter().chain(reactions).collect();
+        ours.sort_unstable();
+        ours.dedup();
         let read = unread
             .into_iter()
-            .chain(poll_votes.into_iter().map(|sent_at| (me.clone(), sent_at)))
+            .chain(ours.into_iter().map(|sent_at| (me.clone(), sent_at)))
             .map(|(author, sent_at)| {
                 let sender = config.wire_service_id(&author);
                 sync_message::Read {

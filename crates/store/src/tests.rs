@@ -1268,6 +1268,8 @@ async fn drop_later_migrations(db: &AppDb) {
     sqlx::query("DROP TABLE scheduled_messages").execute(&db.writer).await.unwrap();
     sqlx::query("DROP INDEX messages_kept_deleted").execute(&db.writer).await.unwrap();
     sqlx::query("ALTER TABLE messages DROP COLUMN kept_deleted").execute(&db.writer).await.unwrap();
+    sqlx::query("DROP INDEX messages_unread_reactions").execute(&db.writer).await.unwrap();
+    sqlx::query("ALTER TABLE messages DROP COLUMN unread_reactions").execute(&db.writer).await.unwrap();
 }
 
 /// Rewrites the migration history to look like a pre-squash database that
@@ -2460,6 +2462,71 @@ async fn votes_in_our_poll_are_unread_until_the_chat_is() {
 }
 
 #[tokio::test]
+async fn reactions_to_our_messages_are_unread_until_the_chat_is() {
+    let db = test_db().await;
+    let ours = db.insert_message(&outgoing("g:aa", 10, "Lunch?")).await.unwrap();
+    let theirs = db.insert_message(&incoming("g:aa", "bob", 20, "Sure")).await.unwrap();
+    let react = |author: Option<&str>, sent_at| Reaction { emoji: "👍".into(), author: author.map(Into::into), sent_at };
+    let chat = |db: &AppDb| {
+        let db = db.clone();
+        async move { db.conversation(&conv("g:aa")).await.unwrap().unwrap() }
+    };
+    db.mark_read(&conv("g:aa")).await.unwrap();
+    // Ours, from any device, isn't unread; someone else's is, without
+    // counting as an unread message.
+    db.set_reaction(theirs, react(None, 25)).await.unwrap();
+    assert!(!chat(&db).await.unread_reactions);
+    db.set_unread_reaction(ours, react(Some("bob"), 30)).await.unwrap();
+    let c = chat(&db).await;
+    assert!(c.unread_reactions);
+    assert_eq!(c.unread_count, 0);
+    // A later change doesn't read it.
+    db.set_reaction(ours, react(None, 35)).await.unwrap();
+    assert!(chat(&db).await.unread_reactions);
+    // Reading the chat takes it, naming our message for a read sync.
+    assert_eq!(db.take_unread_reactions(&conv("g:aa")).await.unwrap(), vec![10]);
+    assert!(db.take_unread_reactions(&conv("g:aa")).await.unwrap().is_empty());
+    assert!(!chat(&db).await.unread_reactions);
+    // Edited, it's named by its latest edit.
+    db.edit_message(ours, "Lunch at noon?", 40).await.unwrap();
+    db.set_unread_reaction(ours, react(Some("bob"), 45)).await.unwrap();
+    assert_eq!(db.take_unread_reactions(&conv("g:aa")).await.unwrap(), vec![40]);
+    // Or a read sync from another device naming it, by any of its times.
+    for named in [10, 40] {
+        db.set_unread_reaction(ours, react(Some("bob"), 50)).await.unwrap();
+        assert_eq!(db.mark_reactions_read(named).await.unwrap(), Some((conv("g:aa"), ours)));
+        assert_eq!(db.mark_reactions_read(named).await.unwrap(), None);
+    }
+    // Only ours: Bob's message sent at 20 has nothing to read.
+    assert_eq!(db.mark_reactions_read(20).await.unwrap(), None);
+    // Taken back, nothing's left to read; another's left still is.
+    db.set_unread_reaction(ours, react(Some("bob"), 51)).await.unwrap();
+    db.remove_reaction(ours, Some("bob")).await.unwrap();
+    assert!(!chat(&db).await.unread_reactions);
+    db.set_unread_reaction(ours, react(Some("bob"), 52)).await.unwrap();
+    db.set_unread_reaction(ours, react(Some("cat"), 53)).await.unwrap();
+    db.remove_reaction(ours, Some("bob")).await.unwrap();
+    assert!(chat(&db).await.unread_reactions);
+    // A read sync for their newer message reads it, as Desktop reads the
+    // chat up to there; one for an older message doesn't.
+    db.insert_message(&incoming("g:aa", "bob", 55, "Noon works")).await.unwrap();
+    db.insert_message(&incoming("g:aa", "bob", 5, "Hi")).await.unwrap();
+    assert_eq!(db.apply_read_sync("bob", 5).await.unwrap(), ReadSync::Read(conv("g:aa")));
+    assert!(chat(&db).await.unread_reactions);
+    assert_eq!(db.apply_read_sync("bob", 55).await.unwrap(), ReadSync::Read(conv("g:aa")));
+    assert!(!chat(&db).await.unread_reactions);
+    // Even with its messages read already.
+    db.set_unread_reaction(ours, react(Some("bob"), 56)).await.unwrap();
+    assert_eq!(db.apply_read_sync("bob", 55).await.unwrap(), ReadSync::Read(conv("g:aa")));
+    assert!(!chat(&db).await.unread_reactions);
+    assert_eq!(db.apply_read_sync("bob", 55).await.unwrap(), ReadSync::AlreadyRead);
+    // Deleted: nothing left to read.
+    db.set_unread_reaction(ours, react(Some("bob"), 60)).await.unwrap();
+    db.mark_deleted(ours).await.unwrap();
+    assert!(!chat(&db).await.unread_reactions);
+}
+
+#[tokio::test]
 async fn a_polls_end_is_the_preview_and_someone_elses_is_unread() {
     let db = test_db().await;
     db.upsert_conversation(&conv("d:bob"), ConversationUpdate { title: Some("Bob Builder".into()), ..Default::default() })
@@ -2516,6 +2583,15 @@ async fn pending_votes_and_unread_votes_are_found_by_index() {
     };
     let list = plan(format!("SELECT {CONVERSATION_COLUMNS} FROM conversations")).await;
     assert!(list.contains("messages_unread_poll_votes"), "{list}");
+    assert!(list.contains("messages_unread_reactions"), "{list}");
+    let reactions = plan(
+        "UPDATE messages SET unread_reactions = 0 WHERE unread_reactions = 1 AND author_key = '' AND id IN ( \
+            SELECT id FROM messages WHERE author_key = '' AND sent_at = 1 \
+            UNION SELECT message_id FROM message_edits WHERE sent_at = 1)"
+            .into(),
+    )
+    .await;
+    assert!(!reactions.contains("SCAN messages"), "{reactions}");
     let sync =
         plan("UPDATE messages SET unread_poll_votes = 0 WHERE author_key = '' AND sent_at = 1 AND unread_poll_votes = 1".into()).await;
     assert!(sync.contains("sent_at=?"), "{sync}");

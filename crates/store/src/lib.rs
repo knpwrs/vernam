@@ -143,6 +143,10 @@ pub struct Conversation {
     /// (Desktop's `hasUnreadPollVotes`). It isn't in `unread_count`, as
     /// Desktop's isn't, but reading the chat clears it.
     pub unread_poll_votes: bool,
+    /// Someone reacted to one of our messages here since we last read it
+    /// (Desktop's unread `reactions` rows). Not in `unread_count` either,
+    /// but reading the chat clears it.
+    pub unread_reactions: bool,
     /// Desktop's `isConversationAccepted`: not a message request. Note to
     /// Self and the Signal chat are; others when we accepted (here, on
     /// another device, or Storage Service's `whitelisted`), share our
@@ -1181,6 +1185,8 @@ const CONVERSATION_COLUMNS: &str = "id, kind, title, phone, color, members, last
       AS last_outgoing_status, \
      EXISTS (SELECT 1 FROM messages m \
       WHERE m.conversation_id = conversations.id AND m.unread_poll_votes = 1) AS unread_poll_votes, \
+     EXISTS (SELECT 1 FROM messages m \
+      WHERE m.conversation_id = conversations.id AND m.unread_reactions = 1) AS unread_reactions, \
      message_request, reported, added_by, \
      EXISTS (SELECT 1 FROM system_contacts s WHERE s.service_id = substr(conversations.id, 3)) AS system_contact, \
      (kind = 'note_to_self' OR id = 'd:11111111-1111-4111-8111-111111111111' OR message_request = 1 \
@@ -1408,6 +1414,7 @@ fn conversation_from_row(row: &SqliteRow) -> Result<Conversation> {
         avatar_withheld: row.try_get("avatar_withheld")?,
         last_outgoing_status: row.try_get::<Option<i64>, _>("last_outgoing_status")?.map(status_from_i64),
         unread_poll_votes: row.try_get("unread_poll_votes")?,
+        unread_reactions: row.try_get("unread_reactions")?,
         accepted: row.try_get("accepted")?,
         message_request: MessageRequestResponse::from_wire(row.try_get("message_request")?),
         reported: row.try_get("reported")?,
@@ -2152,7 +2159,19 @@ impl AppDb {
         .execute(&mut *tx)
         .await?
         .rows_affected();
-        if read == 0 {
+        // Reading up to there reads reactions to our messages and votes in
+        // our polls up to there too: Desktop's `onReadMessage` runs
+        // `markConversationRead` without receipts.
+        let mut ours = 0;
+        for sql in [
+            "UPDATE messages INDEXED BY messages_unread_reactions SET unread_reactions = 0 \
+             WHERE conversation_id = ?1 AND unread_reactions = 1 AND author_key = '' AND sent_at <= ?2",
+            "UPDATE messages INDEXED BY messages_unread_poll_votes SET unread_poll_votes = 0 \
+             WHERE conversation_id = ?1 AND unread_poll_votes = 1 AND author_key = '' AND sent_at <= ?2",
+        ] {
+            ours += sqlx::query(sql).bind(&conversation).bind(target_sent_at).execute(&mut *tx).await?.rows_affected();
+        }
+        if read == 0 && ours == 0 {
             return Ok(ReadSync::AlreadyRead);
         }
         sqlx::query(
@@ -2196,6 +2215,42 @@ impl AppDb {
         .fetch_optional(&self.writer)
         .await?;
         Ok(conversation.map(ConversationId))
+    }
+
+    /// Our messages in this chat with reactions not yet read (Desktop's
+    /// `getUnreadReactionsAndMarkRead`): marks them read and returns the
+    /// timestamp each is known by now (its latest edit's), for read syncs
+    /// to our other devices.
+    pub async fn take_unread_reactions(&self, id: &ConversationId) -> Result<Vec<i64>> {
+        let mut tx = self.write().await?;
+        let mut read: Vec<i64> = sqlx::query_scalar(
+            "UPDATE messages INDEXED BY messages_unread_reactions SET unread_reactions = 0 \
+             WHERE conversation_id = ? AND unread_reactions = 1 AND author_key = '' \
+             RETURNING COALESCE((SELECT MAX(e.sent_at) FROM message_edits e WHERE e.message_id = messages.id), sent_at)",
+        )
+        .bind(&id.0)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        read.sort_unstable();
+        Ok(read)
+    }
+
+    /// A read sync from another device naming our message sent (or edited)
+    /// at `sent_at`: its reactions are read (Desktop's `markReactionAsRead`).
+    /// Returns its chat and id when it had unread reactions.
+    pub async fn mark_reactions_read(&self, sent_at: i64) -> Result<Option<(ConversationId, i64)>> {
+        let read: Option<(String, i64)> = sqlx::query_as(
+            "UPDATE messages SET unread_reactions = 0 \
+             WHERE unread_reactions = 1 AND author_key = '' AND id IN ( \
+                SELECT id FROM messages WHERE author_key = '' AND sent_at = ?1 \
+                UNION SELECT message_id FROM message_edits WHERE sent_at = ?1) \
+             RETURNING conversation_id, id",
+        )
+        .bind(sent_at)
+        .fetch_optional(&self.writer)
+        .await?;
+        Ok(read.map(|(conversation, id)| (ConversationId(conversation), id)))
     }
 
     /// Inserts a message, deduplicating on `(conversation_id, author, sent_at)`.
@@ -2533,7 +2588,18 @@ impl AppDb {
 
     /// Replaces any previous reaction by the same author on that message.
     pub async fn set_reaction(&self, message_id: i64, reaction: Reaction) -> Result<()> {
-        self.modify_reactions(message_id, |list| {
+        self.modify_reactions(message_id, false, |list| {
+            list.retain(|r| r.author != reaction.author);
+            list.push(reaction);
+        })
+        .await
+    }
+
+    /// As [`set_reaction`](Self::set_reaction), for someone else's reaction
+    /// to one of our messages: it's unread until the chat is read here or
+    /// on another device.
+    pub async fn set_unread_reaction(&self, message_id: i64, reaction: Reaction) -> Result<()> {
+        self.modify_reactions(message_id, true, |list| {
             list.retain(|r| r.author != reaction.author);
             list.push(reaction);
         })
@@ -2541,7 +2607,7 @@ impl AppDb {
     }
 
     pub async fn remove_reaction(&self, message_id: i64, author: Option<&str>) -> Result<()> {
-        self.modify_reactions(message_id, |list| {
+        self.modify_reactions(message_id, false, |list| {
             list.retain(|r| r.author.as_deref() != author);
         })
         .await
@@ -2550,6 +2616,7 @@ impl AppDb {
     async fn modify_reactions(
         &self,
         message_id: i64,
+        unread: bool,
         f: impl FnOnce(&mut Vec<Reaction>),
     ) -> Result<()> {
         let mut tx = self.write().await?;
@@ -2562,9 +2629,16 @@ impl AppDb {
         };
         let mut list: Vec<Reaction> = serde_json::from_str(&json)?;
         f(&mut list);
-        sqlx::query("UPDATE messages SET reactions = ? WHERE id = ?")
-            .bind(serde_json::to_string(&list)?)
-            .bind(message_id)
+        // Unread while someone else's reaction is left (Desktop deletes a
+        // reaction taken back, unread or not), and never on a deleted message.
+        let others = list.iter().any(|r| r.author.is_some());
+        sqlx::query(
+            "UPDATE messages SET reactions = ?, unread_reactions = (unread_reactions OR ?) AND ? AND deleted = 0 WHERE id = ?",
+        )
+        .bind(serde_json::to_string(&list)?)
+        .bind(unread)
+        .bind(others)
+        .bind(message_id)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -2575,7 +2649,7 @@ impl AppDb {
         self.update_and_refresh(
             message_id,
             "UPDATE messages SET deleted = 1, body = '', attachments = '[]', reactions = '[]', \
-             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL, long_text = NULL, poll = NULL, unread_poll_votes = 0, edit_history = NULL, content = NULL \
+             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL, long_text = NULL, poll = NULL, unread_poll_votes = 0, unread_reactions = 0, edit_history = NULL, content = NULL \
              WHERE id = ? RETURNING conversation_id",
             None,
         )
@@ -2595,11 +2669,11 @@ impl AppDb {
         let mut tx = self.write().await?;
         let keep = keeping_deleted(&mut tx).await?;
         let sql = if keep {
-            "UPDATE messages SET deleted = 1, kept_deleted = 1, unread_poll_votes = 0 \
+            "UPDATE messages SET deleted = 1, kept_deleted = 1, unread_poll_votes = 0, unread_reactions = 0 \
              WHERE id = ? AND deleted = 0 RETURNING conversation_id"
         } else {
             "UPDATE messages SET deleted = 1, body = '', attachments = '[]', reactions = '[]', \
-             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL, long_text = NULL, poll = NULL, unread_poll_votes = 0, edit_history = NULL, content = NULL \
+             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL, long_text = NULL, poll = NULL, unread_poll_votes = 0, unread_reactions = 0, edit_history = NULL, content = NULL \
              WHERE id = ? AND deleted = 0 RETURNING conversation_id"
         };
         let conversation: Option<String> = sqlx::query_scalar(sql).bind(message_id).fetch_optional(&mut *tx).await?;
@@ -2640,7 +2714,7 @@ impl AppDb {
         let mut tx = self.write().await?;
         let rows: Vec<(String, i64)> = sqlx::query_as(
             "UPDATE messages SET kept_deleted = 0, body = '', attachments = '[]', reactions = '[]', \
-             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL, long_text = NULL, poll = NULL, unread_poll_votes = 0, edit_history = NULL, content = NULL \
+             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL, long_text = NULL, poll = NULL, unread_poll_votes = 0, unread_reactions = 0, edit_history = NULL, content = NULL \
              WHERE kept_deleted = 1 RETURNING conversation_id, id",
         )
         .fetch_all(&mut *tx)
@@ -2664,11 +2738,11 @@ impl AppDb {
         // Read again in this write, as `keep_deleted` does.
         let keep = keep && keeping_deleted(&mut tx).await?;
         let sql = if keep {
-            "UPDATE messages SET deleted = 1, kept_deleted = 1, deleted_by_admin = ?2, unread_poll_votes = 0 \
+            "UPDATE messages SET deleted = 1, kept_deleted = 1, deleted_by_admin = ?2, unread_poll_votes = 0, unread_reactions = 0 \
              WHERE id = ?1 AND deleted = 0 RETURNING conversation_id"
         } else {
             "UPDATE messages SET deleted = 1, deleted_by_admin = ?2, body = '', attachments = '[]', reactions = '[]', \
-             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL, long_text = NULL, poll = NULL, unread_poll_votes = 0, edit_history = NULL, content = NULL \
+             quote = NULL, link_preview = NULL, mentions = NULL, styles = NULL, long_text = NULL, poll = NULL, unread_poll_votes = 0, unread_reactions = 0, edit_history = NULL, content = NULL \
              WHERE id = ?1 AND deleted = 0 RETURNING conversation_id"
         };
         let conversation: Option<String> = sqlx::query_scalar(sql)

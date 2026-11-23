@@ -1367,6 +1367,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
             Command::MarkRead { conversation } => {
                 let _ = db.mark_read(&conversation).await;
                 let _ = db.take_unread_poll_votes(&conversation).await;
+                let _ = db.take_unread_reactions(&conversation).await;
                 emit(Event::ConversationsChanged);
             }
             Command::ShareContact { conversation, share } => {

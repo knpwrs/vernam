@@ -314,7 +314,7 @@ impl ConversationView {
                 }
                 AppEvent::TypingChanged { conversation } if *conversation == this.id => this.remeasure_typing(cx),
                 AppEvent::ConversationsChanged => {
-                    this.read_open_poll_votes(cx);
+                    this.read_open_votes_and_reactions(cx);
                     cx.notify()
                 }
                 AppEvent::AuthorNamesChanged(names) => {
@@ -1082,18 +1082,23 @@ impl ConversationView {
 
     fn mark_read(&self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
-        if state.conversation(&self.id).is_some_and(|c| c.unread_count > 0 || c.unread_poll_votes) {
+        if state.conversation(&self.id).is_some_and(|c| c.unread_count > 0 || c.unread_poll_votes || c.unread_reactions) {
             state.send(Command::MarkRead {
                 conversation: self.id.clone(),
             });
         }
     }
 
-    /// Someone voted in our poll here while we're looking at the newest
-    /// messages: read at once, as Desktop's `markOpenConversationRead`.
-    fn read_open_poll_votes(&self, cx: &mut Context<Self>) {
+    /// Someone voted in our poll or reacted to our message here while we're
+    /// looking at the newest messages: read at once, as Desktop's
+    /// `markOpenConversationRead`.
+    fn read_open_votes_and_reactions(&self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
-        if self.window_active && state.shown && self.at_end() && state.conversation(&self.id).is_some_and(|c| c.unread_poll_votes) {
+        if self.window_active
+            && state.shown
+            && self.at_end()
+            && state.conversation(&self.id).is_some_and(|c| c.unread_poll_votes || c.unread_reactions)
+        {
             state.send(Command::MarkRead { conversation: self.id.clone() });
         }
     }
@@ -1201,7 +1206,7 @@ impl ConversationView {
         if !self.in_front(cx) {
             return;
         }
-        let unread = self.state.read(cx).conversation(&self.id).is_some_and(|c| c.unread_count > 0 || c.unread_poll_votes);
+        let unread = self.state.read(cx).conversation(&self.id).is_some_and(|c| c.unread_count > 0 || c.unread_poll_votes || c.unread_reactions);
         let replayed = std::mem::take(&mut self.read_once_shown);
         if unread || self.unseen > 0 || replayed {
             // Not gated on the cached count: a message that just arrived may
@@ -8388,6 +8393,40 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(read, "opening the chat didn't read the vote");
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn reactions_to_our_message_are_unread_until_the_chat_is_read(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        wait_for_messages(&backend, GROUP, 1, |m| m.body.contains("first aid kit"));
+        let ours = wait_for_messages(&backend, GROUP, 1, |m| m.direction == signal_store::Direction::Outgoing && !m.deleted)[0].id;
+        let chat = |backend: &Backend| {
+            let db = backend.db().clone();
+            futures::executor::block_on(backend.spawn(async move { db.conversation(&ConversationId(GROUP.into())).await }))
+                .unwrap()
+                .unwrap()
+        };
+        let db = backend.db().clone();
+        let reaction = signal_store::Reaction { emoji: "👍".into(), author: Some("someone".into()), sent_at: 1 };
+        futures::executor::block_on(backend.spawn(async move { db.set_unread_reaction(ours, reaction).await })).unwrap();
+        assert!(chat(&backend).unread_reactions);
+        // Opening the chat reads it.
+        let (mut cx, view) = open_view(cx, &backend, GROUP);
+        cx.update(|_, cx| view.update(cx, |v, _| v.window_active = true));
+        let state = view.read_with(&cx, |v, _| v.state.clone());
+        cx.update(|_, cx| state.update(cx, |s, cx| s.handle(signal_backend::Event::ConversationsChanged, cx)));
+        let mut read = false;
+        for _ in 0..300 {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            if !chat(&backend).unread_reactions {
+                read = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(read, "opening the chat didn't read the reaction");
         backend.shutdown();
     }
 

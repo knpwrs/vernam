@@ -1227,6 +1227,9 @@ pub enum Event {
     /// reaction back (`None`), for Desktop's reaction notifications.
     /// `sender` is their name.
     Reacted { conversation: ConversationId, message_id: i64, author: String, sender: String, emoji: Option<String> },
+    /// Another device read the reactions to our message: their
+    /// notifications go (Desktop's `maybeItIsAReactionReadSync`).
+    ReactionsRead { conversation: ConversationId, message_id: i64 },
     /// Someone voted in our poll (`ended`: they ended theirs), for
     /// Desktop's notifications. `message_id` is the poll; `sender` their name.
     PollActivity { conversation: ConversationId, message_id: i64, sender: String, ended: bool },
