@@ -314,6 +314,47 @@ fn who(recipient: &proto::Recipient) -> Who {
     }
 }
 
+/// Whether a private reply's quote belongs where it is, by the rule live
+/// messages follow (`mapping::private_reply_allowed`, Desktop's
+/// `handleDataMessage`): only in a 1:1 chat, quoting us when it's theirs
+/// and them when it's ours (`quoted`: the quote's author, as the backup's
+/// recipients have it; anyone else, or no one known, doesn't fit).
+/// Otherwise it imports as an ordinary quote.
+fn private_reply_fits(conversation: &ConversationId, direction: Direction, quoted: Option<&Who>) -> bool {
+    let Some(with) = conversation.as_direct() else { return false };
+    match (direction, quoted) {
+        (Direction::Incoming, Some(Who::Me)) => true,
+        (Direction::Outgoing, Some(Who::Contact { sid, .. })) => sid == with,
+        _ => false,
+    }
+}
+
+/// A quote's private reply group, from its `privateReplyDescriptor` (Desktop's
+/// backup import, commit 98032f98): `privateReplyGroupRecipientId` (7)
+/// names the group, `unknownPrivateReply` (6) says there was one we don't
+/// know. libsignal v0.106.1's `Backup.proto` predates both, so they're read
+/// from the quote's unknown fields. A recipient that isn't a group leaves
+/// an ordinary quote, as in Desktop.
+fn private_reply(quote: &proto::Quote, people: &HashMap<u64, Who>) -> Option<signal_store::PrivateReply> {
+    use protobuf::UnknownValueRef;
+    let unknown = quote.special_fields.unknown_fields();
+    if let Some(UnknownValueRef::Varint(recipient)) = unknown.get(7) {
+        if let Some(Who::Group { key, .. }) = people.get(&recipient)
+            && let Ok(master_key) = <[u8; 32]>::try_from(key.as_slice())
+        {
+            return Some(signal_store::PrivateReply {
+                group_id: Some(hex::encode(crate::groups::group_identifier(master_key))),
+                group: Some(ConversationId::group(key)),
+            });
+        }
+        return None;
+    }
+    match unknown.get(6) {
+        Some(UnknownValueRef::Varint(1)) => Some(signal_store::PrivateReply::default()),
+        _ => None,
+    }
+}
+
 /// A contact's or group's profile sharing (`Contact.profileSharing`,
 /// `Group.whitelisted`) and a group's story send mode, as Desktop's backup
 /// import reads them (`ts/services/backups/import`).
@@ -950,6 +991,7 @@ async fn import_item(
             });
             let quote = standard.quote.as_ref().and_then(|q| {
                 let (author, name) = person(q.authorId);
+                let private_reply = private_reply(q, people).filter(|_| private_reply_fits(&conversation, direction, people.get(&q.authorId)));
                 Some(Quote {
                     author_name: name.unwrap_or_else(|| "You".into()),
                     author,
@@ -974,7 +1016,7 @@ async fn import_item(
                         })
                     },
                     story: false,
-                    private_reply: None,
+                    private_reply,
                 })
             });
             let message = NewMessage {
@@ -1645,6 +1687,9 @@ mod tests {
         quote.targetSentTimestamp = Some(900);
         quote.authorId = 2;
         quote.text = Some(text("where are you?")).into();
+        // A private reply to her message in the group (recipient 3), in
+        // `privateReplyGroupRecipientId` (7), which the crate's proto lacks.
+        quote.special_fields.mut_unknown_fields().add_varint(7, 3);
         standard.quote = Some(quote).into();
         let mut reaction = proto::Reaction::new();
         reaction.emoji = "👍".into();
@@ -1800,6 +1845,9 @@ mod tests {
         let reply = &with_alice[0];
         assert_eq!((reply.direction, reply.status, reply.body.as_str()), (Direction::Outgoing, DeliveryStatus::Read, "on my way"));
         assert_eq!(reply.quote.as_ref().map(|q| (q.sent_at, q.author_name.as_str())), Some((900, "Alice Liddell")));
+        let private = reply.quote.as_ref().and_then(|q| q.private_reply.clone()).expect("a private reply");
+        assert_eq!(private.group, Some(group.id.clone()));
+        assert_eq!(private.group_id, Some(hex::encode(crate::groups::group_identifier([9; 32]))));
         assert_eq!(reply.reactions[0].emoji, "👍");
         // The photo keeps where to download it, and downloads now.
         let photo = &reply.attachments[0];
@@ -1831,6 +1879,49 @@ mod tests {
         assert_eq!(signal.title, "Signal");
         let notes = db.messages(&signal.id, None, 10).await.unwrap();
         assert_eq!((notes[0].body.as_str(), notes[0].author.as_deref()), ("Something new", Some(signal_store::SIGNAL_ACI)));
+    }
+
+    /// Live messages' rule (`mapping::private_reply_allowed`), for imports.
+    #[test]
+    fn imported_private_replies_stay_only_where_live_ones_would() {
+        let alice = ConversationId::direct("alice");
+        let who = |sid: &str| Who::Contact { sid: sid.into(), name: String::new(), e164: None, blocked: false };
+        assert!(private_reply_fits(&alice, Direction::Incoming, Some(&Who::Me)), "theirs, quoting us");
+        assert!(private_reply_fits(&alice, Direction::Outgoing, Some(&who("alice"))), "ours, quoting them");
+        assert!(!private_reply_fits(&alice, Direction::Incoming, Some(&who("alice"))));
+        assert!(!private_reply_fits(&alice, Direction::Outgoing, Some(&Who::Me)));
+        assert!(!private_reply_fits(&alice, Direction::Outgoing, Some(&who("bob"))));
+        // An author the backup doesn't name, or who isn't a person.
+        assert!(!private_reply_fits(&alice, Direction::Incoming, None));
+        assert!(!private_reply_fits(&alice, Direction::Incoming, Some(&Who::Other)));
+        assert!(!private_reply_fits(&ConversationId::group(&[1; 32]), Direction::Incoming, Some(&Who::Me)), "in a group");
+    }
+
+    #[test]
+    fn private_reply_descriptors_read_as_desktops_import_reads_them() {
+        let mut people = HashMap::new();
+        people.insert(2, Who::Contact { sid: "alice".into(), name: "Alice".into(), e164: None, blocked: false });
+        people.insert(3, Who::Group { key: vec![9; 32], title: "Hikers".into(), members: Vec::new(), blocked: false, ended: false });
+        let quote = |field: u32, value: u64| {
+            let mut quote = proto::Quote::new();
+            quote.special_fields.mut_unknown_fields().add_varint(field, value);
+            // Through the wire, as a backup carries it.
+            proto::Quote::parse_from_bytes(&quote.write_to_bytes().unwrap()).unwrap()
+        };
+        assert_eq!(
+            private_reply(&quote(7, 3), &people),
+            Some(signal_store::PrivateReply {
+                group_id: Some(hex::encode(crate::groups::group_identifier([9; 32]))),
+                group: Some(ConversationId::group(&[9; 32])),
+            })
+        );
+        // `unknownPrivateReply`: a group we never learn, so it matches nothing.
+        assert_eq!(private_reply(&quote(6, 1), &people), Some(signal_store::PrivateReply::default()));
+        assert_eq!(private_reply(&quote(6, 0), &people), None);
+        // A recipient that isn't a known group: an ordinary quote.
+        assert_eq!(private_reply(&quote(7, 2), &people), None);
+        assert_eq!(private_reply(&quote(7, 99), &people), None);
+        assert_eq!(private_reply(&proto::Quote::new(), &people), None);
     }
 
     #[test]
