@@ -1914,10 +1914,15 @@ impl Composer {
     }
 
     fn render_reply(&self, message: &Message, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
-        let author: SharedString = match &message.author_name {
-            Some(name) if message.author.is_some() => name.clone().into(),
-            _ => "You".into(),
+        let mut author = match &message.author_name {
+            Some(name) if message.author.is_some() => name.clone(),
+            _ => "You".to_owned(),
         };
+        // A private reply names the group, as its quote will.
+        if message.conversation_id != self.conversation {
+            let group = self.state.read(cx).conversation(&message.conversation_id).map(|c| c.title.clone());
+            author = format!("{author} \u{b7} {}", group.unwrap_or_else(|| "Unknown group".into()));
+        }
         // As the quote will show: its text, else what it holds ("Voice
         // Message"), with a photo or Desktop's microphone beside it.
         let text = signal_store::hide_spoilers(&message.body, &message.styles);
@@ -3913,5 +3918,61 @@ mod tests {
             (c.input.read(cx).value().to_string(), c.view_once, c.images.len())
         });
         assert_eq!((text.as_str(), view_once, images), ("keep this", false, 0));
+    }
+
+    /// A reply in someone's 1:1 chat to their message in a group is a
+    /// private reply: its quote names the group (Desktop commit 98032f98).
+    /// Anyone else's group message isn't quoted from here.
+    #[gpui_kit::test]
+    fn a_reply_to_their_group_message_names_the_group(cx: &mut TestAppContext) {
+        let f = mount(cx);
+        let group = ConversationId("g:0000000000000000000000000000000000000000000000000000000000000001".into());
+        let db = f.backend.db().clone();
+        let in_group = group.clone();
+        let at = chrono::Utc::now().timestamp_millis() - 60_000;
+        let (theirs, someone_elses) = futures::executor::block_on(f.backend.spawn(async move {
+            let message = |author: &str, sent_at: i64, body: &str| signal_store::NewMessage {
+                conversation_id: in_group.clone(),
+                sent_at,
+                received_at: sent_at,
+                direction: signal_store::Direction::Incoming,
+                author: Some(author.into()),
+                author_name: Some(author.into()),
+                body: body.into(),
+                status: signal_store::DeliveryStatus::Delivered,
+                quote: None,
+                attachments: vec![],
+                link_preview: None,
+                expires_in: 0,
+            };
+            let theirs = db.insert_message(&message("test", at, "said in the group")).await?;
+            let other = db.insert_message(&message("someone-else", at + 1, "also in the group")).await?;
+            Ok::<_, signal_store::Error>((db.message(theirs).await?.unwrap(), db.message(other).await?.unwrap()))
+        }))
+        .unwrap();
+        let send = |cx: &mut TestAppContext, quoted: &signal_store::Message, body: &'static str| {
+            cx.update_window(f.window, |_, window, cx| {
+                f.composer.update(cx, |c, cx| {
+                    c.reply_to(quoted.clone(), window, cx);
+                    c.input.update(cx, |input, cx| input.set_value(body, window, cx));
+                    c.submit(window, cx);
+                });
+            })
+            .unwrap();
+            cx.run_until_parked();
+        };
+
+        send(cx, &theirs, "between us");
+        let messages = sent(&f, |m| m.body == "between us");
+        let quote = messages.iter().find(|m| m.body == "between us").and_then(|m| m.quote.clone()).expect("quoted");
+        assert_eq!((quote.sent_at, quote.text.as_str()), (theirs.sent_at, "said in the group"));
+        let reply = quote.private_reply.expect("a private reply");
+        assert_eq!(reply.group, Some(group));
+        assert_eq!(reply.group_id.map(|id| id.len()), Some(64), "the group's 32-byte identifier, hex");
+
+        send(cx, &someone_elses, "not about theirs");
+        let messages = sent(&f, |m| m.body == "not about theirs");
+        let sent_without = messages.iter().find(|m| m.body == "not about theirs").unwrap();
+        assert!(sent_without.quote.is_none(), "{:?}", sent_without.quote);
     }
 }

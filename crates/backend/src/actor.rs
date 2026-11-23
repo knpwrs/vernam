@@ -3953,6 +3953,7 @@ impl Actor {
                     text: Some(q.text.clone()),
                     attachments: mapping::quoted_attachments(q.attachment.as_ref()),
                     r#type: Some(data_message::quote::Type::Normal.into()),
+                    group_id: q.private_reply.as_ref().and_then(mapping::wire_group_id),
                     ..Default::default()
                 }
             }),
@@ -4024,6 +4025,7 @@ impl Actor {
                     text: Some(q.text.clone()),
                     attachments: mapping::quoted_attachments(q.attachment.as_ref()),
                     r#type: Some(data_message::quote::Type::Normal.into()),
+                    group_id: q.private_reply.as_ref().and_then(mapping::wire_group_id),
                     ..Default::default()
                 }
             }),
@@ -4540,6 +4542,17 @@ impl Actor {
             Some(id) => self.db.message(id).await.ok().flatten().map(crate::deletes::quotable),
             None => None,
         };
+        // A message in another chat is quoted only as a private reply.
+        let (quoted, private_reply) = match quoted {
+            Some(m) => match mapping::reply_group(&m, &conversation, crate::remote_config::current().private_reply_send()) {
+                Ok(group) => (Some(m), group),
+                Err(why) => {
+                    warn!(why, "sending without the quote");
+                    (None, None)
+                }
+            },
+            None => (None, None),
+        };
         let quote = quoted.as_ref().map(|m| Quote {
             author: m.author.clone(),
             author_name: match &m.author {
@@ -4552,7 +4565,7 @@ impl Actor {
             thumbnail: m.thumbnail(),
             attachment: quoted_attachment(m),
             story: false,
-            private_reply: None,
+            private_reply: private_reply.clone(),
         });
 
         let expire_timer = self
@@ -4607,6 +4620,7 @@ impl Actor {
                         if m.poll.is_some() { data_message::quote::Type::Poll } else { data_message::quote::Type::Normal }
                             .into(),
                     ),
+                    group_id: private_reply.as_ref().and_then(mapping::wire_group_id),
                     ..Default::default()
                 }
             }),

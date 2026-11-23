@@ -279,6 +279,9 @@ pub struct AppState {
     pub archived: Vec<Conversation>,
     /// A message to show when its chat's view opens (from search).
     jump: Option<(ConversationId, i64)>,
+    /// A group message to reply to privately once its author's chat opens
+    /// ([`AppState::reply_privately`]).
+    private_reply: Option<(ConversationId, signal_store::Message)>,
     /// Group chats' identifiers (hex), each worked out once: the key a
     /// private reply's quote finds its group by.
     group_identifiers: std::cell::RefCell<HashMap<ConversationId, String>>,
@@ -572,6 +575,7 @@ impl AppState {
             contact_avatars: HashMap::new(),
             contact_sync: ContactSync::Idle,
             jump: None,
+            private_reply: None,
             group_identifiers: Default::default(),
             selected: None,
             typing: HashMap::new(),
@@ -2757,6 +2761,53 @@ impl AppState {
         cx.notify();
     }
 
+    /// Whether a group message offers "Reply privately" (Desktop's
+    /// `canReplyPrivately`, commit 98032f98): with `privateReply.send` on,
+    /// someone else's message, not deleted, in a group we accepted and
+    /// didn't block, from someone we didn't block. (Desktop also leaves out
+    /// unregistered authors, which aren't tracked here.)
+    pub fn can_reply_privately(&self, message: &signal_store::Message) -> bool {
+        let Some(author) = message.author.as_deref() else { return false };
+        if !self.remote_config().private_reply_send()
+            || message.direction != signal_store::Direction::Incoming
+            || message.deleted
+            || message.notice.is_some()
+        {
+            return false;
+        }
+        let group = self.conversation(&message.conversation_id).filter(|c| c.id.is_group());
+        if !group.is_some_and(|g| g.accepted && !g.blocked) {
+            return false;
+        }
+        !self.conversation(&ConversationId::direct(author)).is_some_and(|c| c.blocked)
+    }
+
+    /// Desktop's "Reply privately": opens the 1:1 chat with a group
+    /// message's author, its composer replying to the message
+    /// (`replyPrivately`). The quote names the group when it's sent.
+    pub fn reply_privately(&mut self, message: signal_store::Message, cx: &mut Context<Self>) {
+        if !self.can_reply_privately(&message) {
+            return;
+        }
+        let Some(author) = message.author.clone() else { return };
+        let chat = ConversationId::direct(&author);
+        let entry = signal_store::DirectoryEntry {
+            id: chat.clone(),
+            kind: signal_store::ConversationKind::Direct,
+            title: message.author_name.clone().unwrap_or_else(|| signal_store::UNKNOWN_NAME.into()),
+            phone: None,
+        };
+        self.private_reply = Some((chat, message));
+        self.start_conversation(entry, cx);
+    }
+
+    /// The message a chat just opened is to reply to privately, if any
+    /// (taken once).
+    pub fn take_private_reply(&mut self, conversation: &ConversationId) -> Option<signal_store::Message> {
+        let (_, message) = self.private_reply.take_if(|(c, _)| c == conversation)?;
+        Some(message)
+    }
+
     /// Opens a chat with someone (or a group) from the directory or a
     /// lookup, creating the conversation if needed.
     pub fn start_conversation(&mut self, entry: signal_store::DirectoryEntry, cx: &mut Context<Self>) {
@@ -2781,7 +2832,12 @@ impl AppState {
                     this.reload_conversations(cx);
                     this.select(Some(id), cx);
                 }
-                Err(error) => this.report_error(format!("Couldn't start the chat: {error}"), cx),
+                Err(error) => {
+                    // A private reply waiting for this chat isn't left to
+                    // turn up when it's opened some other way later.
+                    this.private_reply.take_if(|(chat, _)| *chat == id);
+                    this.report_error(format!("Couldn't start the chat: {error}"), cx)
+                }
             });
         })
         .detach();

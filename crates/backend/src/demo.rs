@@ -956,6 +956,7 @@ const DEMO_REMOTE_CONFIG: &[(&str, &str)] = &[
     ("desktop.groupTerminate.send.prod", "8.30.0"),
     ("desktop.keyTransparency.prod", "8.30.0"),
     ("desktop.shareContact.prod", "8.30.0"),
+    ("desktop.privateReply.send.prod", "8.30.0"),
 ];
 
 pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::UnboundedReceiver<Command>, events: mpsc::UnboundedSender<Event>) {
@@ -1284,19 +1285,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
             }
             Command::SendText { conversation, body, quote, preview, mentions, styles } => {
                 let (body, spans, styles) = demo_mentions(&db, &body, &mentions, &styles).await;
-                let quote = match quote {
-                    Some(id) => db.message(id).await.ok().flatten().map(|m| Quote {
-                        author: m.author.clone(),
-                        author_name: m.author_name.clone().unwrap_or_default(),
-                        sent_at: m.sent_at,
-                        text: m.body.clone(),
-                        thumbnail: m.thumbnail(),
-                        attachment: m.attachments.first().map(signal_store::QuotedAttachment::of),
-                        story: false,
-                        private_reply: None,
-                    }),
-                    None => None,
-                };
+                let quote = demo_quote(&db, &conversation, quote).await;
                 let sent_at = next_sent_at();
                 let link_preview = preview.filter(|p| crate::link_preview::is_valid(&body, &p.url)).map(|draft| {
                     let image = draft.image.and_then(|image| {
@@ -1837,7 +1826,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 if std::fs::write(&path, &bytes).is_err() {
                     continue;
                 }
-                let quote = demo_quote(&db, quote).await;
+                let quote = demo_quote(&db, &conversation, quote).await;
                 let sent_at = next_sent_at();
                 let msg = NewMessage {
                     conversation_id: conversation.clone(),
@@ -1968,7 +1957,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 });
             }
             Command::SendSticker { conversation, pack, sticker, quote } => {
-                let quote = demo_quote(&db, quote).await;
+                let quote = demo_quote(&db, &conversation, quote).await;
                 let sent_at = next_sent_at();
                 let msg = NewMessage {
                     conversation_id: conversation.clone(),
@@ -2077,7 +2066,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     author_name: None,
                     body: String::new(),
                     status: DeliveryStatus::Sent,
-                    quote: demo_quote(&db, quote).await,
+                    quote: demo_quote(&db, &conversation, quote).await,
                     attachments,
                     link_preview: None,
                     expires_in: 0,
@@ -2108,7 +2097,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     author_name: None,
                     body,
                     status: DeliveryStatus::Sent,
-                    quote: demo_quote(&db, quote).await,
+                    quote: demo_quote(&db, &conversation, quote).await,
                     attachments: vec![AttachmentMeta {
                         content_type: if file.voice {
                             crate::VOICE_CONTENT_TYPE.into()
@@ -2812,8 +2801,10 @@ fn demo_voice_wav() -> Vec<u8> {
 }
 
 /// The quote for a reply to `quote`, as the real backend stores it.
-async fn demo_quote(db: &AppDb, quote: Option<i64>) -> Option<Quote> {
+async fn demo_quote(db: &AppDb, conversation: &ConversationId, quote: Option<i64>) -> Option<Quote> {
     let m = db.message(quote?).await.ok().flatten()?;
+    // Another chat's message only as a private reply.
+    let private_reply = crate::mapping::reply_group(&m, conversation, crate::remote_config().private_reply_send()).ok()?;
     Some(Quote {
         author: m.author.clone(),
         author_name: m.author_name.clone().unwrap_or_default(),
@@ -2822,7 +2813,7 @@ async fn demo_quote(db: &AppDb, quote: Option<i64>) -> Option<Quote> {
         thumbnail: m.thumbnail(),
         attachment: m.attachments.first().map(signal_store::QuotedAttachment::of),
         story: false,
-        private_reply: None,
+        private_reply,
     })
 }
 

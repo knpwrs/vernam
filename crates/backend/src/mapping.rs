@@ -819,6 +819,47 @@ fn private_reply_allowed(quote: &data_message::Quote, conversation: &Conversatio
     true
 }
 
+/// What a reply in `conversation` to `quoted` is: `Ok(None)` for a message
+/// in the same chat, `Ok(Some(_))` for a private reply to a message in a
+/// group, and `Err` when it may not quote it. A private reply goes only to
+/// the 1:1 chat with the message's author, for a message someone else sent
+/// that wasn't deleted, as Desktop's `canReplyPrivately` and `makeQuote`
+/// (`getQuotedGroupId`) allow, and only with `privateReply.send` on.
+pub fn reply_group(
+    quoted: &signal_store::Message,
+    conversation: &ConversationId,
+    private_reply_send: bool,
+) -> Result<Option<signal_store::PrivateReply>, &'static str> {
+    if quoted.conversation_id == *conversation {
+        return Ok(None);
+    }
+    if !private_reply_send {
+        return Err("private replies are off");
+    }
+    let key: [u8; 32] = quoted
+        .conversation_id
+        .as_group()
+        .and_then(|key| key.try_into().ok())
+        .ok_or("the quoted message is in another chat that isn't a group")?;
+    // One deleted since it was picked still goes, as an ordinary quote of a
+    // deleted message does, and as Desktop's quote made when it's picked.
+    if quoted.direction != Direction::Incoming || quoted.notice.is_some() {
+        return Err("only someone else's message can be replied to privately");
+    }
+    if quoted.author.is_none() || quoted.author.as_deref() != conversation.as_direct() {
+        return Err("a private reply goes to the quoted message's author");
+    }
+    Ok(Some(signal_store::PrivateReply {
+        group_id: Some(hex::encode(crate::groups::group_identifier(key))),
+        group: Some(quoted.conversation_id.clone()),
+    }))
+}
+
+/// A private reply's group as the quote's `groupId` names it.
+pub fn wire_group_id(reply: &signal_store::PrivateReply) -> Option<Vec<u8>> {
+    hex::decode(reply.group_id.as_deref()?).ok()
+}
+
 pub fn map_content(content: &Content, ctx: &MapContext) -> Vec<Action> {
     let sender = content.metadata.sender.service_id_string();
     let envelope_ts = content.metadata.client_timestamp.timestamp_millis();

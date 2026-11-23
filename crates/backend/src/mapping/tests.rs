@@ -1859,3 +1859,76 @@ fn a_private_reply_in_a_group_loses_its_quote() {
     let [Action::Insert { message, .. }] = actions.as_slice() else { panic!("{actions:?}") };
     assert_eq!((message.body.as_str(), message.quote.is_none()), ("just between us", true));
 }
+
+fn stored(conversation: ConversationId, author: Option<&str>) -> signal_store::Message {
+    signal_store::Message {
+        id: 1,
+        conversation_id: conversation,
+        sent_at: 42,
+        received_at: 42,
+        direction: if author.is_some() { Direction::Incoming } else { Direction::Outgoing },
+        author: author.map(Into::into),
+        author_name: None,
+        body: "in the group".into(),
+        status: DeliveryStatus::Delivered,
+        reactions: Vec::new(),
+        quote: None,
+        attachments: Vec::new(),
+        link_preview: None,
+        deleted: false,
+        kept_deleted: false,
+        edited: false,
+        expires_in: 0,
+        expire_start: None,
+        edit_count: 0,
+        notice: None,
+        mentions: Vec::new(),
+        styles: Vec::new(),
+        cta: None,
+        deleted_by_admin: None,
+        long_text: None,
+        poll: None,
+        view_once: None,
+        content: None,
+        sealed_sender: Vec::new(),
+        is_read: true,
+    }
+}
+
+#[test]
+fn a_reply_in_the_same_chat_is_no_private_reply() {
+    let group = ConversationId::group(&group_key());
+    assert_eq!(reply_group(&stored(group.clone(), Some(ALICE)), &group, false), Ok(None));
+    let alice = ConversationId::direct(ALICE);
+    assert_eq!(reply_group(&stored(alice.clone(), Some(ALICE)), &alice, true), Ok(None));
+}
+
+#[test]
+fn a_private_reply_names_the_group_by_its_identifier() {
+    let group = ConversationId::group(&group_key());
+    let theirs = stored(group.clone(), Some(ALICE));
+    let reply = reply_group(&theirs, &ConversationId::direct(ALICE), true).unwrap().unwrap();
+    let identifier = crate::groups::group_identifier(group_key().try_into().unwrap());
+    assert_eq!(reply.group_id, Some(hex::encode(&identifier)));
+    assert_eq!(reply.group, Some(group));
+    assert_eq!(wire_group_id(&reply), Some(identifier));
+    // A backup's unknown group goes as no group.
+    assert_eq!(wire_group_id(&signal_store::PrivateReply::default()), None);
+}
+
+#[test]
+fn private_replies_go_only_to_the_author_with_the_flag_on() {
+    let group = ConversationId::group(&group_key());
+    let theirs = stored(group.clone(), Some(ALICE));
+    let alice = ConversationId::direct(ALICE);
+    assert!(reply_group(&theirs, &alice, false).is_err(), "flag off");
+    assert!(reply_group(&theirs, &ConversationId::direct(BOB), true).is_err(), "not the author");
+    assert!(reply_group(&stored(group.clone(), None), &alice, true).is_err(), "our own message");
+    // Deleted since it was picked: still a private reply.
+    let deleted = signal_store::Message { deleted: true, ..theirs.clone() };
+    assert!(reply_group(&deleted, &alice, true).is_ok_and(|g| g.is_some()));
+    // Another 1:1 chat's message is no private reply.
+    assert!(reply_group(&stored(ConversationId::direct(BOB), Some(ALICE)), &alice, true).is_err());
+    // Nor is one into a group.
+    assert!(reply_group(&theirs, &ConversationId::group(&[8; 32]), true).is_err());
+}

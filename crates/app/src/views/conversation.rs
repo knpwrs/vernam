@@ -439,6 +439,10 @@ impl ConversationView {
             _subscriptions: subscriptions,
         };
         this.load_request_details(cx);
+        // Opened to reply privately to a group message.
+        if let Some(message) = this.state.update(cx, |state, _| state.take_private_reply(&this.id)) {
+            this.composer.update(cx, |composer, cx| composer.reply_to(message, window, cx));
+        }
         let jump = this.state.update(cx, |state, _| state.take_jump(&this.id));
         let unread = this.state.read(cx).conversation(&this.id).is_some_and(|c| c.unread_count > 0);
         match jump {
@@ -5346,6 +5350,16 @@ fn message_menu(
             })
         }));
     }
+    // Desktop's "Reply privately" on someone else's group message
+    // (`MessageContextMenu`, commit 98032f98).
+    if state.read(cx).can_reply_privately(message) {
+        let (state, message) = (state.clone(), message.clone());
+        menu = menu.item(
+            PopupMenuItem::new("Reply privately")
+                .icon(IconName::User)
+                .on_click(move |_, _, cx| state.update(cx, |state, cx| state.reply_privately(message.clone(), cx))),
+        );
+    }
     // Desktop doesn't forward polls or view-once messages (`canForward`).
     if !message.deleted && message.poll.is_none() && message.view_once.is_none() {
         let state = state.clone();
@@ -8896,6 +8910,36 @@ mod tests {
         let stranger = signal_store::PrivateReply { group_id: Some("00".repeat(32)), group: None };
         assert_eq!(state.read_with(&cx, |s, _| s.private_reply_group(&stranger).map(|c| c.id.clone())), None);
         assert_eq!(state.read_with(&cx, |s, _| s.private_reply_group(&signal_store::PrivateReply::default()).is_none()), true);
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn replying_privately_opens_their_chat_replying(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        let theirs = wait_for_messages(&backend, GROUP, 1, |m| m.body == JORDAN_IN_GROUP).remove(0);
+        let ours = wait_for_messages(&backend, GROUP, 1, |m| m.direction == Direction::Outgoing && m.notice.is_none()).remove(0);
+        let in_chat = wait_for_messages(&backend, JORDAN, 1, |m| m.direction == Direction::Incoming).remove(0);
+        let (mut cx, view) = open_view(cx, &backend, GROUP);
+        let state = view.read_with(&cx, |v, _| v.state.clone());
+        chats_loaded(&mut cx, &state);
+        // Desktop's `canReplyPrivately`: someone else's message in a group.
+        state.read_with(&cx, |s, _| {
+            assert!(s.can_reply_privately(&theirs));
+            assert!(!s.can_reply_privately(&ours), "our own");
+            assert!(!s.can_reply_privately(&in_chat), "not in a group");
+            assert!(!s.can_reply_privately(&Message { deleted: true, ..theirs.clone() }), "deleted");
+        });
+        state.update(&mut cx, |s, cx| s.reply_privately(theirs.clone(), cx));
+        assert_eq!(state.read_with(&cx, |s, _| s.selected.clone()), Some(ConversationId(JORDAN.into())));
+        // His chat's view (as the window makes it) replies to the message.
+        let jordan = cx.update(|window, cx| {
+            let picker = cx.new(|cx| EmojiPicker::new(state.clone(), window, cx));
+            cx.new(|cx| ConversationView::new(state.clone(), picker, ConversationId(JORDAN.into()), window, cx))
+        });
+        let replying = cx.update(|_, cx| jordan.read(cx).composer.read(cx).replying_to());
+        assert_eq!(replying, Some(theirs.id));
+        // Taken once.
+        assert_eq!(state.update(&mut cx, |s, _| s.take_private_reply(&ConversationId(JORDAN.into()))), None);
         backend.shutdown();
     }
 }

@@ -128,6 +128,13 @@ impl RemoteConfig {
         self.feature("stickerReply.send")
     }
 
+    /// Replying privately to a group message, in a 1:1 chat with its author
+    /// (`privateReply.send`, Desktop's `isPrivateReplySendEnabled`, commit
+    /// 98032f98). Private replies are received whatever it says.
+    pub fn private_reply_send(&self) -> bool {
+        self.feature("privateReply.send")
+    }
+
     /// Favorite stickers in the picker and their Storage Service records
     /// (`stickerFavorites`, Desktop's `isFavoriteStickersEnabled`,
     /// `ts/util/stickers.preload.ts`).
@@ -448,6 +455,9 @@ mod tests {
         assert!(!RemoteConfig::from_pairs([("desktop.shareContact.beta", "8.30.0")]).share_contact());
         assert!(RemoteConfig::from_pairs([("desktop.stickerPackHiding.prod", "8.30.0")]).sticker_pack_hiding());
         assert!(!RemoteConfig::from_pairs([("desktop.stickerPackHiding.beta", "8.30.0")]).sticker_pack_hiding());
+        assert!(RemoteConfig::from_pairs([("desktop.privateReply.send.prod", "8.30.0")]).private_reply_send());
+        assert!(!RemoteConfig::from_pairs([("desktop.privateReply.send.beta", "8.30.0")]).private_reply_send());
+        assert!(!RemoteConfig::default().private_reply_send());
     }
 
     #[test]
