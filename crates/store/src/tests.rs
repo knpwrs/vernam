@@ -3232,6 +3232,64 @@ async fn favorite_stickers_stop_at_the_limit() {
     assert!(matches!(db.favorite_sticker("bb", "k", 1, 7).await.unwrap(), Favorited::Added(_)));
 }
 
+#[tokio::test]
+async fn sticker_packs_are_hidden_unhidden_and_hidden_again() {
+    let db = test_db().await;
+    // A pack we don't know has no key to hide it with.
+    assert_eq!(db.hide_sticker_pack("aa", None).await.unwrap(), Hid::NoKey);
+    db.sticker_pack_seen("aa", "k1", 1).await.unwrap();
+    let Hid::Hidden(hidden) = db.hide_sticker_pack("aa", None).await.unwrap() else { panic!("not hidden") };
+    assert_eq!((hidden.pack_key.as_deref(), hidden.unhidden_at, hidden.needs_sync), (Some("k1"), None, true));
+    assert_eq!(db.hide_sticker_pack("aa", None).await.unwrap(), Hid::Already);
+    assert_eq!(db.hidden_sticker_pack_ids().await.unwrap(), ["aa".to_owned()].into());
+
+    // Written, then unhidden (as an install does): a tombstone to write,
+    // keeping its key.
+    db.hidden_sticker_pack_written(&hidden).await.unwrap();
+    assert!(!db.hidden_sticker_packs().await.unwrap()[0].needs_sync);
+    let tombstone = db.unhide_sticker_pack("aa", 30).await.unwrap().unwrap();
+    assert_eq!((tombstone.pack_key.as_deref(), tombstone.unhidden_at, tombstone.needs_sync), (Some("k1"), Some(30), true));
+    assert_eq!(db.unhide_sticker_pack("aa", 31).await.unwrap(), None, "not hidden now");
+    assert_eq!(db.unhide_sticker_pack("zz", 31).await.unwrap(), None, "never hidden");
+    assert!(db.hidden_sticker_pack_ids().await.unwrap().is_empty());
+    // A write of the hidden state leaves the tombstone pending.
+    db.hidden_sticker_pack_written(&hidden).await.unwrap();
+    assert!(db.hidden_sticker_packs().await.unwrap()[0].needs_sync);
+
+    // Our tombstone, written and echoed back: unchanged, its key kept.
+    db.hidden_sticker_pack_written(&tombstone).await.unwrap();
+    let echo = [RemoteHiddenStickerPack { pack_id: "aa".into(), pack_key: None, unhidden_at: 30 }];
+    assert!(!db.merge_storage_hidden_sticker_packs(&echo, 0).await.unwrap().changed);
+    // Unhidden again on another device: still its key.
+    let remote = [RemoteHiddenStickerPack { pack_id: "aa".into(), pack_key: None, unhidden_at: 40 }];
+    assert!(db.merge_storage_hidden_sticker_packs(&remote, 0).await.unwrap().changed);
+    assert_eq!(db.hidden_sticker_packs().await.unwrap()[0].pack_key.as_deref(), Some("k1"));
+    let Hid::Hidden(again) = db.hide_sticker_pack("aa", None).await.unwrap() else { panic!("not hidden again") };
+    assert_eq!((again.pack_key.as_deref(), again.unhidden_at), (Some("k1"), None));
+    // A tombstone first seen from another device has no key: hiding takes
+    // the one `sticker_packs` has (Desktop commit 8049395), else the one
+    // the sticker manager passed.
+    db.sticker_pack_seen("bb", "k2", 1).await.unwrap();
+    let theirs = [
+        RemoteHiddenStickerPack { pack_id: "aa".into(), pack_key: Some("k1".into()), unhidden_at: 0 },
+        RemoteHiddenStickerPack { pack_id: "bb".into(), pack_key: None, unhidden_at: 50 },
+    ];
+    let written = db.hidden_sticker_packs().await.unwrap().into_iter().find(|p| p.pack_id == "aa").unwrap();
+    db.hidden_sticker_pack_written(&written).await.unwrap();
+    db.merge_storage_hidden_sticker_packs(&theirs, 0).await.unwrap();
+    let Hid::Hidden(bb) = db.hide_sticker_pack("bb", Some("ignored")).await.unwrap() else { panic!("bb not hidden") };
+    assert_eq!(bb.pack_key.as_deref(), Some("k2"));
+    let Hid::Hidden(cc) = db.hide_sticker_pack("cc", Some("k3")).await.unwrap() else { panic!("cc not hidden") };
+    assert_eq!(cc.pack_key.as_deref(), Some("k3"));
+    assert_eq!(db.hide_sticker_pack("dd", Some("")).await.unwrap(), Hid::NoKey);
+
+    // A backup's hidden pack, here already, isn't added twice.
+    let imported = [RemoteHiddenStickerPack { pack_id: "aa".into(), pack_key: Some("k1".into()), unhidden_at: 0 }];
+    let before = db.hidden_sticker_packs().await.unwrap();
+    assert_eq!(db.import_hidden_sticker_packs(&imported).await.unwrap(), 0);
+    assert_eq!(db.hidden_sticker_packs().await.unwrap(), before);
+}
+
 fn scheduled(c: &str, send_at: i64, body: &str, files: Vec<ScheduledFile>) -> NewScheduled {
     NewScheduled {
         conversation: conv(c),

@@ -733,14 +733,19 @@ fn demo_summary(pack: &crate::StickerPackView, installed: bool) -> crate::sticke
 }
 
 /// The demo's manager: no Artist Series (nothing is fetched), both packs
-/// shared with us.
+/// shared with us, unless hidden.
 async fn demo_sticker_manager(db: &AppDb, data_dir: &Path) -> crate::stickers::StickerManagerView {
     let ids = demo_installed_ids(db).await;
+    let hidden = db.hidden_sticker_pack_ids().await.unwrap_or_default();
     let installed = demo_stickers_installed(db, data_dir).await;
     crate::stickers::StickerManagerView {
         installed: installed.iter().map(|p| demo_summary(p, true)).collect(),
         blessed: Vec::new(),
-        received: demo_all_stickers(data_dir).iter().map(|p| demo_summary(p, ids.contains(&hex::encode(&p.id)))).collect(),
+        received: demo_all_stickers(data_dir)
+            .iter()
+            .filter(|p| !hidden.contains(&hex::encode(&p.id)))
+            .map(|p| demo_summary(p, ids.contains(&hex::encode(&p.id))))
+            .collect(),
     }
 }
 
@@ -1889,9 +1894,11 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 let mut ids = demo_installed_ids(&db).await;
                 let hex = hex::encode(&id);
                 if !ids.contains(&hex) {
-                    ids.push(hex);
+                    ids.push(hex.clone());
                 }
                 let _ = db.set_setting(DEMO_INSTALLED_STICKERS, &serde_json::to_string(&ids).unwrap_or_default()).await;
+                // Installing unhides it, as the real backend does.
+                let _ = db.unhide_sticker_pack(&hex, now()).await;
                 emit(Event::Stickers(demo_stickers_installed(&db, &data_dir).await));
                 emit(Event::StickerManager(demo_sticker_manager(&db, &data_dir).await));
             }
@@ -1900,6 +1907,25 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                 ids.retain(|i| *i != hex::encode(&id));
                 let _ = db.set_setting(DEMO_INSTALLED_STICKERS, &serde_json::to_string(&ids).unwrap_or_default()).await;
                 emit(Event::Stickers(demo_stickers_installed(&db, &data_dir).await));
+                emit(Event::StickerManager(demo_sticker_manager(&db, &data_dir).await));
+            }
+            // Kept as the real backend keeps them; nothing is written to
+            // Storage Service.
+            Command::HideStickerPack { id, .. } => {
+                let hex = hex::encode(&id);
+                let mut ids = demo_installed_ids(&db).await;
+                ids.retain(|i| *i != hex);
+                let _ = db.set_setting(DEMO_INSTALLED_STICKERS, &serde_json::to_string(&ids).unwrap_or_default()).await;
+                // The demo's packs aren't in `sticker_packs`: known here.
+                let _ = db.sticker_pack_seen(&hex, &hex::encode([0u8; 32]), now()).await;
+                if let Err(e) = db.hide_sticker_pack(&hex, None).await {
+                    emit(Event::Error(format!("failed to hide the sticker pack: {e}")));
+                }
+                emit(Event::Stickers(demo_stickers_installed(&db, &data_dir).await));
+                emit(Event::StickerManager(demo_sticker_manager(&db, &data_dir).await));
+            }
+            Command::UnhideStickerPack { id } => {
+                let _ = db.unhide_sticker_pack(&hex::encode(&id), now()).await;
                 emit(Event::StickerManager(demo_sticker_manager(&db, &data_dir).await));
             }
             Command::OrderStickerPacks(order) => {

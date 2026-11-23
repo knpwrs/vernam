@@ -5,6 +5,8 @@
 //! its stickers; installing and uninstalling tell our other devices (a
 //! `StickerPackOperation` sync and the pack's `InstalledStickerPackRecord`),
 //! and their records are merged as `mergeInstalledStickerPackRecord` does.
+//! Installing a hidden pack, from anywhere, unhides it
+//! (`hidden_sticker_packs.rs`).
 //!
 //! Network work is bounded: manifests and covers are fetched one pack at a
 //! time, at most [`META_PER_RUN`] packs each time the manager opens; a
@@ -55,6 +57,7 @@ impl Actor {
     pub(super) async fn sticker_manager_view(&self) -> StickerManagerView {
         let installed = self.load_stickers().await;
         let rows = self.db.sticker_pack_rows().await.unwrap_or_default();
+        let hidden = self.db.hidden_sticker_pack_ids().await.unwrap_or_default();
         let summary_of_row = |row: &signal_store::StickerPackRow| -> Option<StickerPackSummary> {
             let id = hex::decode(&row.id).ok()?;
             let installed_view = installed.iter().find(|p| p.id == id);
@@ -107,8 +110,12 @@ impl Actor {
             })
             .collect();
         // Desktop's "Shared With You": every pack we know that isn't the
-        // Artist Series, installed ones included, newest first.
-        let received = rows.iter().filter(|r| hex::decode(&r.id).is_ok_and(|id| !is_blessed(&id))).filter_map(summary_of_row).collect();
+        // Artist Series or hidden, installed ones included, newest first.
+        let received = rows
+            .iter()
+            .filter(|r| !hidden.contains(&r.id) && hex::decode(&r.id).is_ok_and(|id| !is_blessed(&id)))
+            .filter_map(summary_of_row)
+            .collect();
         StickerManagerView { installed: installed_summaries, blessed, received }
     }
 
@@ -235,6 +242,11 @@ impl Actor {
             Err(error) => return self.error("failed to save the sticker pack", error),
         };
         self.stickers_changed().await;
+        // Desktop's `maybeUnhideStickerPack`: shown, then written.
+        if let Some(tombstone) = self.unhide_here(&id).await {
+            self.emit(Event::StickerManager(self.sticker_manager_view().await));
+            self.write_hidden_pack_now(&tombstone.pack_id).await;
+        }
         match storage::write_sticker_pack(&manager, &id, &key, position, 0).await {
             Ok(()) => self.storage_written(),
             Err(error) => self.error("couldn't save the sticker pack on your other devices", format!("{error:#}")),
@@ -281,11 +293,15 @@ impl Actor {
     pub(super) async fn apply_sticker_pack_sync(self: &Rc<Self>, packs: Vec<(Vec<u8>, Option<Vec<u8>>)>) {
         for (id, key) in packs {
             let result = match key {
-                Some(key) => self.db.install_sticker_pack_row(&hex_of(&id), &hex_of(&key), None, now_millis()).await.map(|_| ()),
-                None => self.db.uninstall_sticker_pack_row(&hex_of(&id), now_millis()).await.map(|_| ()),
+                Some(key) => self.db.install_sticker_pack_row(&hex_of(&id), &hex_of(&key), None, now_millis()).await.map(|_| true),
+                None => self.db.uninstall_sticker_pack_row(&hex_of(&id), now_millis()).await.map(|_| false),
             };
-            if let Err(error) = result {
-                warn!(%error, "failed to save a synced sticker pack");
+            match result {
+                Ok(true) => {
+                    self.sticker_pack_unhidden(&id).await;
+                }
+                Ok(false) => {}
+                Err(error) => warn!(%error, "failed to save a synced sticker pack"),
             }
         }
         self.stickers_changed().await;
@@ -344,7 +360,9 @@ impl Actor {
                 for (id, key, position) in to_install {
                     match manager.download_sticker_pack(&id, &key).await {
                         Ok(_) => {
-                            let _ = this.db.install_sticker_pack_row(&hex_of(&id), &hex_of(&key), Some(position), now_millis()).await;
+                            if this.db.install_sticker_pack_row(&hex_of(&id), &hex_of(&key), Some(position), now_millis()).await.is_ok() {
+                                this.sticker_pack_unhidden(&id).await;
+                            }
                             this.stickers_changed().await;
                         }
                         Err(error) => warn!(%error, "couldn't download a sticker pack installed elsewhere"),

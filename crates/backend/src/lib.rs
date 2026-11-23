@@ -381,6 +381,12 @@ pub enum Command {
     /// Installed packs in this order (Desktop's drag to reorder), saved for
     /// our other devices.
     OrderStickerPacks(Vec<Vec<u8>>),
+    /// Hides a received pack from the sticker manager, uninstalling it
+    /// first if it's installed, here and on our other devices (its
+    /// `HiddenStickerPackRecord`; Desktop's `markStickerPackAsHidden`).
+    HideStickerPack { id: Vec<u8>, key: Vec<u8> },
+    /// Undoes `HideStickerPack` (the pack stays uninstalled).
+    UnhideStickerPack { id: Vec<u8> },
     /// Favorites a sticker, or unfavorites it, here and on our other
     /// devices (its `FavoriteStickerRecord`; Desktop's
     /// `markStickerAsFavorite`). The pack needn't be installed.

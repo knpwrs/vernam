@@ -10,6 +10,7 @@ mod calls;
 mod early;
 mod group_admin;
 mod group_calls;
+mod hidden_sticker_packs;
 mod polls;
 mod sticker_favorites;
 mod stickers;
@@ -528,6 +529,15 @@ struct Actor {
     avatar_batch_pending: std::cell::Cell<bool>,
     /// Favorite stickers' own downloads (`sticker_favorites.rs`).
     favorite_downloads: sticker_favorites::FavoriteDownloads,
+    /// Hidden sticker packs changed here (`hidden_sticker_packs.rs`).
+    hidden_pack_changes: hidden_sticker_packs::HiddenPackChanges,
+    /// Held by each hidden pack record write, and by a sync from its
+    /// changed-meanwhile check through its merge and writes, so writes
+    /// never overlap and each sends what our database has then.
+    hidden_pack_write_lock: tokio::sync::Mutex<()>,
+    /// Held by a hide or unhide from the sticker manager, start to end (a
+    /// hide's uninstall included), so an Undo waits for its hide.
+    hide_command_lock: tokio::sync::Mutex<()>,
     /// Withheld photos, now trusted, whose download failed this session:
     /// not taken again, so the rest get their turn (`photos.rs`).
     trusted_photo_failures: RefCell<HashSet<String>>,
@@ -674,6 +684,9 @@ pub(crate) async fn run(
         video,
         avatar_batch_pending: std::cell::Cell::new(false),
         favorite_downloads: Default::default(),
+        hidden_pack_changes: Default::default(),
+        hidden_pack_write_lock: Default::default(),
+        hide_command_lock: Default::default(),
         trusted_photo_failures: RefCell::default(),
         history: RefCell::new(None),
         outbound,
@@ -1014,6 +1027,8 @@ impl Actor {
                 Command::InstallStickerPack { id, key } => self.install_sticker_pack_ui(id, key).await,
                 Command::UninstallStickerPack { id, key } => self.uninstall_sticker_pack_ui(id, key).await,
                 Command::OrderStickerPacks(ids) => self.order_sticker_packs(ids).await,
+                Command::HideStickerPack { id, key } => self.hide_sticker_pack(id, key).await,
+                Command::UnhideStickerPack { id } => self.unhide_sticker_pack(id).await,
                 Command::SetStickerFavorite { pack_id, pack_key, sticker_id, favorite } => {
                     self.set_sticker_favorite(pack_id, pack_key, sticker_id, favorite).await
                 }
@@ -2802,6 +2817,7 @@ impl Actor {
     async fn sync_storage(self: &Rc<Self>, manager: &SignalManager) {
         // Favorites changed after this point are newer than the snapshot.
         let favorite_changes = self.favorite_downloads.local_changes.get();
+        let hidden_pack_changes = self.hidden_pack_changes.get();
         let storage::StorageSnapshot {
             contacts,
             pinned,
@@ -2821,6 +2837,7 @@ impl Actor {
             chat_folders,
             sticker_packs,
             favorite_stickers,
+            hidden_sticker_packs,
         } = match storage::fetch(manager).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -2858,6 +2875,7 @@ impl Actor {
         self.apply_storage_chat_folders(chat_folders).await;
         self.apply_storage_sticker_packs(sticker_packs).await;
         self.apply_storage_favorite_stickers(favorite_stickers, favorite_changes).await;
+        self.apply_storage_hidden_sticker_packs(hidden_sticker_packs, hidden_pack_changes).await;
         if let Err(error) = self.db.apply_profile_sharing(&profile_sharing).await {
             warn!(error = %format!("{error:#}"), "failed to save profile sharing");
         }
@@ -6150,8 +6168,11 @@ impl Actor {
             match manager.install_sticker_pack(&id, &key).await {
                 Ok(()) => {
                     added += 1;
-                    if let Err(error) = self.db.install_sticker_pack_row(&hex_of(&id), &hex_of(&key), None, now_millis()).await {
-                        warn!(%error, "failed to save a transferred sticker pack");
+                    match self.db.install_sticker_pack_row(&hex_of(&id), &hex_of(&key), None, now_millis()).await {
+                        Ok(_) => {
+                            self.sticker_pack_unhidden(&id).await;
+                        }
+                        Err(error) => warn!(%error, "failed to save a transferred sticker pack"),
                     }
                 }
                 Err(error) => warn!(%error, "couldn't install a transferred sticker pack"),
