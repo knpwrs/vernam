@@ -39,7 +39,9 @@ pub enum Tab {
 /// down (each `None` where it can't move).
 type Moves = (Option<Vec<Vec<u8>>>, Option<Vec<Vec<u8>>>);
 
-const UNINSTALL_WARNING: &str = "You may not be able to re-install this sticker pack if you no longer have the source message.";
+/// Desktop's `UninstallWarning` dialog (as of commit 5edf85d); the hide
+/// dialog says the same.
+const REMOVE_WARNING: &str = "This will remove the sticker pack. You can't add it again without a link or sticker message.";
 
 fn cover(pack: &StickerPackSummary, size: f32, palette: Palette) -> AnyElement {
     match &pack.cover {
@@ -56,10 +58,12 @@ fn uninstall(state: Entity<AppState>, pack: StickerPackSummary, window: &mut Win
     }
     window.open_alert_dialog(cx, move |alert, _, _| {
         let (state, pack) = (state.clone(), pack.clone());
-        alert.description(UNINSTALL_WARNING).confirm().ok_text("Uninstall").ok_variant(ButtonVariant::Danger).on_ok(move |_, _, cx| {
-            state.read(cx).send(Command::UninstallStickerPack { id: pack.id.clone(), key: pack.key.clone() });
-            true
-        })
+        alert.title("Remove Sticker Pack?").description(REMOVE_WARNING).confirm().ok_text("Remove").ok_variant(ButtonVariant::Danger).on_ok(
+            move |_, _, cx| {
+                state.read(cx).send(Command::UninstallStickerPack { id: pack.id.clone(), key: pack.key.clone() });
+                true
+            },
+        )
     });
 }
 
@@ -69,7 +73,7 @@ pub fn confirm_hide(state: Entity<AppState>, pack: StickerPackSummary, window: &
         let (state, pack) = (state.clone(), pack.clone());
         alert
             .title("Hide Sticker Pack?")
-            .description("This will remove the sticker pack. You can't add it again without a link or sticker message.")
+            .description(REMOVE_WARNING)
             .confirm()
             .ok_text("Hide")
             .ok_variant(ButtonVariant::Danger)
