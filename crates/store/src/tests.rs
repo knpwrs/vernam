@@ -1503,20 +1503,42 @@ fn group_call(call_id: i64, era: Option<&str>, by: Option<&str>, at: i64) -> Gro
     GroupCallRecord { call_id, era: era.map(str::to_owned), by: by.map(str::to_owned), incoming: by.is_some(), at }
 }
 
+// Desktop's `updateLocalHistoryFromGroupCallUpdateMessage` (commit 749cd4e).
+#[tokio::test]
+async fn a_group_call_update_creates_only_when_allowed_and_never_moves_a_call() {
+    let db = test_db().await;
+    let g = conv("g:a");
+    let started = CallHistoryEvent::Started;
+    // Not allowed to create: nothing, and no chat row either.
+    assert_eq!(db.apply_group_call_event(&g, &group_call(7, Some("e7"), Some("bob"), 5_000), started, false, true, false).await.unwrap(), None);
+    assert!(db.conversation(&g).await.unwrap().is_none());
+    let change =
+        db.apply_group_call_event(&g, &group_call(7, Some("e7"), Some("bob"), 5_000), started, false, true, true).await.unwrap().unwrap();
+    assert_eq!((change.previous, change.sent_at), (None, 5_000));
+    // Later or earlier updates (a sender's timestamp could be anything)
+    // leave it where it is.
+    for at in [6_000, 3_000, 1] {
+        assert_eq!(db.apply_group_call_event(&g, &group_call(7, Some("e7"), Some("carol"), at), started, false, true, true).await.unwrap(), None);
+    }
+    let message = db.message(change.id).await.unwrap().unwrap();
+    assert_eq!(message.sent_at, 5_000);
+    assert!(matches!(message.notice, Some(Notice::GroupCall { by: Some(ref by), .. }) if by == "bob"));
+}
+
 #[tokio::test]
 async fn a_group_call_is_one_record_that_follows_desktops_statuses() {
     let db = test_db().await;
     let g = conv("g:a");
     let rung = group_call(42, None, Some("alice"), 1_000);
     // Alice rings us: unseen until we look.
-    let change = db.apply_group_call_event(&g, &rung, CallHistoryEvent::Ringing, false, false).await.unwrap().unwrap();
+    let change = db.apply_group_call_event(&g, &rung, CallHistoryEvent::Ringing, false, false, true).await.unwrap().unwrap();
     assert_eq!((change.status, change.previous), (GroupCallStatus::Ringing, None));
     assert_eq!(db.unseen_calls().await.unwrap(), 1);
     // Bob's update about the same call (by its era) adds nothing.
     let update = group_call(42, Some("e1"), Some("bob"), 2_000);
-    assert_eq!(db.apply_group_call_event(&g, &update, CallHistoryEvent::Started, false, true).await.unwrap(), None);
+    assert_eq!(db.apply_group_call_event(&g, &update, CallHistoryEvent::Started, false, true, true).await.unwrap(), None);
     // We join: accepted, and seen.
-    let joined = db.apply_group_call_event(&g, &update, CallHistoryEvent::Accepted, true, false).await.unwrap().unwrap();
+    let joined = db.apply_group_call_event(&g, &update, CallHistoryEvent::Accepted, true, false, true).await.unwrap().unwrap();
     assert_eq!((joined.id, joined.status, joined.previous), (change.id, GroupCallStatus::Accepted, Some(GroupCallStatus::Ringing)));
     let notice = db.message(change.id).await.unwrap().unwrap().notice.unwrap();
     assert_eq!(
@@ -1535,13 +1557,13 @@ async fn a_group_call_is_one_record_that_follows_desktops_statuses() {
     let old = Notice::GroupCall { by: Some("bob".into()), era: Some("e2".into()), call_id: None, status: None, incoming: false, unseen: false };
     let old_id = db.insert_notice(&g, 5_000, &old).await.unwrap().unwrap();
     let change = db
-        .apply_group_call_event(&g, &group_call(43, Some("e2"), None, 6_000), CallHistoryEvent::Accepted, true, false)
+        .apply_group_call_event(&g, &group_call(43, Some("e2"), None, 6_000), CallHistoryEvent::Accepted, true, false, true)
         .await
         .unwrap()
         .unwrap();
     assert_eq!((change.id, change.status), (old_id, GroupCallStatus::Joined));
     // The same call id in another group is another call.
-    let other = db.apply_group_call_event(&conv("g:b"), &rung, CallHistoryEvent::Missed, false, false).await.unwrap().unwrap();
+    let other = db.apply_group_call_event(&conv("g:b"), &rung, CallHistoryEvent::Missed, false, false, true).await.unwrap().unwrap();
     assert_eq!(other.previous, None);
     assert_eq!(db.remove_group_call(&conv("g:b"), 42).await.unwrap(), Some(other.id));
 }
@@ -1553,25 +1575,25 @@ async fn calls_follow_the_chats_disappearing_timer_once_seen() {
     db.upsert_conversation(&g, ConversationUpdate { expire_timer: Some(60), ..Default::default() }).await.unwrap();
     // Ours, seen: counts down from now, unless we're still in the call.
     let ours = db
-        .apply_group_call_event(&g, &group_call(1, Some("e1"), None, 1_000), CallHistoryEvent::Ringing, true, false)
+        .apply_group_call_event(&g, &group_call(1, Some("e1"), None, 1_000), CallHistoryEvent::Ringing, true, false, true)
         .await
         .unwrap()
         .unwrap();
     let message = db.message(ours.id).await.unwrap().unwrap();
     assert_eq!((message.expires_in, message.expire_start), (60, None));
     // Leaving starts it.
-    db.apply_group_call_event(&g, &group_call(1, Some("e1"), None, 1_000), CallHistoryEvent::Started, false, false)
+    db.apply_group_call_event(&g, &group_call(1, Some("e1"), None, 1_000), CallHistoryEvent::Started, false, false, true)
         .await
         .unwrap();
     assert!(db.message(ours.id).await.unwrap().unwrap().expire_start.is_some());
     // A missed one waits until the call history is read…
     let missed = db
-        .apply_group_call_event(&g, &group_call(2, None, Some("alice"), 2_000), CallHistoryEvent::Missed, false, false)
+        .apply_group_call_event(&g, &group_call(2, None, Some("alice"), 2_000), CallHistoryEvent::Missed, false, false, true)
         .await
         .unwrap()
         .unwrap();
     let in_call = db
-        .apply_group_call_event(&g, &group_call(3, None, Some("alice"), 3_000), CallHistoryEvent::Accepted, true, false)
+        .apply_group_call_event(&g, &group_call(3, None, Some("alice"), 3_000), CallHistoryEvent::Accepted, true, false, true)
         .await
         .unwrap()
         .unwrap();

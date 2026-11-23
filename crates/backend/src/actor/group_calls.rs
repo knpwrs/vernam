@@ -28,11 +28,22 @@ const MAX_RING_SIZE: usize = 16;
 pub(super) enum HistorySource {
     /// Here: our other devices hear of a call we took part in.
     Local,
-    /// Someone's `groupCallUpdate`: recorded only if the call is new to us
-    /// (Desktop's `updateCallHistoryForGroupCallOnPeek`).
-    IfNew,
+    /// A `groupCallUpdate`: a new record only with `may_create`, and one we
+    /// have is left alone (Desktop's
+    /// `updateLocalHistoryFromGroupCallUpdateMessage`).
+    IfNew { may_create: bool },
     /// Another of our devices' call event sync, which isn't echoed back.
     OtherDevice,
+}
+
+/// Whether someone's `groupCallUpdate` may add a call to the history
+/// (Desktop's `canCreate` in `handleGroupCallUpdateMessage`): someone
+/// else's (`incoming`), in a chat we accepted
+/// (`getAccepted({ ignoreEmptyConvo: true })`, so not one we have no row
+/// for), and in an announcement-only group only an admin's.
+/// `accepted` is false without a row.
+fn may_create_group_call(incoming: bool, accepted: bool, announcements_only: bool, sender_is_admin: bool) -> bool {
+    incoming && accepted && (!announcements_only || sender_is_admin)
 }
 
 /// Whether a group call's status change here is told to our other devices
@@ -598,8 +609,11 @@ impl Actor {
         active: bool,
         source: HistorySource,
     ) {
-        let only_new = source == HistorySource::IfNew;
-        let change = match self.db.apply_group_call_event(conversation, &record, event, active, only_new).await {
+        let (only_new, may_create) = match source {
+            HistorySource::IfNew { may_create } => (true, may_create),
+            HistorySource::Local | HistorySource::OtherDevice => (false, true),
+        };
+        let change = match self.db.apply_group_call_event(conversation, &record, event, active, only_new, may_create).await {
             Ok(Some(change)) => change,
             Ok(None) => return,
             Err(error) => return self.error("failed to record the call", error),
@@ -674,13 +688,35 @@ impl Actor {
     /// in the history if it's new to us. Desktop peeks the call first and
     /// takes who started it from the calling server; we take the sender,
     /// which is who started it unless they joined someone else's.
+    ///
+    /// Desktop's `handleGroupCallUpdateMessage`
+    /// (`ts/messages/handleDataMessage.preload.ts`, commit 749cd4e): nothing
+    /// for an ended group; a new record only for someone else's update in a
+    /// chat we accepted, and in an announcement-only group only an admin's;
+    /// a record we have is left as it is (see `apply_group_call_event`).
     pub(super) async fn on_group_call_started(&self, conversation: ConversationId, by: Option<String>, era: Option<String>, at: i64) {
         // Without an era there's no call to name (Desktop records none).
         let Some(era) = era else { return };
+        let chat = self.db.conversation(&conversation).await.ok().flatten();
+        if chat.as_ref().is_some_and(|c| c.ended) {
+            return;
+        }
+        let sender_is_admin = match &by {
+            Some(sender) if chat.as_ref().is_some_and(|c| c.group_state.announcements_only) => {
+                self.is_group_admin(&conversation, sender).await
+            }
+            _ => false,
+        };
+        let may_create = may_create_group_call(
+            by.is_some(),
+            chat.as_ref().is_some_and(|c| c.accepted),
+            chat.as_ref().is_some_and(|c| c.group_state.announcements_only),
+            sender_is_admin,
+        );
         let call_id = signal_calls::call_id_from_era(&era);
         let active = self.group_call.borrow().as_ref().is_some_and(|g| g.conversation == conversation && g.era.as_deref() == Some(&era));
         let record = GroupCallRecord { call_id, era: Some(era), incoming: by.is_some(), by, at };
-        self.group_call_history(&conversation, record, CallHistoryEvent::Started, active, HistorySource::IfNew).await;
+        self.group_call_history(&conversation, record, CallHistoryEvent::Started, active, HistorySource::IfNew { may_create }).await;
     }
 
     /// Whose device a demux id is in the call (ours included).
@@ -888,6 +924,19 @@ pub(super) fn method_of(method: signal_calls::HttpMethod) -> reqwest::Method {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_someone_elses_update_in_an_accepted_chat_adds_a_call() {
+        let may = super::may_create_group_call;
+        // (incoming, accepted, announcements only, sender is admin)
+        assert!(may(true, true, false, false));
+        assert!(may(true, true, true, true));
+        // Ours from another device; a chat not accepted (or not known);
+        // a non-admin in an announcement-only group.
+        assert!(!may(false, true, false, false));
+        assert!(!may(true, false, false, true));
+        assert!(!may(true, true, true, false));
+    }
+
     #[test]
     fn calls_we_took_part_in_are_synced_once_per_status() {
         use signal_store::GroupCallStatus as S;

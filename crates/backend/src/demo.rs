@@ -1094,7 +1094,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                     };
                     let mut id = None;
                     for (event, active) in [(signal_store::CallHistoryEvent::Ringing, true), (signal_store::CallHistoryEvent::Started, false)] {
-                        if let Ok(Some(change)) = db.apply_group_call_event(&update.conversation, &record, event, active, false).await {
+                        if let Ok(Some(change)) = db.apply_group_call_event(&update.conversation, &record, event, active, false, true).await {
                             id = Some(change.id);
                         }
                     }

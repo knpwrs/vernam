@@ -286,8 +286,14 @@ impl AppDb {
     /// seen), and a new one takes the chat's disappearing timer, which
     /// starts once it's seen and we're not in the call (`active`).
     ///
-    /// `only_new`: record it only if there's no record yet (Desktop's
-    /// `updateCallHistoryForGroupCallOnPeek`); `None` when there was.
+    /// `only_new`: someone's `groupCallUpdate` (Desktop's
+    /// `updateLocalHistoryFromGroupCallUpdateMessage`,
+    /// `ts/util/callDisposition.preload.ts`): `None` when there's a record
+    /// already. There's a new one only with `may_create`, as Desktop's
+    /// `canCreate` decides. Desktop also moves a record's call-history time
+    /// earlier for an older update, without moving it in the chat; here a
+    /// notice's time is its place in the chat (`sent_at`), and the sender
+    /// picks an update's timestamp, so the notice stays where it is.
     pub async fn apply_group_call_event(
         &self,
         conversation: &ConversationId,
@@ -295,6 +301,7 @@ impl AppDb {
         event: CallHistoryEvent,
         active: bool,
         only_new: bool,
+        may_create: bool,
     ) -> Result<Option<GroupCallChange>> {
         let mut tx = self.write().await?;
         ensure_conversation(&mut tx, conversation).await?;
@@ -322,6 +329,9 @@ impl AppDb {
             }
             (found, _) => found,
         };
+        if found.is_none() && !may_create {
+            return Ok(None);
+        }
         if only_new && found.is_some() {
             return Ok(None);
         }
