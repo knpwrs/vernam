@@ -10,7 +10,7 @@ description = "1:1 Signal calls through RingRTC"
 [dependencies]
 # Signal's calling library, with Signal's prebuilt WebRTC (fetched at build
 # time into OUTPUT_DIR; see .cargo/config.toml).
-ringrtc = { git = "https://github.com/signalapp/ringrtc", tag = "v2.74.0", features = ["prebuilt_webrtc"] }
+ringrtc = { git = "https://github.com/signalapp/ringrtc", tag = "v2.75.0", features = ["prebuilt_webrtc"] }
 # Camera capture (AVFoundation on macOS).
 nokhwa = { version = "0.10.11", features = ["input-native", "output-threaded"] }
 # Call link keys (the version RingRTC takes).

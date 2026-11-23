@@ -374,7 +374,7 @@ upload hasn't been tried against Signal's servers. Left:
 ## Calls
 
 1:1 and group voice and video calls work (see the README): `crates/calls`
-drives RingRTC v2.72.1 with Signal's prebuilt WebRTC, signaling travels as
+drives RingRTC v2.75.0 with Signal's prebuilt WebRTC, signaling travels as
 `CallMessage`s through presage, TURN relays come from
 `GET /v2/calling/relays`, and group calls go through Signal's calling server
 with a membership proof from `GET /v1/groups/token`. Not done yet:
