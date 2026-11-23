@@ -220,6 +220,8 @@ pub(crate) struct Imported {
     pub sticker_packs: Vec<(Vec<u8>, Vec<u8>)>,
     /// Favorite stickers added, whose images are still to download.
     pub favorite_stickers: usize,
+    /// Hidden sticker packs added.
+    pub hidden_sticker_packs: usize,
     /// The account's privacy settings, when the backup has them.
     pub settings: Option<crate::AccountSettings>,
 }
@@ -539,6 +541,7 @@ pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: imp
     // Who's in our address book (Desktop's `isInSystemContacts`).
     let mut system: Vec<String> = Vec::new();
     let mut imported = Imported::default();
+    let mut hidden_packs = Vec::new();
     // Chat colors (Desktop's `#fromCustomChatColors` and `#fromChatStyle`):
     // custom colors by their backup id, then the default and each chat's.
     let mut colors = signal_store::ChatColors::default();
@@ -657,6 +660,20 @@ pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: imp
             Some(proto::frame::Item::InstalledStickerPack(pack)) => {
                 imported.sticker_packs.push((pack.packId.clone(), pack.packKey.clone()));
             }
+            // Desktop's `#fromHiddenStickerPack` (commit 5edf85d): hidden,
+            // as Storage Service already has it. Desktop's import fails on
+            // one without a 16-byte id and 32-byte key; here it's skipped.
+            Some(proto::frame::Item::HiddenStickerPack(pack)) => {
+                if pack.packId.len() == 16 && pack.packKey.len() == 32 {
+                    hidden_packs.push(signal_store::RemoteHiddenStickerPack {
+                        pack_id: hex::encode(&pack.packId),
+                        pack_key: Some(hex::encode(&pack.packKey)),
+                        unhidden_at: 0,
+                    });
+                } else {
+                    tracing::warn!("skipped a hidden sticker pack in the backup without a valid pack id or key");
+                }
+            }
             Some(proto::frame::Item::FavoriteStickerList(list)) => {
                 let favorites = favorite_stickers(&list);
                 let invalid = list.favoriteSticker.len() - favorites.len();
@@ -684,6 +701,17 @@ pub(crate) async fn import(db: &AppDb, plain: &[u8], me: &str, mut progress: imp
         }
     }
     db.apply_chat_states(&states).await?;
+    if !hidden_packs.is_empty() {
+        match db.import_hidden_sticker_packs(&hidden_packs).await {
+            Ok(added) => {
+                if added < hidden_packs.len() {
+                    tracing::debug!(already = hidden_packs.len() - added, "hidden sticker packs in the backup were here already");
+                }
+                imported.hidden_sticker_packs = added;
+            }
+            Err(error) => tracing::warn!(%error, "failed to save the backup's hidden sticker packs"),
+        }
+    }
     if colors != signal_store::ChatColors::default() {
         db.edit_chat_colors(signal_store::ChatColorEdit::Import(colors)).await?;
     }
@@ -1556,6 +1584,13 @@ mod tests {
         pack.packId = vec![0xab; 16];
         pack.packKey = vec![0xcd; 32];
         push(proto::Frame { item: Some(proto::frame::Item::InstalledStickerPack(pack)), ..Default::default() });
+        // Packs hidden on the phone, one with a short key.
+        for (id, key_len) in [(0x77, 32), (0x78, 31)] {
+            let mut pack = proto::StickerPack::new();
+            pack.packId = vec![id; 16];
+            pack.packKey = vec![0x34; key_len];
+            push(proto::Frame { item: Some(proto::frame::Item::HiddenStickerPack(pack)), ..Default::default() });
+        }
         // Favorite stickers, one with a short pack key.
         let mut favorites = proto::FavoriteStickerList::new();
         for (key_len, sticker_id) in [(32, 3), (31, 4)] {
@@ -1688,6 +1723,18 @@ mod tests {
         assert_eq!(seen.last(), Some(&(plain.len() as u64)));
         assert_eq!((imported.chats, imported.messages), (4, 7));
         assert_eq!(imported.sticker_packs, vec![(vec![0xab; 16], vec![0xcd; 32])]);
+        // The hidden pack with a whole key, as Storage Service would have it.
+        assert_eq!(imported.hidden_sticker_packs, 1);
+        let hidden = db.hidden_sticker_packs().await.unwrap();
+        assert_eq!(
+            hidden,
+            [signal_store::HiddenStickerPack {
+                pack_id: "77".repeat(16),
+                pack_key: Some("34".repeat(32)),
+                unhidden_at: None,
+                needs_sync: false
+            }]
+        );
         // The favorite with a whole key, as Storage Service would have it.
         assert_eq!(imported.favorite_stickers, 1);
         let favorites = db.favorite_stickers().await.unwrap();
