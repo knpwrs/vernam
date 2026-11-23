@@ -72,11 +72,12 @@ pub fn duration_label(secs: f64) -> String {
     if minutes == 1 { "1 minute".into() } else { format!("{minutes} minutes") }
 }
 
-/// Desktop's MIME types it transcodes (`isVideoTypeSupported`): MP4, Ogg
-/// and WebM. AVFoundation reads only MP4 of those; the others go as they
-/// are, as everything does off macOS.
+/// Desktop's MIME types it transcodes (`isVideoTypeTranscodable`): MP4,
+/// QuickTime (from commit f820b4a, sent as MP4 once re-encoded), Ogg and
+/// WebM. AVFoundation reads MP4 and QuickTime; the others go as they are,
+/// as everything does off macOS.
 pub fn transcodes(content_type: &str) -> bool {
-    cfg!(target_os = "macos") && content_type == "video/mp4"
+    cfg!(target_os = "macos") && matches!(content_type, "video/mp4" | "video/quicktime")
 }
 
 /// What a video holds, read before it's sent.
@@ -551,6 +552,27 @@ mod tests {
         transcode(&turned, &turned_out, &target(480, 1.0, 900.)).unwrap();
         let after = probe(&turned_out).unwrap();
         assert_eq!((after.display_width, after.display_height), (480, 854));
+    }
+
+    /// A QuickTime movie re-encodes as an MP4 does (Desktop commit f820b4a).
+    #[test]
+    fn a_quicktime_movie_re_encodes() {
+        assert_eq!(transcodes("video/quicktime"), cfg!(target_os = "macos"));
+        assert!(!transcodes("video/webm"));
+        let dir = tempfile::tempdir().unwrap();
+        let (input, output) = (dir.path().join("in.mov"), dir.path().join("out.mp4"));
+        let made = std::process::Command::new("/opt/homebrew/bin/ffmpeg")
+            .args(["-v", "error", "-f", "lavfi", "-i", "testsrc=size=1280x720:rate=30:duration=2"])
+            .args(["-c:v", "libx264", "-b:v", "6M", "-pix_fmt", "yuv420p", "-f", "mov"])
+            .arg(&input)
+            .status();
+        if !made.is_ok_and(|s| s.success()) {
+            eprintln!("ffmpeg not available; skipping");
+            return;
+        }
+        transcode(&input, &output, &target(480, 1.0, 900.)).unwrap();
+        let after = probe(&output).expect("the result reads");
+        assert_eq!((after.display_width, after.display_height), (854, 480));
     }
 
     #[test]

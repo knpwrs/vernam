@@ -5008,11 +5008,18 @@ impl Actor {
             let mut gone = false;
             if let Outbound::SendImages { message, images, .. } = &mut job {
                 for upload in images.iter_mut() {
-                    if let Some(index) = upload.transcode.take()
-                        && !self.transcode_video(*message, index, &upload.path).await
-                    {
-                        gone = true;
-                        break;
+                    let Some(index) = upload.transcode.take() else { continue };
+                    match self.transcode_video(*message, index, &upload.path).await {
+                        None => {
+                            gone = true;
+                            break;
+                        }
+                        // It goes as an MP4, as the store now has it.
+                        Some(true) => {
+                            upload.file_type = Some("video/mp4".into());
+                            upload.file_name = upload.file_name.as_deref().map(signal_store::mp4_file_name);
+                        }
+                        Some(false) => {}
                     }
                 }
             }
@@ -5527,8 +5534,9 @@ impl Actor {
     /// `transcodeAttachment`), with the target for its length and our
     /// number's country. Left as it was when that fails or the result is
     /// still over the limit, as Desktop sends the original then.
-    /// `false` when the message is gone.
-    async fn transcode_video(&self, message: i64, index: usize, path: &std::path::Path) -> bool {
+    /// `None` when the message is gone; otherwise whether it was
+    /// re-encoded (and so is now an MP4).
+    async fn transcode_video(&self, message: i64, index: usize, path: &std::path::Path) -> Option<bool> {
         let phone = self.manager().map(|m| m.registration_data().phone_number.to_string());
         let source = path.to_owned();
         // This account's config, read here: it's the backend thread's own.
@@ -5578,15 +5586,15 @@ impl Actor {
                 if let Ok(Some(m)) = self.db.message(message).await {
                     self.emit(Event::MessageChanged { conversation: m.conversation_id, message_id: message });
                 }
-                true
+                Some(size.is_some())
             }
             Ok(false) => {
                 info!("the video's message is gone; not sending it");
-                false
+                None
             }
             Err(error) => {
                 warn!(%error, "couldn't record the re-encoded video");
-                true
+                Some(size.is_some())
             }
         }
     }

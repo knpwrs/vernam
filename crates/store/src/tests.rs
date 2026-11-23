@@ -312,6 +312,23 @@ async fn delete_edit_attachments_and_search() {
     // Failed: the size stays.
     assert!(db.finish_attachment_transcode(video_id, 0, None).await.unwrap());
     assert_eq!(db.message(video_id).await.unwrap().unwrap().attachments[0].size, 4);
+    // A re-encoded QuickTime movie becomes an MP4; one that failed stays as it was.
+    let mut movie = incoming("d:v", "v", 4, "");
+    let mov = AttachmentMeta {
+        content_type: "video/quicktime".into(),
+        file_name: Some("Trip.mov".into()),
+        transcode: true,
+        ..m.attachments[0].clone()
+    };
+    movie.attachments = vec![mov.clone(), mov];
+    let movie_id = db.insert_message(&movie).await.unwrap();
+    assert!(db.finish_attachment_transcode(movie_id, 0, Some(9)).await.unwrap());
+    assert!(db.finish_attachment_transcode(movie_id, 1, None).await.unwrap());
+    let atts = db.message(movie_id).await.unwrap().unwrap().attachments;
+    assert_eq!((atts[0].content_type.as_str(), atts[0].file_name.as_deref()), ("video/mp4", Some("Trip.mp4")));
+    assert_eq!((atts[1].content_type.as_str(), atts[1].file_name.as_deref()), ("video/quicktime", Some("Trip.mov")));
+    assert_eq!(crate::mp4_file_name("clip"), "clip.mp4");
+    assert_eq!(crate::mp4_file_name(".mov"), ".mov.mp4");
 
     let hits = db.search_messages("fox", 10).await.unwrap();
     assert_eq!(hits.iter().map(|h| h.message_id).collect::<Vec<_>>(), [id2, id]);

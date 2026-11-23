@@ -177,12 +177,13 @@ fn image_format(bytes: &[u8]) -> Option<ImageFormat> {
 }
 
 /// What "Photos & videos" takes, by extension: Desktop's supported image
-/// and video types (`ts/util/GoogleChrome.std.ts`).
+/// and video types (`ts/util/GoogleChrome.std.ts`), QuickTime movies
+/// included from commit e01fe04 (`TRANSCODABLE_VIDEO_EXTENSIONS`).
 fn is_photo_or_video(path: &std::path::Path) -> bool {
     let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
     matches!(
         ext.as_str(),
-        "avif" | "bmp" | "gif" | "jpg" | "jpeg" | "webp" | "xbm" | "ico" | "apng" | "png" | "mp4" | "m4v" | "ogv" | "webm"
+        "avif" | "bmp" | "gif" | "jpg" | "jpeg" | "webp" | "xbm" | "ico" | "apng" | "png" | "mp4" | "m4v" | "mov" | "ogv" | "webm"
     )
 }
 

@@ -3216,6 +3216,10 @@ impl AppDb {
             att.transcode = false;
             if let Some(size) = size {
                 att.size = size;
+                // Re-encoded, it's an MP4 whatever it was (a QuickTime
+                // movie, Desktop commit f820b4a's `fileType = VIDEO_MP4`).
+                att.content_type = "video/mp4".into();
+                att.file_name = att.file_name.as_deref().map(mp4_file_name);
             }
         })
         .await
@@ -3690,3 +3694,11 @@ async fn set_preview(conn: &mut sqlx::SqliteConnection, id: &ConversationId, pre
 
 #[cfg(test)]
 mod tests;
+
+/// `name` with an `.mp4` extension in place of its own (a re-encoded video).
+pub fn mp4_file_name(name: &str) -> String {
+    match std::path::Path::new(name).file_stem().and_then(|s| s.to_str()) {
+        Some(stem) if !stem.is_empty() => format!("{stem}.mp4"),
+        _ => format!("{name}.mp4"),
+    }
+}
