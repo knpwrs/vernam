@@ -348,6 +348,7 @@ impl Actor {
             thumbnail,
             attachment: None,
             story: true,
+            private_reply: None,
         };
         let message = NewMessage {
             conversation_id: conversation.clone(),

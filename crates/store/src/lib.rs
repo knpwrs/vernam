@@ -209,6 +209,24 @@ pub struct Quote {
     /// It quotes a story (a reply to one, one to one).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub story: bool,
+    /// It's a private reply: a quote, in a 1:1 chat, of a message in a
+    /// group (Desktop's quote `groupId` and `isPrivateReplyGroupUnknown`,
+    /// Desktop commit 98032f98).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_reply: Option<PrivateReply>,
+}
+
+/// The group a private reply's quoted message is in.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct PrivateReply {
+    /// The group's identifier (hex), as the quote's `groupId` names it.
+    /// `None` when it isn't known: a transferred backup's
+    /// `unknownPrivateReply`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    /// Our chat for that group, when we know it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<ConversationId>,
 }
 
 /// What a quote knows of the quoted attachment (Signal's
@@ -1775,6 +1793,13 @@ impl AppDb {
 
     pub async fn person_avatars(&self) -> Result<Vec<(String, String)>> {
         Ok(sqlx::query_as("SELECT service_id, path FROM person_avatars").fetch_all(&self.pool).await?)
+    }
+
+    /// Every group chat's id, archived ones included.
+    pub async fn group_conversation_ids(&self) -> Result<Vec<ConversationId>> {
+        let ids: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM conversations WHERE id LIKE 'g:%'").fetch_all(&self.pool).await?;
+        Ok(ids.into_iter().map(ConversationId).collect())
     }
 
     /// Pinned first, then by `last_message_at` descending. Excludes archived.

@@ -287,7 +287,7 @@ async fn delete_edit_attachments_and_search() {
         sticker_pack: None,
         transcode: false,
     }];
-    m.quote = Some(Quote { author: None, author_name: "You".into(), sent_at: 0, text: "q".into(), thumbnail: None, attachment: None, story: false });
+    m.quote = Some(Quote { author: None, author_name: "You".into(), sent_at: 0, text: "q".into(), thumbnail: None, attachment: None, story: false, private_reply: None });
     let id = db.insert_message(&m).await.unwrap();
     let id2 = db.insert_message(&incoming("d:b", "b", 2, "Crème brûlée foxes")).await.unwrap();
 
@@ -818,7 +818,7 @@ async fn rename_authors_updates_messages_and_quotes() {
     first.author_name = None;
     let first = db.insert_message(&first).await.unwrap();
     let mut reply = incoming("g:01", "amy", 2, "re");
-    reply.quote = Some(Quote { author: Some("jon".into()), author_name: "jon".into(), sent_at: 1, text: "hi".into(), thumbnail: None, attachment: None, story: false });
+    reply.quote = Some(Quote { author: Some("jon".into()), author_name: "jon".into(), sent_at: 1, text: "hi".into(), thumbnail: None, attachment: None, story: false, private_reply: None });
     let reply = db.insert_message(&reply).await.unwrap();
 
     let mut authors = db.message_authors().await.unwrap();
@@ -2933,6 +2933,7 @@ async fn unread_reminders_find_who_wrote_mentioned_and_replied() {
         thumbnail: None,
         attachment: None,
         story: false,
+        private_reply: None,
     };
     // received_at is sent_at + 5.
     db.insert_message(&incoming("g:aa", "alice", 100, "hi")).await.unwrap();
@@ -3440,4 +3441,42 @@ async fn a_scheduled_message_with_unreadable_extras_is_listed_but_not_taken() {
     // Sent without its mentions it would show the placeholder: it stays.
     assert!(db.take_scheduled_message(id, dir.path()).await.is_err());
     assert_eq!(db.scheduled_messages().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_private_replys_group_is_kept_with_its_quote() {
+    let db = test_db().await;
+    let group = conv("g:aa");
+    let reply = PrivateReply { group_id: Some("bb".into()), group: Some(group.clone()) };
+    let quote = Quote {
+        author: None,
+        author_name: "You".into(),
+        sent_at: 1,
+        text: "in the group".into(),
+        thumbnail: None,
+        attachment: None,
+        story: false,
+        private_reply: Some(reply.clone()),
+    };
+    let id = db.insert_message(&NewMessage { quote: Some(quote), ..incoming("d:a", "a", 10, "between us") }).await.unwrap();
+    assert_eq!(db.message(id).await.unwrap().unwrap().quote.unwrap().private_reply, Some(reply));
+    // Quotes stored before private replies read as ordinary ones.
+    let old: Quote = serde_json::from_str(r#"{"author":null,"author_name":"You","sent_at":1,"text":"q"}"#).unwrap();
+    assert_eq!(old.private_reply, None);
+    // A backup's unknown group is kept as such.
+    let unknown = Quote { private_reply: Some(PrivateReply::default()), ..old };
+    let json = serde_json::to_string(&unknown).unwrap();
+    assert_eq!(serde_json::from_str::<Quote>(&json).unwrap().private_reply, Some(PrivateReply::default()));
+}
+
+#[tokio::test]
+async fn group_conversation_ids_include_archived_groups() {
+    let db = test_db().await;
+    db.insert_message(&incoming("g:aa", "a", 1, "hi")).await.unwrap();
+    db.insert_message(&incoming("g:bb", "a", 2, "hi")).await.unwrap();
+    db.insert_message(&incoming("d:a", "a", 3, "hi")).await.unwrap();
+    db.set_archived(&conv("g:bb"), true).await.unwrap();
+    let mut ids = db.group_conversation_ids().await.unwrap();
+    ids.sort();
+    assert_eq!(ids, [conv("g:aa"), conv("g:bb")]);
 }

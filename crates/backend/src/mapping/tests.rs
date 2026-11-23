@@ -1794,3 +1794,68 @@ fn stickers_name_their_pack_and_syncs_install_packs() {
         "{actions:?}"
     );
 }
+
+/// A private reply: a quote naming the group its message is in.
+fn private_reply(author: &str, group_id: Vec<u8>) -> DataMessage {
+    DataMessage {
+        quote: Some(data_message::Quote {
+            id: Some(42),
+            author_aci: Some(author.into()),
+            text: Some("in the group".into()),
+            group_id: Some(group_id),
+            ..Default::default()
+        }),
+        ..text("just between us", 100)
+    }
+}
+
+fn quote_of(actions: &[Action]) -> Option<&signal_store::Quote> {
+    let [Action::Insert { message, .. }] = actions else { panic!("{actions:?}") };
+    message.quote.as_ref()
+}
+
+#[test]
+fn a_private_reply_to_us_keeps_its_group() {
+    let actions = map_data_message(&private_reply(ME, vec![9; 32]), Origin::Incoming { sender: ALICE.into() }, 100, &ctx());
+    let quote = quote_of(&actions).expect("kept");
+    assert_eq!((quote.author.as_deref(), quote.sent_at), (None, 42));
+    assert_eq!(
+        quote.private_reply,
+        Some(signal_store::PrivateReply { group_id: Some(hex::encode([9; 32])), group: None })
+    );
+    // An empty group id is no group: an ordinary quote.
+    let actions = map_data_message(&private_reply(ME, Vec::new()), Origin::Incoming { sender: ALICE.into() }, 100, &ctx());
+    assert_eq!(quote_of(&actions).map(|q| q.private_reply.is_none()), Some(true));
+}
+
+#[test]
+fn a_private_reply_quoting_someone_else_loses_its_quote() {
+    // Theirs must quote us (Desktop's `handleDataMessage`); the message stays.
+    let actions = map_data_message(&private_reply(BOB, vec![9; 32]), Origin::Incoming { sender: ALICE.into() }, 100, &ctx());
+    assert!(quote_of(&actions).is_none());
+    let actions = map_data_message(&private_reply(ALICE, vec![9; 32]), Origin::Incoming { sender: ALICE.into() }, 100, &ctx());
+    assert!(quote_of(&actions).is_none());
+}
+
+#[test]
+fn our_private_reply_from_another_device_quotes_them() {
+    let ours = |author: &str| {
+        map_data_message(&private_reply(author, vec![9; 32]), Origin::Outgoing { destination: Some(ALICE.into()) }, 100, &ctx())
+    };
+    let actions = ours(ALICE);
+    let quote = quote_of(&actions).expect("kept");
+    assert_eq!(quote.author.as_deref(), Some(ALICE));
+    assert!(quote.private_reply.is_some());
+    // Not us, not anyone else.
+    assert!(quote_of(&ours(ME)).is_none());
+    assert!(quote_of(&ours(BOB)).is_none());
+}
+
+#[test]
+fn a_private_reply_in_a_group_loses_its_quote() {
+    let mut dm = private_reply(ME, vec![9; 32]);
+    dm.group_v2 = Some(GroupContextV2 { master_key: Some(group_key()), revision: Some(3), ..Default::default() });
+    let actions = map_data_message(&dm, Origin::Incoming { sender: ALICE.into() }, 100, &ctx());
+    let [Action::Insert { message, .. }] = actions.as_slice() else { panic!("{actions:?}") };
+    assert_eq!((message.body.as_str(), message.quote.is_none()), ("just between us", true));
+}

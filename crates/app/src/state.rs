@@ -279,6 +279,9 @@ pub struct AppState {
     pub archived: Vec<Conversation>,
     /// A message to show when its chat's view opens (from search).
     jump: Option<(ConversationId, i64)>,
+    /// Group chats' identifiers (hex), each worked out once: the key a
+    /// private reply's quote finds its group by.
+    group_identifiers: std::cell::RefCell<HashMap<ConversationId, String>>,
     /// Downloaded profile photos by service id.
     person_avatars: HashMap<String, std::path::PathBuf>,
     /// People whose photo wasn't downloaded because we haven't accepted
@@ -569,6 +572,7 @@ impl AppState {
             contact_avatars: HashMap::new(),
             contact_sync: ContactSync::Idle,
             jump: None,
+            group_identifiers: Default::default(),
             selected: None,
             typing: HashMap::new(),
             emoji_usage: EmojiUsageCache::default(),
@@ -1674,6 +1678,21 @@ impl AppState {
 
     pub fn conversation(&self, id: &ConversationId) -> Option<&Conversation> {
         self.conversations.iter().chain(&self.archived).find(|c| &c.id == id)
+    }
+
+    /// The group chat a private reply names: the one the backend found when
+    /// the reply arrived, or else one with that identifier we have now
+    /// (Desktop looks the group up each time it shows the quote).
+    pub fn private_reply_group(&self, reply: &signal_store::PrivateReply) -> Option<&Conversation> {
+        if let Some(group) = reply.group.as_ref().and_then(|id| self.conversation(id)) {
+            return Some(group);
+        }
+        let wanted = reply.group_id.as_deref()?;
+        let mut ids = self.group_identifiers.borrow_mut();
+        self.conversations.iter().chain(&self.archived).filter(|c| c.id.as_group().is_some()).find(|c| {
+            let id = ids.entry(c.id.clone()).or_insert_with(|| signal_backend::group_identifier_hex(&c.id).unwrap_or_default());
+            id == wanted
+        })
     }
 
     fn load_settings(&mut self, cx: &mut Context<Self>) {

@@ -183,6 +183,7 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
         thumbnail,
         attachment: message.attachments.first().map(signal_store::QuotedAttachment::of),
         story: false,
+        private_reply: None,
     };
     let react = |emoji: &str, from: Option<&str>| Reaction { emoji: emoji.into(), author: from.map(|f| aci(f).into()), sent_at: now };
 
@@ -244,7 +245,8 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
         image: image("demo-preview-wide.png", 600, 315),
     });
     db.insert_message(&trail).await?;
-    db.insert_message(&incoming(GROUP, JORDAN, y + 21 * MINUTE, "Ridge loop. The lake trail was pure mud last time")).await?;
+    let mud = incoming(GROUP, JORDAN, y + 21 * MINUTE, "Ridge loop. The lake trail was pure mud last time");
+    db.insert_message(&mud).await?;
     // Signal's formatting: one of each style.
     let pack = "Pack list: water, layers, snacks. Gate code is 4417. Best part is the surprise at the top";
     let pack_id = db.insert_message(&incoming(GROUP, PRIYA, y + 30 * MINUTE, pack)).await?;
@@ -446,6 +448,20 @@ async fn seed(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
         db.insert_message(&gif).await?;
     }
     db.insert_message(&incoming(JORDAN, JORDAN, now - 4 * DAY + 13 * MINUTE, "You're the best 🙏")).await?;
+    // A private reply to his message in the hiking group: its quote names
+    // the group.
+    let mut aside = outgoing(JORDAN, y + 23 * MINUTE, "Your boots still haven't recovered, have they?", DeliveryStatus::Read);
+    aside.quote = Some(Quote {
+        private_reply: Some(signal_store::PrivateReply {
+            group_id: ConversationId(GROUP.into())
+                .as_group()
+                .and_then(|key| key.try_into().ok())
+                .map(|key| hex::encode(crate::groups::group_identifier(key))),
+            group: Some(ConversationId(GROUP.into())),
+        }),
+        ..quote_of(&mud, None)
+    });
+    db.insert_message(&aside).await?;
     db.mark_read(&ConversationId(JORDAN.into())).await?;
     db.set_draft(&ConversationId(JORDAN.into()), Some("No rush on the tent, I won't need it until")).await?;
 
@@ -1277,6 +1293,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
                         thumbnail: m.thumbnail(),
                         attachment: m.attachments.first().map(signal_store::QuotedAttachment::of),
                         story: false,
+                        private_reply: None,
                     }),
                     None => None,
                 };
@@ -2805,6 +2822,7 @@ async fn demo_quote(db: &AppDb, quote: Option<i64>) -> Option<Quote> {
         thumbnail: m.thumbnail(),
         attachment: m.attachments.first().map(signal_store::QuotedAttachment::of),
         story: false,
+        private_reply: None,
     })
 }
 

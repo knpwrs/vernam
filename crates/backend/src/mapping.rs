@@ -795,6 +795,30 @@ fn other(id: Option<String>, ctx: &MapContext) -> Option<String> {
     id.filter(|id| id != ctx.self_aci)
 }
 
+/// Whether a quote may stay on the message: one naming a group (a private
+/// reply) only in a 1:1 chat, quoting us when it's theirs or them when it's
+/// ours from another device. Desktop drops any other such quote and keeps
+/// the message (`handleDataMessage`).
+fn private_reply_allowed(quote: &data_message::Quote, conversation: &ConversationId, origin: &Origin, ctx: &MapContext) -> bool {
+    if quote.group_id.as_deref().is_none_or(<[u8]>::is_empty) {
+        return true;
+    }
+    let Some(with) = conversation.as_direct() else {
+        tracing::warn!("dropping a quote with a group id outside a 1:1 chat");
+        return false;
+    };
+    let expected = match origin {
+        Origin::Incoming { .. } => ctx.self_aci,
+        Origin::Outgoing { .. } => with,
+    };
+    let author = aci_string(quote.parse_author_aci());
+    if author.as_deref() != Some(expected) {
+        tracing::warn!("dropping a quote with a group id from the wrong author");
+        return false;
+    }
+    true
+}
+
 pub fn map_content(content: &Content, ctx: &MapContext) -> Vec<Action> {
     let sender = content.metadata.sender.service_id_string();
     let envelope_ts = content.metadata.client_timestamp.timestamp_millis();
@@ -1257,7 +1281,8 @@ fn map_data_message(dm: &DataMessage, origin: Origin, ts: i64, ctx: &MapContext)
         return Vec::new();
     }
 
-    let quote = dm.quote.as_ref().filter(|_| view_once.is_none()).and_then(|q| {
+    let quote = dm.quote.as_ref().filter(|_| view_once.is_none()).filter(|q| private_reply_allowed(q, &conversation, &origin, ctx));
+    let quote = quote.and_then(|q| {
         Some(Quote {
             author: other(aci_string(q.parse_author_aci()), ctx),
             author_name: String::new(),
@@ -1275,6 +1300,12 @@ fn map_data_message(dm: &DataMessage, origin: Origin, ts: i64, ctx: &MapContext)
                 ..Default::default()
             }),
             story: false,
+            // Its group's chat is found when it's stored.
+            private_reply: q
+                .group_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .map(|id| signal_store::PrivateReply { group_id: Some(hex::encode(id)), group: None }),
         })
     });
 
@@ -1688,6 +1719,7 @@ fn map_story_reply(
                 thumbnail: None,
                 attachment: None,
                 story: true,
+                private_reply: None,
             }),
             attachments: Vec::new(),
             link_preview: None,

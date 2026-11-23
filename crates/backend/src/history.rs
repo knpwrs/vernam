@@ -974,6 +974,7 @@ async fn import_item(
                         })
                     },
                     story: false,
+                    private_reply: None,
                 })
             });
             let message = NewMessage {

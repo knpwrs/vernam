@@ -1643,8 +1643,20 @@ impl Actor {
                         }
                     } else
                     // Like Desktop, show the quoted message's photo or link
-                    // preview image beside the quote when we have it.
-                    if let Ok(Some(quoted)) = self.db.find_message_any(quote.author.as_deref(), quote.sent_at).await {
+                    // preview image beside the quote when we have it. It's
+                    // looked for where it was sent (Desktop's `isQuoteAMatch`):
+                    // this chat, or a private reply's group.
+                    if let Some(chat) = match &mut quote.private_reply {
+                        Some(reply) => {
+                            reply.group = match &reply.group_id {
+                                Some(id) => self.group_for_identifier(id).await,
+                                None => None,
+                            };
+                            reply.group.clone()
+                        }
+                        None => Some(message.conversation_id.clone()),
+                    } && let Ok(Some(quoted)) = self.db.find_message(&chat, quote.author.as_deref(), quote.sent_at).await
+                    {
                         quote.thumbnail = quoted.thumbnail();
                         // Ours knows what the wire doesn't: a voice message,
                         // or a view-once message, which says only that
@@ -4162,17 +4174,41 @@ impl Actor {
         self.sync_delete(delete);
     }
 
+    /// Our chat for the group a private reply names (its identifier, hex):
+    /// one we have a chat for, or one in presage's store.
+    async fn group_for_identifier(&self, id_hex: &str) -> Option<ConversationId> {
+        let id = hex::decode(id_hex).ok()?;
+        if let Some(key) = self.group_ids.borrow().get(&id) {
+            return Some(ConversationId::group(key));
+        }
+        let mut keys: Vec<[u8; 32]> = match self.store.groups().await {
+            Ok(groups) => groups.flatten().map(|(key, _)| key).collect(),
+            Err(_) => Vec::new(),
+        };
+        let chats = self.db.group_conversation_ids().await.unwrap_or_default();
+        keys.extend(chats.iter().filter_map(|c| <[u8; 32]>::try_from(c.as_group()?).ok()));
+        self.learn_group_ids(keys);
+        self.group_ids.borrow().get(&id).map(|key| ConversationId::group(key))
+    }
+
     async fn group_for_id(&self, manager: &SignalManager, id: &[u8]) -> Option<[u8; 32]> {
         if let Some(key) = self.group_ids.borrow().get(id) {
             return Some(*key);
         }
         let groups = manager.store().groups().await.ok()?;
+        self.learn_group_ids(groups.flatten().map(|(key, _)| key).collect());
+        self.group_ids.borrow().get(id).copied()
+    }
+
+    /// Adds groups' identifiers to `group_ids`, working out only those of
+    /// keys it doesn't have yet: an identifier nobody's group has (a private
+    /// reply can name any) costs a scan, not a derivation per group.
+    fn learn_group_ids(&self, keys: Vec<[u8; 32]>) {
         let mut map = self.group_ids.borrow_mut();
-        for (key, _) in groups.flatten() {
-            let params = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(key));
-            map.insert(params.get_group_identifier().to_vec(), key);
+        let known: std::collections::HashSet<[u8; 32]> = map.values().copied().collect();
+        for key in keys.into_iter().filter(|k| !known.contains(k)) {
+            map.insert(crate::groups::group_identifier(key), key);
         }
-        map.get(id).copied()
     }
 
     // ---------------------------------------------------------------- sending
@@ -4516,6 +4552,7 @@ impl Actor {
             thumbnail: m.thumbnail(),
             attachment: quoted_attachment(m),
             story: false,
+            private_reply: None,
         });
 
         let expire_timer = self

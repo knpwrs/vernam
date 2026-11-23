@@ -648,14 +648,22 @@ impl ConversationView {
     /// Shows the message `author` sent at `sent_at` (from a pin notice or a
     /// quote), saying `missing` if we don't have it.
     fn go_to(&mut self, author: Option<String>, sent_at: i64, missing: &'static str, cx: &mut Context<Self>) {
+        self.go_to_in(self.id.clone(), author, sent_at, missing, cx);
+    }
+
+    /// [`go_to`](Self::go_to) in `chat`, which opens if it isn't this one
+    /// (a private reply's quote of a group message, Desktop's
+    /// `scrollToQuotedMessage` with `showConversation`).
+    fn go_to_in(&mut self, chat: ConversationId, author: Option<String>, sent_at: i64, missing: &'static str, cx: &mut Context<Self>) {
         let backend = self.state.read(cx).backend.clone();
         let db = backend.db().clone();
-        let id = self.id.clone();
+        let id = chat.clone();
         let query = backend.spawn(async move { db.find_message(&id, author.as_deref(), sent_at).await });
         cx.spawn(async move |this, cx| {
             let found = query.await.ok().flatten();
             let _ = this.update(cx, |this, cx| match found {
-                Some(message) => this.load_around(message.id, cx),
+                Some(message) if chat == this.id => this.load_around(message.id, cx),
+                Some(message) => this.state.update(cx, |state, cx| state.jump_to(chat, message.id, cx)),
                 None => this.state.update(cx, |state, cx| state.report_error(missing.to_owned(), cx)),
             });
         })
@@ -4549,23 +4557,46 @@ impl ConversationView {
         let (author, sent_at) = (quote.author.clone(), quote.sent_at);
         let dark = gpui_kit::component::ActiveTheme::theme(&**cx).is_dark();
         let colors = crate::chat_color::quote(self.state.read(cx).bubble_fill(&self.id), outgoing, dark);
+        // A private reply's quote is of a message in a group: shown in that
+        // group, or Desktop's toast when we don't know the group
+        // (`ToastType.OriginalMessageAndGroupNotFound`).
+        let (chat, group_title) = match &quote.private_reply {
+            None => (Some(self.id.clone()), None),
+            Some(reply) => {
+                let group = self.state.read(cx).private_reply_group(reply);
+                (group.map(|g| g.id.clone()), Some(group.map(|g| g.title.clone())))
+            }
+        };
         div()
             .id(("quote", message_id as u64))
             .debug_selector(move || format!("quote-{message_id}"))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
-                // Desktop's toast when it's gone (`icu:originalMessageNotFound`).
-                this.go_to(author.clone(), sent_at, "Original message not found", cx);
+                match &chat {
+                    // Desktop's toast when it's gone (`icu:originalMessageNotFound`).
+                    Some(chat) => this.go_to_in(chat.clone(), author.clone(), sent_at, "Original message not found", cx),
+                    None => this.state.update(cx, |state, cx| state.report_error("Original message and group not found", cx)),
+                }
             }))
-            .child(render_quote(quote, colors, palette))
+            .child(render_quote(quote, group_title, colors, palette))
+    }
+}
+
+/// A quote's author line: theirs, and for a private reply the group's
+/// title or "Unknown group" (Desktop's `Quote`, commit 98032f98).
+fn quote_author_line(quote: &signal_store::Quote, group_title: Option<Option<String>>) -> String {
+    let author = if quote.author.is_none() { "You".to_string() } else { quote.author_name.clone() };
+    match group_title {
+        None => author,
+        Some(title) => format!("{author} \u{b7} {}", title.unwrap_or_else(|| "Unknown group".into())),
     }
 }
 
 /// `(fill, border)`: the quote's colors from `chat_color::quote`. Its text
 /// is Desktop's gray-90 or gray-05 whichever way it faces, which
 /// `palette.text` is.
-fn render_quote(quote: signal_store::Quote, (fill, border): (crate::chat_color::BubbleFill, Hsla), palette: Palette) -> impl IntoElement {
+fn render_quote(quote: signal_store::Quote, group_title: Option<Option<String>>, (fill, border): (crate::chat_color::BubbleFill, Hsla), palette: Palette) -> impl IntoElement {
     let fg = palette.text;
     // A column with a left border, not a row with a bar beside the text: in a
     // flex row the text is measured unwrapped and would widen the bubble past
@@ -4617,7 +4648,7 @@ fn render_quote(quote: signal_store::Quote, (fill, border): (crate::chat_color::
             div()
                 .text_sm()
                 .font_weight(FontWeight::SEMIBOLD)
-                .child(if quote.author.is_none() { "You".to_string() } else { quote.author_name }),
+                .child(quote_author_line(&quote, group_title)),
         )
         .map(|d| match label {
             Some(label) => d.child(div().text_sm().italic().truncate().child(label)),
@@ -7234,6 +7265,7 @@ mod tests {
                 thumbnail: None,
                 attachment: None,
                 story: false,
+                private_reply: None,
             });
             Ok::<_, signal_store::Error>((quoted, db.insert_message(&reply).await?))
         }))
@@ -8731,6 +8763,139 @@ mod tests {
         block(&mut cx, false);
         cx.executor().advance_clock(crate::scheduled::MAX_WAIT * 2);
         wait_sent(&mut cx, &backend, "while blocked");
+        backend.shutdown();
+    }
+
+    const JORDAN: &str = "d:00000000-0000-4000-8000-0000000000b0";
+    /// Jordan's message in the demo's hiking group, which we replied to
+    /// privately in his chat.
+    const JORDAN_IN_GROUP: &str = "Ridge loop. The lake trail was pure mud last time";
+
+    /// Waits for the state to have read the chats, the group among them.
+    fn chats_loaded(cx: &mut VisualTestContext, state: &Entity<AppState>) {
+        state.update(cx, |state, cx| state.handle(signal_backend::Event::ConversationsChanged, cx));
+        for _ in 0..300 {
+            cx.run_until_parked();
+            if state.read_with(cx, |s, _| s.conversation(&ConversationId(GROUP.into())).is_some()) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("chats never loaded");
+    }
+
+    #[test]
+    fn a_private_replys_quote_names_its_group() {
+        let quote = signal_store::Quote {
+            author: Some("jordan".into()),
+            author_name: "Jordan Reyes".into(),
+            sent_at: 1,
+            text: "in the group".into(),
+            thumbnail: None,
+            attachment: None,
+            story: false,
+            private_reply: None,
+        };
+        assert_eq!(quote_author_line(&quote, None), "Jordan Reyes");
+        assert_eq!(quote_author_line(&quote, Some(Some("Hikers".into()))), "Jordan Reyes \u{b7} Hikers");
+        // Desktop's `icu:Quote__unknown-group`.
+        assert_eq!(quote_author_line(&quote, Some(None)), "Jordan Reyes \u{b7} Unknown group");
+        let ours = signal_store::Quote { author: None, ..quote };
+        assert_eq!(quote_author_line(&ours, Some(Some("Hikers".into()))), "You \u{b7} Hikers");
+    }
+
+    #[gpui_kit::test]
+    fn clicking_a_private_replys_quote_opens_the_group_at_it(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        let quoted = wait_for_messages(&backend, GROUP, 1, |m| m.body == JORDAN_IN_GROUP).remove(0);
+        let reply = wait_for_messages(&backend, JORDAN, 1, |m| m.quote.as_ref().is_some_and(|q| q.private_reply.is_some())).remove(0);
+        let private = reply.quote.as_ref().and_then(|q| q.private_reply.clone()).unwrap();
+        assert_eq!(private.group, Some(ConversationId(GROUP.into())));
+        let (mut cx, view) = open_view(cx, &backend, JORDAN);
+        let state = view.read_with(&cx, |v, _| v.state.clone());
+        chats_loaded(&mut cx, &state);
+        let quote = bounds(&mut cx, format!("quote-{}", reply.id));
+        cx.simulate_click(quote.center(), gpui_kit::Modifiers::none());
+        for _ in 0..300 {
+            cx.run_until_parked();
+            if state.read_with(&cx, |s, _| s.selected.clone()) == Some(ConversationId(GROUP.into())) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(state.read_with(&cx, |s, _| s.selected.clone()), Some(ConversationId(GROUP.into())));
+        let jump = state.update(&mut cx, |s, _| s.take_jump(&ConversationId(GROUP.into())));
+        assert_eq!(jump, Some(quoted.id));
+        backend.shutdown();
+    }
+
+    #[gpui_kit::test]
+    fn a_private_reply_whose_group_is_unknown_says_so(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        wait_for_messages(&backend, JORDAN, 1, |m| m.quote.as_ref().is_some_and(|q| q.private_reply.is_some()));
+        let db = backend.db().clone();
+        let reply = futures::executor::block_on(backend.spawn(async move {
+            let at = chrono::Utc::now().timestamp_millis();
+            let message = signal_store::NewMessage {
+                conversation_id: ConversationId(JORDAN.into()),
+                sent_at: at,
+                received_at: at,
+                direction: Direction::Incoming,
+                author: Some(JORDAN.trim_start_matches("d:").into()),
+                author_name: Some("Jordan Reyes".into()),
+                body: "about what you said".into(),
+                status: DeliveryStatus::Read,
+                quote: Some(signal_store::Quote {
+                    author: None,
+                    author_name: "You".into(),
+                    sent_at: 5,
+                    text: "in a group we don't know".into(),
+                    thumbnail: None,
+                    attachment: None,
+                    story: false,
+                    // A transferred backup's `unknownPrivateReply`.
+                    private_reply: Some(signal_store::PrivateReply::default()),
+                }),
+                attachments: vec![],
+                link_preview: None,
+                expires_in: 0,
+            };
+            db.insert_message(&message).await
+        }))
+        .unwrap();
+        let (mut cx, view) = open_view(cx, &backend, JORDAN);
+        let state = view.read_with(&cx, |v, _| v.state.clone());
+        let quote = bounds(&mut cx, format!("quote-{reply}"));
+        cx.simulate_click(quote.center(), gpui_kit::Modifiers::none());
+        for _ in 0..300 {
+            cx.run_until_parked();
+            if state.read_with(&cx, |s, _| s.last_error.is_some()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(state.read_with(&cx, |s, _| s.last_error.clone()).as_deref(), Some("Original message and group not found"));
+        assert_eq!(state.read_with(&cx, |s, _| s.selected.clone()), None, "nothing opened");
+        backend.shutdown();
+    }
+
+    /// A private reply stored before its group was known finds the group
+    /// once we have it, by its identifier.
+    #[gpui_kit::test]
+    fn a_private_replys_group_is_found_once_known(cx: &mut TestAppContext) {
+        let (backend, _dir) = demo_backend(cx);
+        // The demo has seeded the group.
+        wait_for_messages(&backend, GROUP, 1, |m| m.body == JORDAN_IN_GROUP);
+        let (mut cx, view) = open_view(cx, &backend, JORDAN);
+        let state = view.read_with(&cx, |v, _| v.state.clone());
+        let group = ConversationId(GROUP.into());
+        let reply = signal_store::PrivateReply { group_id: signal_backend::group_identifier_hex(&group), group: None };
+        chats_loaded(&mut cx, &state);
+        let found = state.read_with(&cx, |s, _| s.private_reply_group(&reply).map(|c| c.id.clone()));
+        assert_eq!(found, Some(group.clone()));
+        let stranger = signal_store::PrivateReply { group_id: Some("00".repeat(32)), group: None };
+        assert_eq!(state.read_with(&cx, |s, _| s.private_reply_group(&stranger).map(|c| c.id.clone())), None);
+        assert_eq!(state.read_with(&cx, |s, _| s.private_reply_group(&signal_store::PrivateReply::default()).is_none()), true);
         backend.shutdown();
     }
 }

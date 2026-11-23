@@ -180,6 +180,13 @@ impl AccountSetting {
     }
 }
 
+/// A group chat's identifier, hex, as a private reply's quote names it
+/// (`Quote.groupId`); `None` for any other chat.
+pub fn group_identifier_hex(conversation: &ConversationId) -> Option<String> {
+    let key = <[u8; 32]>::try_from(conversation.as_group()?).ok()?;
+    Some(hex::encode(groups::group_identifier(key)))
+}
+
 /// Whether a stored setting that's off until set is on: only `"true"` is.
 pub fn setting_on(value: Option<&str>) -> bool {
     value == Some("true")

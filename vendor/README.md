@@ -187,6 +187,9 @@ this revision on 2026-11-05. Changes:
   (`aciBinary`, `nickname` as a `SignalNickname`, `note`), from Signal
   Desktop's `protos/SignalService.proto`, so a shared contact's Signal
   account, nickname and note can be shown.
+- `protobuf/SignalService.proto`: `DataMessage.Quote.groupId` (9), from
+  Signal Desktop's `protos/SignalService.proto` (commit 98032f98), the
+  group a private reply's quoted message is in.
 - `protobuf/StorageService.proto`: `InstalledStickerPackRecord` and its
   identifier and record type (6), from Signal Desktop's
   `protos/SignalStorage.proto`, for installed sticker packs.
