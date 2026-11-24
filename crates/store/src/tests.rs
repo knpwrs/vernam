@@ -3688,3 +3688,60 @@ async fn group_conversation_ids_include_archived_groups() {
     ids.sort();
     assert_eq!(ids, [conv("g:aa"), conv("g:bb")]);
 }
+
+#[tokio::test]
+async fn new_chat_lists_people_we_trust_as_desktop_does() {
+    let db = test_db().await;
+    let direct = |title: &str| ConversationUpdate { kind: Some(ConversationKind::Direct), title: Some(title.into()), ..Default::default() };
+    // Note to Self.
+    db.upsert_conversation(&conv("d:me"), ConversationUpdate { kind: Some(ConversationKind::NoteToSelf), title: Some("Note to Self".into()), ..Default::default() })
+        .await
+        .unwrap();
+    // In the address book, with a chat.
+    db.upsert_conversation(&conv("d:ana"), direct("Ana")).await.unwrap();
+    // We share our profile with them.
+    db.upsert_conversation(&conv("d:ben"), direct("Ben")).await.unwrap();
+    db.set_profile_sharing(&conv("d:ben"), true).await.unwrap();
+    // In a group we're in, and in one we left.
+    db.upsert_conversation(&conv("d:cal"), direct("Cal")).await.unwrap();
+    db.upsert_conversation(&conv("d:dee"), direct("Dee")).await.unwrap();
+    let group = |members: &[&str]| ConversationUpdate {
+        kind: Some(ConversationKind::Group),
+        title: Some("Hikers".into()),
+        members: Some(members.iter().map(|m| (*m).to_owned()).collect()),
+        ..Default::default()
+    };
+    db.upsert_conversation(&conv("g:aa"), group(&["me", "cal"])).await.unwrap();
+    db.upsert_conversation(&conv("g:bb"), group(&["dee"])).await.unwrap();
+    db.set_left(&conv("g:bb"), true).await.unwrap();
+    // A stranger who messaged us, someone blocked, and the Signal chat.
+    db.upsert_conversation(&conv("d:eve"), direct("Eve")).await.unwrap();
+    db.upsert_conversation(&conv("d:fay"), direct("Fay")).await.unwrap();
+    db.set_profile_sharing(&conv("d:fay"), true).await.unwrap();
+    db.set_blocked(&conv("d:fay"), true).await.unwrap();
+    db.upsert_conversation(&ConversationId::signal(), direct("Signal")).await.unwrap();
+    // In the address book without a chat, and a nameless entry.
+    db.replace_directory(&[
+        DirectoryEntry { id: conv("d:gus"), kind: ConversationKind::Direct, title: "Gus".into(), phone: Some("+15550100".into()) },
+        DirectoryEntry { id: conv("d:ana"), kind: ConversationKind::Direct, title: "Ana".into(), phone: None },
+    ])
+    .await
+    .unwrap();
+    db.replace_system_contacts(&["ana".into(), "gus".into()]).await.unwrap();
+    db.save_fetched_profile(
+        "ben",
+        &FetchedProfile { given_name: "Benjamin".into(), about: "Out hiking".into(), about_emoji: "🥾".into(), ..Default::default() },
+        1,
+    )
+    .await
+    .unwrap();
+    let mut found = db.compose_contacts("me").await.unwrap();
+    found.sort_by(|a, b| a.title.cmp(&b.title));
+    let names: Vec<&str> = found.iter().map(|c| c.title.as_str()).collect();
+    assert_eq!(names, ["Ana", "Ben", "Cal", "Gus", "Note to Self"], "no stranger, blocked, left-group-only or Signal");
+    let by = |name: &str| found.iter().find(|c| c.title == name).unwrap();
+    assert!(by("Ana").system_contact && by("Gus").system_contact && !by("Ben").system_contact);
+    assert!(by("Note to Self").me);
+    assert_eq!((by("Ben").about.as_str(), by("Ben").about_emoji.as_str(), by("Ben").profile_given.as_str()), ("Out hiking", "🥾", "Benjamin"));
+    assert_eq!(by("Gus").phone.as_deref(), Some("+15550100"));
+}
