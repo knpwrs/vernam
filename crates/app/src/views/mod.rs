@@ -9,6 +9,7 @@ pub mod challenge;
 pub mod chat_settings;
 pub mod collapse;
 pub mod common;
+pub mod compose;
 pub mod composer;
 pub mod contact;
 pub mod conversation;

@@ -44,6 +44,9 @@ unicode-linebreak = "0.1"
 # Avatar initials keep letters and split at separators, as Desktop's
 # getInitials does with \p{L} and \p{Z}.
 unicode-properties = { version = "0.1", default-features = false, features = ["general-category"] }
+# "New chat" searches names without their diacritics, as Desktop's
+# toSearchableTokens does (NFD).
+unicode-normalization = "0.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"

@@ -88,6 +88,8 @@ pub struct Sidebar {
     /// Desktop's narrow left pane: avatars only (set by the root view from
     /// the width).
     pub narrow: bool,
+    /// "New chat", in place of the chat list while it's open.
+    compose: Option<Compose>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -98,6 +100,13 @@ pub enum SidebarEvent {
 }
 
 impl gpui_kit::EventEmitter<SidebarEvent> for Sidebar {}
+
+/// "New chat", open in place of the chat list, and its search field.
+struct Compose {
+    view: Entity<crate::views::compose::Compose>,
+    search: Entity<InputState>,
+    _subscription: Subscription,
+}
 
 /// The search box while it's searching one chat. It has its own input, for
 /// its "Search chat" placeholder.
@@ -192,6 +201,7 @@ impl Sidebar {
             chat_search: None,
             hits_scroll: gpui_kit::ScrollHandle::new(),
             narrow: false,
+            compose: None,
             _subscriptions: subscriptions,
         }
     }
@@ -200,7 +210,40 @@ impl Sidebar {
     /// Searching or the archive need names to read (Desktop's
     /// `requiresFullWidth`).
     pub fn requires_full_width(&self) -> bool {
-        !self.query.is_empty() || self.chat_search.is_some() || self.archive_open
+        !self.query.is_empty() || self.chat_search.is_some() || self.archive_open || self.compose.is_some()
+    }
+
+    /// "New chat", while it's open.
+    #[cfg(test)]
+    pub(crate) fn compose(&self) -> Option<Entity<crate::views::compose::Compose>> {
+        self.compose.as_ref().map(|compose| compose.view.clone())
+    }
+
+    /// Opens "New chat" (Desktop's `startComposing`), from the inbox or the
+    /// archive; the inbox's search stays for when it closes.
+    pub fn open_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::views::compose::ComposeEvent;
+        if let Some(compose) = &self.compose {
+            compose.search.update(cx, |search, cx| search.focus(window, cx));
+            return;
+        }
+        cx.emit(SidebarEvent::Expand);
+        let compose = cx.new(|cx| crate::views::compose::Compose::new(self.state.clone(), window, cx));
+        let subscription = cx.subscribe_in(&compose, window, |this, _, event: &ComposeEvent, window, cx| {
+            let archived = matches!(event, ComposeEvent::Opened { archived: true });
+            this.compose = None;
+            // Desktop leaves the archive for the inbox, unless the chat
+            // picked is archived.
+            this.set_archive_open(archived, cx);
+            if let ComposeEvent::Close = event {
+                let search = this.search_input();
+                search.update(cx, |search, cx| search.focus(window, cx));
+            }
+            cx.notify();
+        });
+        let search = compose.read(cx).search_input();
+        self.compose = Some(Compose { view: compose, search, _subscription: subscription });
+        cx.notify();
     }
 
     /// The narrow sidebar's search button: widen, then search.
@@ -211,6 +254,10 @@ impl Sidebar {
     }
 
     pub fn search_input(&self) -> Entity<InputState> {
+        // "New chat"'s while it's open, which hides the others.
+        if let Some(compose) = &self.compose {
+            return compose.search.clone();
+        }
         match &self.chat_search {
             Some(search) => search.input.clone(),
             None => self.search.clone(),
@@ -505,8 +552,8 @@ impl Sidebar {
                 Button::new("new-group-button")
                     .ghost()
                     .icon(IconName::SquarePen)
-                    .tooltip("New group")
-                    .on_click(cx.listener(|this, _, window, cx| crate::views::new_group::open(this.state.clone(), window, cx))),
+                    .tooltip("New chat")
+                    .on_click(cx.listener(|this, _, window, cx| this.open_compose(window, cx))),
             )
             // Settings is on the tabs while they show.
             .when(collapsed, |d| {
@@ -913,9 +960,20 @@ impl Focusable for Sidebar {
 impl Render for Sidebar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = Palette::get(cx);
-        let narrow_header = self.narrow.then(|| self.render_narrow_header(palette, crate::views::common::title_bar_inset(_window), cx));
         let collapsed = self.state.read(cx).nav_collapsed;
         let inset = crate::views::common::title_bar_inset(_window);
+        // "New chat" takes the whole pane, header and all, as Desktop's
+        // composer does (`hideHeader`).
+        if let Some(compose) = &self.compose {
+            return div()
+                .size_full()
+                .bg(palette.sidebar)
+                .text_color(palette.text)
+                .when(collapsed, |d| d.pt(inset))
+                .child(compose.view.clone())
+                .into_any_element();
+        }
+        let narrow_header = self.narrow.then(|| self.render_narrow_header(palette, crate::views::common::title_bar_inset(_window), cx));
         let show_tabs = collapsed.then(|| crate::views::nav::show_tabs_button(&self.state, palette, cx));
         let state = self.state.read(cx);
         let connection = state.connection.clone();
@@ -981,10 +1039,8 @@ impl Render for Sidebar {
                                 .ghost()
                                 .small()
                                 .icon(IconName::SquarePen)
-                                .tooltip("New group")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    crate::views::new_group::open(this.state.clone(), window, cx);
-                                })),
+                                .tooltip("New chat")
+                                .on_click(cx.listener(|this, _, window, cx| this.open_compose(window, cx))),
                         )
                         // Settings is on the tabs while they show.
                         .when(collapsed, |d| {
@@ -1163,6 +1219,7 @@ impl Render for Sidebar {
                 )
             })
             .when(searching && self.hits.is_empty(), |d| d.child(div().flex_1()))
+            .into_any_element()
     }
 }
 

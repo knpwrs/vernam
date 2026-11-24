@@ -18,6 +18,7 @@ gpui_kit::assets::icon_assets!(
         BellOff,
         ChevronLeft,
         ChevronRight,
+        CircleUser,
         Hand,
         LayoutGrid,
         SquareUser,

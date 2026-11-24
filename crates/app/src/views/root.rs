@@ -416,10 +416,11 @@ impl RootView {
             }))
             // New chats start from the search box here (Desktop's compose
             // pane finds people by name, number or username the same way).
+            // Desktop's ⌘N opens "New chat" (`onStartComposingShortcut`).
             .on_action(cx.listener(|this, _: &StartNewChat, window, cx| {
                 if this.ready(cx) {
                     this.state.update(cx, |state, cx| state.set_tab(NavTab::Chats, cx));
-                    window.dispatch_action(Box::new(FocusSearch), cx);
+                    this.sidebar.update(cx, |sidebar, cx| sidebar.open_compose(window, cx));
                 }
             }))
             .on_action(cx.listener(|this, _: &FocusComposer, window, cx| {
