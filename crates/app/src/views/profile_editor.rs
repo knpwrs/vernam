@@ -399,19 +399,8 @@ impl ProfileEditor {
                     std::rc::Rc::new(move |size| crate::views::common::person_avatar(photo.as_deref(), &current_name, 0, px(size)));
                 let placeholder: crate::views::avatar_editor::CurrentView =
                     std::rc::Rc::new(move |size| crate::views::common::avatar(&name, 0, px(size)).into_any_element());
-                let saving = backend.clone();
-                let on_list = move |list: &[crate::avatar_data::AvatarData], cx: &mut App| {
-                    let json = serde_json::to_string(list).unwrap_or_default();
-                    let db = saving.db().clone();
-                    let write = saving.spawn(async move { db.set_setting(crate::avatar_data::OURS, &json).await });
-                    cx.background_executor()
-                        .spawn(async move {
-                            if let Err(error) = write.await {
-                                tracing::warn!(%error, "couldn't keep our saved photos");
-                            }
-                        })
-                        .detach();
-                };
+                let keep = crate::avatar_data::list_writer(backend.clone(), crate::avatar_data::OURS.to_owned());
+                let on_list = move |list: &[crate::avatar_data::AvatarData], _: &mut App| keep(list);
                 let has_current = profile.photo.is_some();
                 this.avatar = Some(cx.new(|cx| {
                     crate::views::avatar_editor::AvatarEditor::new("profile", list, None, has_current, current, placeholder, dir, on_list, cx)
@@ -823,14 +812,18 @@ impl ProfileEditor {
                     }
                 })),
             ),
-            Footer::Main { .. } => footer(
+            Footer::Main { drawing, .. } => footer(
                 Button::new("profile-cancel").label("Cancel").outline().on_click(cx.listener(|this, _, window, cx| this.back(window, cx))),
                 Button::new("profile-save")
                     .label("Save")
                     .primary()
-                    .disabled(save.is_none() || self.saving)
+                    // Not while a photo picked or made is still being drawn.
+                    .disabled(save.is_none() || self.saving || drawing)
                     .loading(self.saving)
                     .on_click(cx.listener(|this, _, _, cx| {
+                        if this.avatar.as_ref().is_some_and(|e| e.read(cx).drawing()) {
+                            return;
+                        }
                         if let Some(edit) = this.photo_changed(cx) {
                             // The photo chosen moves to the front of the list.
                             if let Some(editor) = this.avatar.clone() {

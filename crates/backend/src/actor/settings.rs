@@ -221,6 +221,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unlinking_deletes_the_editors_saved_photos_with_the_other_media() {
+        let wiped = super::super::wiped_dirs();
+        assert!(wiped.contains(&crate::AVATAR_DATA_DIR), "the avatar editor's uploads are unencrypted");
+        assert!(wiped.contains(&CONTACT_AVATARS_DIR));
+    }
+
+    #[test]
     fn contact_photos_are_named_after_their_contents() {
         let a = contact_avatar_name(b"photo one", "image/jpeg");
         assert!(a.ends_with(".jpg") && a.len() == 32 + 4, "{a}");

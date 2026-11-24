@@ -490,6 +490,7 @@ impl Compose {
         let current = group.avatar.clone();
         let this = cx.entity();
         let listing = cx.entity();
+        let dir = group.avatar_dir.clone();
         crate::views::avatar_editor::open_dialog(
             "Group Avatar",
             current,
@@ -497,11 +498,26 @@ impl Compose {
             group.avatar_dir.clone(),
             |size| crate::views::common::group_photo(None, "", 0, px(size)),
             move |list, cx| {
-                listing.update(cx, |this, _| {
-                    if let Some(group) = &mut this.group {
+                let kept = listing.update(cx, |this, _| match &mut this.group {
+                    Some(group) => {
                         group.avatars = list.to_vec();
+                        true
                     }
-                })
+                    None => false,
+                });
+                // The draft went while the dialog was open (its photos
+                // deleted with it): nothing keeps these either.
+                if !kept {
+                    let dir = dir.clone();
+                    let names: Vec<String> = list.iter().filter_map(|a| a.image.clone()).collect();
+                    cx.background_executor()
+                        .spawn(async move {
+                            for name in names {
+                                crate::avatar_data::remove_image(&dir, &name);
+                            }
+                        })
+                        .detach();
+                }
             },
             move |photo, _, cx| {
                 this.update(cx, |this, cx| {

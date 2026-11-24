@@ -156,8 +156,10 @@ const BUBBLE: f32 = 120.;
 /// Save each mode enables on its own changes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Footer {
-    /// Choosing the photo: Save once it differs from the current one.
-    Main { changed: bool },
+    /// Choosing the photo: Save once it differs from the current one, and
+    /// not while a photo picked or made is still being drawn (`drawing`):
+    /// the staged photo and the one ringed aren't the same yet.
+    Main { changed: bool, drawing: bool },
     /// Making a text photo or recoloring a preset: Save makes it.
     Sub { can_save: bool },
 }
@@ -180,6 +182,11 @@ pub struct AvatarEditor {
     placeholder: CurrentView,
     /// The pick or preset being waited on.
     latest: Latest,
+    /// The photo from the list the latest request is drawing (a pick, a
+    /// saved text photo), until it's staged; `None` for one of no photo in
+    /// the list yet (an upload, Remove). Set with every request, so it
+    /// never names one a newer request replaced.
+    pending_for: Option<AvatarData>,
     mode: Mode,
     /// Where uploaded photos are kept.
     dir: PathBuf,
@@ -211,6 +218,7 @@ impl AvatarEditor {
             current_view,
             placeholder,
             latest: Latest::default(),
+            pending_for: None,
             mode: Mode::Main,
             dir,
             on_list: Rc::new(on_list),
@@ -237,6 +245,12 @@ impl AvatarEditor {
         }
     }
 
+    /// Whether a photo picked from the list or a text photo saved is still
+    /// being drawn (cleared when it lands, fails, or is dropped).
+    pub fn drawing(&self) -> bool {
+        self.pending_for.is_some()
+    }
+
     /// Whether the photo chosen differs from the one now.
     pub fn changed(&self) -> bool {
         match &self.staged {
@@ -248,7 +262,7 @@ impl AvatarEditor {
 
     pub fn footer(&self, cx: &App) -> Footer {
         match &self.mode {
-            Mode::Main => Footer::Main { changed: self.changed() },
+            Mode::Main => Footer::Main { changed: self.changed(), drawing: self.drawing() },
             Mode::Text { input, color, initial, .. } => {
                 let text = input.read(cx).value().to_string();
                 Footer::Sub { can_save: !text.trim().is_empty() && (text != initial.0 || *color != initial.1) }
@@ -259,9 +273,16 @@ impl AvatarEditor {
 
     /// Desktop's Save in the main view: the photo chosen from the list moves
     /// to its front (`replaceAvatar(selected, selected)`).
+    /// One no longer in the list (deleted while it was being picked) isn't
+    /// put back.
     pub fn commit(&mut self, cx: &mut Context<Self>) {
+        // Half made: what's ringed isn't what's staged yet.
+        if self.drawing() {
+            return;
+        }
         if let Some(selected) = self.selected.clone()
             && self.changed()
+            && self.list.iter().any(|a| a.same(&selected))
         {
             self.list = crate::avatar_data::replace(&self.list, selected.clone(), Some(&selected));
             self.selected = self.list.first().cloned();
@@ -333,10 +354,17 @@ impl AvatarEditor {
         cx.notify();
     }
 
+    /// A new request, for `photo` from the list (or none): earlier ones are
+    /// now stale.
+    fn request(&mut self, photo: Option<AvatarData>) -> u64 {
+        self.pending_for = photo;
+        self.latest.next()
+    }
+
     /// "Photo": a picked file, kept in the list (Desktop's
     /// `saveAvatarToDisk`) and chosen.
     fn upload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let request = self.latest.next();
+        let request = self.request(None);
         pick_photo("Choose photo", window, cx, move |this: &mut Self, photo, window, cx| this.uploaded(photo, request, window, cx));
     }
 
@@ -353,10 +381,12 @@ impl AvatarEditor {
             };
             // The file first, then the list that names it.
             let dir = this.dir.clone();
+            let orphan_dir = dir.clone();
             let bytes = jpeg.clone();
             cx.spawn_in(window, async move |this, cx| {
                 let written = cx.background_executor().spawn(async move { crate::avatar_data::write_image(&dir, &bytes) }).await;
-                let _ = this.update_in(cx, |this, window, cx| {
+                let name = written.as_ref().ok().cloned();
+                let landed = this.update_in(cx, |this, window, cx| {
                     if !this.latest.is(request) {
                         // Picked over: the file isn't wanted.
                         if let Ok(name) = &written {
@@ -376,6 +406,12 @@ impl AvatarEditor {
                         Err(error) => this.stage(Err(format!("it couldn\u{2019}t be saved ({error}).")), None, window, cx),
                     }
                 });
+                // The editor closed while it was written: no list will name it.
+                if landed.is_err()
+                    && let Some(name) = name
+                {
+                    cx.background_executor().spawn(async move { crate::avatar_data::remove_image(&orphan_dir, &name) }).detach();
+                }
             })
             .detach();
         }
@@ -383,7 +419,7 @@ impl AvatarEditor {
 
     /// "Remove": no photo.
     fn remove_photo(&mut self, cx: &mut Context<Self>) {
-        self.latest.next();
+        self.request(None);
         self.staged = Staged::Remove;
         self.selected = None;
         cx.notify();
@@ -400,13 +436,14 @@ impl AvatarEditor {
             }
             return;
         }
-        let request = self.latest.next();
+        let request = self.request(Some(data.clone()));
         let dir = self.dir.clone();
         cx.spawn_in(window, async move |this, cx| {
             let drawing = data.clone();
             let drawn = cx.background_executor().spawn(async move { Staged::from_data(&drawing, &dir) }).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 if this.latest.is(request) {
+                    this.pending_for = None;
                     this.stage(drawn, Some(data), window, cx);
                 }
             });
@@ -418,10 +455,16 @@ impl AvatarEditor {
     /// `deleteAvatarFromDisk`): out of the list, then its file deleted.
     fn delete(&mut self, data: AvatarData, cx: &mut Context<Self>) {
         let list = crate::avatar_data::without(&self.list, &data);
+        // Chosen: not anymore. A request for another photo (an upload, a
+        // new text photo) still lands.
         if self.selected.as_ref().is_some_and(|s| s.same(&data)) {
-            self.latest.next();
             self.selected = None;
             self.staged = Staged::Current;
+        }
+        // Being drawn for the latest request: that request is dropped rather
+        // than staging a photo that's gone.
+        if self.pending_for.take_if(|p| p.same(&data)).is_some() {
+            self.latest.next();
         }
         self.set_list(list, cx);
         if let Some(name) = data.image {
@@ -538,25 +581,37 @@ impl AvatarEditor {
             return;
         }
         match std::mem::replace(&mut self.mode, Mode::Main) {
-            Mode::Text { input, color, editing, .. } => {
+            Mode::Text { input, color, editing, before, .. } => {
                 let text = input.read(cx).value().to_string();
                 let made = AvatarData { id: 0, color: Some(crate::avatar_data::COLOR_NAMES[color as usize].into()), icon: None, text: Some(text), image: None };
-                let request = self.latest.next();
+                // In the list at once, as Desktop's `replaceAvatar` puts it,
+                // whatever happens to its drawing; the photo chosen stays
+                // ringed until it's drawn.
+                let list = crate::avatar_data::replace(&self.list, made, editing.as_ref());
+                let Some(added) = list.first().cloned() else { return };
+                self.set_list(list, cx);
+                // The photo chosen stays ringed while the new one draws;
+                // when it's the one edited, the edit is it (the old entry is
+                // gone from the list, and shares its id).
+                if self.selected.is_none() {
+                    self.selected = match (&before, &editing) {
+                        (Some(b), Some(e)) if b.same(e) => Some(added.clone()),
+                        _ => before,
+                    };
+                }
+                let request = self.request(Some(added.clone()));
                 let dir = self.dir.clone();
                 cx.spawn_in(window, async move |this, cx| {
-                    let drawing = made.clone();
+                    let drawing = added.clone();
                     let drawn = cx.background_executor().spawn(async move { Staged::from_data(&drawing, &dir) }).await;
                     let _ = this.update_in(cx, |this, window, cx| {
                         if !this.latest.is(request) {
                             return;
                         }
-                        if drawn.is_err() {
-                            return this.stage(drawn, None, window, cx);
-                        }
-                        let list = crate::avatar_data::replace(&this.list, made, editing.as_ref());
-                        let added = list.first().cloned();
-                        this.set_list(list, cx);
-                        this.stage(drawn, added, window, cx);
+                        this.pending_for = None;
+                        // Not drawn: why, and the photo chosen as it was.
+                        let selected = drawn.is_ok().then_some(added).or_else(|| this.selected.clone());
+                        this.stage(drawn, selected, window, cx);
                     });
                 })
                 .detach();
@@ -566,7 +621,7 @@ impl AvatarEditor {
                 recolored.color = Some(crate::avatar_data::COLOR_NAMES[color as usize].into());
                 let list = crate::avatar_data::replace(&self.list, recolored, Some(&original));
                 let added = list.first().cloned();
-                self.latest.next();
+                self.request(None);
                 self.set_list(list, cx);
                 self.stage(Ok(Staged::New(jpeg, image)), added, window, cx);
             }
@@ -839,14 +894,14 @@ pub fn open_dialog(
                 closing.update(cx, |e, cx| e.cancel_sub(cx));
                 false
             }
-            Footer::Main { changed: true } => {
+            Footer::Main { changed: true, .. } => {
                 confirm_discard(window, cx);
                 false
             }
-            Footer::Main { changed: false } => true,
+            Footer::Main { changed: false, .. } => true,
         };
         let (can_save, sub) = match footer {
-            Footer::Main { changed } => (changed, false),
+            Footer::Main { changed, drawing } => (changed && !drawing, false),
             Footer::Sub { can_save } => (can_save, true),
         };
         dialog.title(title).w(px(440.)).child(shown.clone()).on_cancel(on_cancel).footer(
@@ -854,13 +909,16 @@ pub fn open_dialog(
                 .child(Button::new("avatar-editor-cancel").label("Cancel").outline().on_click(move |_, window, cx| {
                     match cancelling.read(cx).footer(cx) {
                         Footer::Sub { .. } => cancelling.update(cx, |e, cx| e.cancel_sub(cx)),
-                        Footer::Main { changed: true } => confirm_discard(window, cx),
-                        Footer::Main { changed: false } => window.close_dialog(cx),
+                        Footer::Main { changed: true, .. } => confirm_discard(window, cx),
+                        Footer::Main { changed: false, .. } => window.close_dialog(cx),
                     }
                 }))
                 .child(Button::new("avatar-editor-save").label("Save").primary().disabled(!can_save).on_click(move |_, window, cx| {
                     if sub {
                         save.update(cx, |e, cx| e.save_sub(window, cx));
+                        return;
+                    }
+                    if save.read(cx).drawing() {
                         return;
                     }
                     save.update(cx, |e, cx| e.commit(cx));
@@ -1146,6 +1204,207 @@ mod tests {
         let staged = editor.read_with(&vcx, |e, _| e.result().map(|(jpeg, _)| jpeg)).unwrap();
         let corner = image::load_from_memory(&staged).unwrap().to_rgba8().get_pixel(0, 0).0;
         assert!(corner[0].abs_diff(0xe3) < 6 && corner[2].abs_diff(0xfe) < 6, "on A100: {corner:?}");
+    }
+
+    /// A text photo put in the editor's list as one saved earlier.
+    fn saved_text(editor: &Entity<AvatarEditor>, vcx: &mut gpui_kit::VisualTestContext, text: &str) -> AvatarData {
+        editor.update(vcx, |e, cx| {
+            let made = AvatarData { id: 0, color: Some("A110".into()), icon: None, text: Some(text.into()), image: None };
+            let list = crate::avatar_data::replace(&e.list, made, None);
+            e.set_list(list, cx);
+            e.list[0].clone()
+        })
+    }
+
+    #[gpui_kit::test]
+    fn a_photo_deleted_while_it_is_picked_stays_deleted(cx: &mut gpui_kit::TestAppContext) {
+        let Opened { mut vcx, editor, kept, .. } = open_editor(cx);
+        let made = saved_text(&editor, &mut vcx, "AB");
+        settle(&mut vcx);
+        // Picked, then deleted before its drawing lands.
+        editor.update_in(&mut vcx, |e, window, cx| {
+            e.pick(made.clone(), window, cx);
+            e.delete(made.clone(), cx);
+        });
+        settle(&mut vcx);
+        assert!(editor.read_with(&vcx, |e, _| e.selected.is_none() && matches!(e.staged, Staged::Current)), "the pick didn't land");
+        // And Save can't put it back.
+        editor.update(&mut vcx, |e, cx| {
+            e.selected = Some(made.clone());
+            e.staged = Staged::Remove;
+            e.has_current = true;
+            e.commit(cx);
+        });
+        let list = kept.borrow().clone().unwrap();
+        assert!(!list.iter().any(|a| a.same(&made)), "not put back");
+    }
+
+    /// An uploaded photo, kept and chosen, as the list holds it.
+    fn upload_one(vcx: &mut gpui_kit::VisualTestContext, editor: &gpui_kit::Entity<AvatarEditor>) -> AvatarData {
+        editor.update_in(vcx, |e, window, cx| {
+            let request = e.request(None);
+            e.uploaded(Ok(photo()), request, window, cx);
+        });
+        settle(vcx);
+        editor.read_with(vcx, |e, _| e.selected.clone().filter(|s| s.image.is_some()).expect("the upload chosen"))
+    }
+
+    /// Makes a text photo and saves it, without letting its drawing land.
+    fn save_text(e: &mut AvatarEditor, text: &str, window: &mut Window, cx: &mut Context<AvatarEditor>) -> AvatarData {
+        e.edit_text(None, window, cx);
+        if let Mode::Text { input, .. } = &e.mode {
+            input.clone().update(cx, |input, cx| input.set_value(text, window, cx));
+        }
+        e.save_sub(window, cx);
+        e.list[0].clone()
+    }
+
+    #[gpui_kit::test]
+    fn deleting_the_chosen_photo_keeps_an_upload_on_its_way(cx: &mut gpui_kit::TestAppContext) {
+        let Opened { mut vcx, editor, .. } = open_editor(cx);
+        let a = upload_one(&mut vcx, &editor);
+        editor.update_in(&mut vcx, |e, window, cx| {
+            let request = e.request(None);
+            e.delete(a.clone(), cx);
+            e.uploaded(Ok(photo()), request, window, cx);
+        });
+        settle(&mut vcx);
+        let chosen = editor.read_with(&vcx, |e, _| e.selected.clone());
+        assert!(chosen.as_ref().is_some_and(|c| c.image.is_some() && !c.same(&a)), "the new upload: {chosen:?}");
+    }
+
+    #[gpui_kit::test]
+    fn deleting_the_chosen_photo_keeps_a_new_text_photo_chosen(cx: &mut gpui_kit::TestAppContext) {
+        let Opened { mut vcx, editor, .. } = open_editor(cx);
+        let a = upload_one(&mut vcx, &editor);
+        let text = editor.update_in(&mut vcx, |e, window, cx| {
+            let text = save_text(e, "XY", window, cx);
+            // A stays ringed while the text draws; then it's deleted.
+            assert!(e.selected.as_ref().is_some_and(|s| s.same(&a)));
+            e.delete(a.clone(), cx);
+            text
+        });
+        settle(&mut vcx);
+        assert!(editor.read_with(&vcx, |e, _| e.selected.as_ref().is_some_and(|s| s.same(&text))), "the text photo chosen");
+    }
+
+    #[gpui_kit::test]
+    fn a_stale_pick_doesnt_make_a_delete_cancel_a_newer_request(cx: &mut gpui_kit::TestAppContext) {
+        let Opened { mut vcx, editor, .. } = open_editor(cx);
+        let a = upload_one(&mut vcx, &editor);
+        pick_preset(&mut vcx, &editor, 2);
+        editor.update_in(&mut vcx, |e, window, cx| {
+            // Pick A, then upload before A is drawn: the pick is stale.
+            e.pick(a.clone(), window, cx);
+            let upload = e.request(None);
+            // Deleting A now cancels nothing: the upload is for another.
+            e.delete(a.clone(), cx);
+            e.uploaded(Ok(photo()), upload, window, cx);
+        });
+        settle(&mut vcx);
+        let chosen = editor.read_with(&vcx, |e, _| e.selected.clone());
+        assert!(chosen.as_ref().is_some_and(|c| c.image.is_some() && !c.same(&a)), "the upload landed: {chosen:?}");
+    }
+
+    #[gpui_kit::test]
+    fn a_new_text_photo_deleted_before_its_drawing_isnt_chosen(cx: &mut gpui_kit::TestAppContext) {
+        let Opened { mut vcx, editor, .. } = open_editor(cx);
+        pick_preset(&mut vcx, &editor, 2);
+        let text = editor.update_in(&mut vcx, |e, window, cx| {
+            let text = save_text(e, "XY", window, cx);
+            e.delete(text.clone(), cx);
+            text
+        });
+        settle(&mut vcx);
+        editor.read_with(&vcx, |e, _| {
+            assert!(!e.selected.as_ref().is_some_and(|s| s.same(&text)), "not chosen");
+            assert!(!e.list.iter().any(|d| d.same(&text)), "not in the list");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_chosen_text_photo_edited_is_the_one_saved(cx: &mut gpui_kit::TestAppContext) {
+        let Opened { mut vcx, editor, kept, saved, dir } = open_editor(cx);
+        editor.update_in(&mut vcx, |e, window, cx| {
+            save_text(e, "AB", window, cx);
+        });
+        settle(&mut vcx);
+        let old = editor.read_with(&vcx, |e, _| e.selected.clone().expect("AB chosen"));
+        assert_eq!(old.text.as_deref(), Some("AB"));
+        let new = editor.update_in(&mut vcx, |e, window, cx| {
+            // Clicked again: edited to "CD" and saved; it draws off the UI thread.
+            e.edit_text(Some(old.clone()), window, cx);
+            if let Mode::Text { input, .. } = &e.mode {
+                input.clone().update(cx, |input, cx| input.set_value("CD", window, cx));
+            }
+            e.save_sub(window, cx);
+            let new = e.list[0].clone();
+            // The edit is what's chosen (old and new share an id), and Save
+            // waits until it's drawn: a commit now changes nothing.
+            assert_eq!(e.selected.as_ref().and_then(|s| s.text.as_deref()), Some("CD"));
+            assert_eq!(e.footer(cx), Footer::Main { changed: e.changed(), drawing: true });
+            let before = e.list.clone();
+            e.commit(cx);
+            assert_eq!(e.list, before, "nothing committed while drawing");
+            new
+        });
+        assert_eq!((new.text.as_deref(), new.id), (Some("CD"), old.id));
+        settle(&mut vcx);
+        assert!(editor.read_with(&vcx, |e, cx| matches!(e.footer(cx), Footer::Main { changed: true, drawing: false })));
+        click(&mut vcx, "avatar-editor-save");
+        let list = kept.borrow().clone().unwrap();
+        assert_eq!(list[0].text.as_deref(), Some("CD"), "the edit kept, not the old text");
+        assert!(!list.iter().any(|d| d.text.as_deref() == Some("AB")));
+        // The photo saved is the new text's drawing.
+        let Staged::New(expected, _) = Staged::from_data(&new, dir.path()).unwrap() else { panic!("not drawn") };
+        let photo = saved.borrow().clone().flatten().expect("a photo");
+        assert_eq!(photo.0, expected);
+    }
+
+    #[gpui_kit::test]
+    fn an_upload_whose_editor_closed_leaves_no_file(cx: &mut gpui_kit::TestAppContext) {
+        let Opened { mut vcx, editor, dir, .. } = open_editor(cx);
+        let png = {
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(8, 8, image::Rgba([200, 80, 40, 255])))
+                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+                .unwrap();
+            bytes
+        };
+        let staged = Staged::from_image(&png).unwrap();
+        editor.update_in(&mut vcx, |e, window, cx| {
+            let request = e.latest.next();
+            e.uploaded(Ok(staged), request, window, cx);
+        });
+        // Closed before the write lands.
+        vcx.update(|window, cx| window.close_dialog(cx));
+        drop(editor);
+        settle(&mut vcx);
+        let left: Vec<_> = std::fs::read_dir(dir.path()).map(|d| d.flatten().map(|e| e.file_name()).collect()).unwrap_or_default();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[gpui_kit::test]
+    fn a_text_photo_saved_is_kept_even_when_another_is_picked_first(cx: &mut gpui_kit::TestAppContext) {
+        let Opened { mut vcx, editor, kept, .. } = open_editor(cx);
+        pick_preset(&mut vcx, &editor, 2);
+        editor.update_in(&mut vcx, |e, window, cx| {
+            e.edit_text(None, window, cx);
+            if let Mode::Text { input, .. } = &e.mode {
+                input.clone().update(cx, |input, cx| input.set_value("XY", window, cx));
+            }
+            e.save_sub(window, cx);
+            // The photo chosen stays ringed until the text is drawn…
+            assert!(e.selected.as_ref().is_some_and(|s| s.icon.is_some()), "{:?}", e.selected);
+            // …and another click comes first.
+            let other = e.list[5].clone();
+            e.pick(other, window, cx);
+        });
+        settle(&mut vcx);
+        // The text photo is in the list regardless (Desktop's `replaceAvatar`).
+        let list = kept.borrow().clone().unwrap();
+        assert_eq!(list[0].text.as_deref(), Some("XY"));
+        assert!(editor.read_with(&vcx, |e, _| e.selected.as_ref().is_some_and(|s| s.icon.is_some())), "the later pick chosen");
     }
 
     #[test]

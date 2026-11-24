@@ -118,7 +118,7 @@ pub fn parse(json: &str) -> Option<Vec<AvatarData>> {
 
 /// Where uploaded photos are kept, in the account's directory.
 pub fn dir(data_dir: &Path) -> PathBuf {
-    data_dir.join("avatar-data")
+    data_dir.join(signal_backend::AVATAR_DATA_DIR)
 }
 
 /// A name `write_image` gives: 32 hex digits and `.jpg`.
@@ -161,6 +161,32 @@ pub fn render(data: &AvatarData, dir: &Path) -> anyhow::Result<Vec<u8>> {
     }
     let preset = data.icon.as_deref().and_then(crate::avatar_presets::by_name).ok_or_else(|| anyhow::anyhow!("no such preset"))?;
     crate::avatar_presets::render_on(preset, color)
+}
+
+/// Keeps a list in its settings row `key` as it changes, the last change
+/// last: each change waits its turn and writes the newest list then, so
+/// writes on the backend's threads can't land out of order and leave an
+/// older list (one naming a photo since deleted). Nothing is cancelled
+/// should the editor close.
+pub fn list_writer(backend: signal_backend::Backend, key: String) -> impl Fn(&[AvatarData]) + 'static {
+    use std::sync::{Arc, Mutex};
+    let newest: Arc<Mutex<Option<String>>> = Arc::default();
+    let turn: Arc<futures::lock::Mutex<()>> = Arc::default();
+    move |list| {
+        let json = serde_json::to_string(list).unwrap_or_default();
+        *newest.lock().unwrap_or_else(|e| e.into_inner()) = Some(json);
+        let (newest, turn, db, key) = (newest.clone(), turn.clone(), backend.db().clone(), key.clone());
+        // Runs on its own; nothing waits on it.
+        drop(backend.spawn(async move {
+            let _turn = turn.lock().await;
+            let json = newest.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(json) = json
+                && let Err(error) = db.set_setting(&key, &json).await
+            {
+                tracing::warn!(%error, "couldn't keep the saved photos");
+            }
+        }));
+    }
 }
 
 #[cfg(test)]
@@ -224,6 +250,43 @@ mod tests {
         std::fs::write(dir.join("keep.txt"), b"x").unwrap();
         remove_image(&dir, "keep.txt");
         assert!(dir.join("keep.txt").exists());
+    }
+
+    #[test]
+    fn the_last_list_written_is_the_one_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = signal_backend::Config {
+            data_dir: dir.path().to_owned(),
+            db_key: [7; 32],
+            device_name: "test".into(),
+            demo: true,
+            former_data_dirs: Vec::new(),
+            call_lines: Default::default(),
+        };
+        let (backend, _events) = signal_backend::Backend::start(config).unwrap();
+        let keep = list_writer(backend.clone(), "avatar_data.test".into());
+        // Many changes at once, as deleting several quickly makes.
+        let mut list = defaults(false);
+        for n in 0..40 {
+            list = replace(&list, text(0, &format!("{n}")), None);
+            keep(&list);
+        }
+        let read = || {
+            let db = backend.db().clone();
+            futures::executor::block_on(backend.spawn(async move { db.setting("avatar_data.test").await })).unwrap()
+        };
+        let last = serde_json::to_string(&list).unwrap();
+        for _ in 0..300 {
+            if read().as_deref() == Some(last.as_str()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(read().as_deref(), Some(last.as_str()));
+        // And it stays: no older write lands after.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(read().as_deref(), Some(last.as_str()));
+        backend.shutdown();
     }
 
     #[test]

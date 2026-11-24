@@ -83,6 +83,13 @@ pub(crate) use call_links::clamp_name as clamp_link_name;
 
 pub(crate) type SignalManager = Manager<SqliteStore, Registered>;
 
+/// The account directory's media folders unlinking deletes: downloads,
+/// sends, stickers, GIFs, address book photos, and the photos the avatar
+/// editor keeps ([`crate::AVATAR_DATA_DIR`]). All unencrypted.
+fn wiped_dirs() -> [&'static str; 7] {
+    ["avatars", "attachments", "scheduled", "stickers", "gif-cache", settings::CONTACT_AVATARS_DIR, crate::AVATAR_DATA_DIR]
+}
+
 /// How checking someone's profile photo went, for the batch's log line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PhotoOutcome {
@@ -1332,7 +1339,7 @@ impl Actor {
             warn!(%error, "failed to clear app database");
         }
         // Downloaded and sent media are files, unencrypted: they go too.
-        for dir in ["avatars", "attachments", "scheduled", "stickers", "gif-cache", settings::CONTACT_AVATARS_DIR] {
+        for dir in wiped_dirs() {
             let _ = std::fs::remove_dir_all(self.config.data_dir.join(dir));
         }
         let _ = std::fs::create_dir_all(self.config.data_dir.join("attachments"));

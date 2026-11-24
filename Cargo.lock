@@ -9749,6 +9749,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "ttf-parser",
  "unicode-linebreak",
  "unicode-normalization",
  "unicode-properties",

@@ -36,6 +36,9 @@ qrcode = { version = "0.14", default-features = false }
 # color emoji (bitmaps, so raster images too), its 192 MB font file mapped
 # rather than read.
 resvg = { version = "0.45", default-features = false, features = ["text", "memmap-fonts", "raster-images"] }
+# Which font has a text photo's characters (already in the build, through
+# resvg's fontdb).
+ttf-parser = "0.25"
 # Stickers for the pack creator: decoded, fitted to 512px, then lossy WebP
 # (libwebp), as Desktop's creator encodes them.
 webp = { version = "0.3", default-features = false }

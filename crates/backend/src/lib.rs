@@ -52,6 +52,10 @@ mod sender_keys;
 pub use remote_config::{ConfigCell, RemoteConfig};
 pub(crate) use remote_config::current as remote_config;
 
+/// The account directory's folder of the photos the avatar editor keeps for
+/// reuse (uploaded photos; the app's `avatar_data`). Unlinking deletes it.
+pub const AVATAR_DATA_DIR: &str = "avatar-data";
+
 /// Settings key: `"true"` when read receipts are on: sent, and others'
 /// shown. See [`AccountSetting`] for where it comes from and its default.
 pub const SETTING_READ_RECEIPTS: &str = "read_receipts";
