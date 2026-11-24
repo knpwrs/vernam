@@ -65,9 +65,6 @@ enum Row {
 pub enum ComposeEvent {
     /// Back to the inbox (back button, Escape).
     Close,
-    /// Closed for a dialog that takes the keyboard (New group), so the
-    /// inbox search doesn't take it back.
-    Handoff,
     /// A chat was picked; `archived` shows the archive (Desktop's
     /// `switchToAssociatedView`).
     Opened { archived: bool },
@@ -1263,28 +1260,12 @@ impl Compose {
         });
         let picked = !order.is_empty();
         let pills_scroll = self.group.as_ref().map(|g| g.pills_scroll.clone()).unwrap_or_default();
-        let state = self.state.clone();
         div()
             .flex_1()
             .min_h_0()
             .flex()
             .flex_col()
             .child(search)
-            // Vernam's: Desktop joins a group only from its link, which
-            // Vernam can take pasted here (the old New group dialog had it).
-            .child(
-                div().px(px(16.)).pb(px(8.)).child(
-                    Button::new("compose-join-link")
-                        .label("Join with a group link")
-                        .ghost()
-                        .xsmall()
-                        .text_color(palette.accent)
-                        .on_click(cx.listener(move |_, _, window, cx| {
-                            crate::views::group_admin::open_paste_link(state.clone(), window, cx);
-                            cx.emit(ComposeEvent::Handoff);
-                        })),
-                ),
-            )
             .when(picked, |d| {
                 d.child(
                     div()

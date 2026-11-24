@@ -13,9 +13,8 @@ use std::collections::HashMap;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
-use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{Disableable as _, Sizable as _};
+use gpui_kit::component::Sizable as _;
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyElement, App, Entity, FontWeight, SharedString, Window, div, px};
 use signal_backend::Command;
@@ -660,36 +659,6 @@ pub fn open_join(state: Entity<AppState>, preview: std::rc::Rc<signal_backend::G
     });
 }
 
-/// Pasting a group link to open it (an OS link handler can call
-/// [`AppState::open_group_link`] too).
-pub fn open_paste_link(state: Entity<AppState>, window: &mut Window, cx: &mut App) {
-    let input = cx.new(|cx| InputState::new(window, cx).placeholder("https://signal.group/#…"));
-    window.open_dialog(cx, move |dialog, _, cx| {
-        let palette = Palette::get(cx);
-        let url = input.read(cx).value().trim().to_string();
-        let valid = signal_backend::group_admin::is_group_link(&url);
-        let (open_state, open_url) = (state.clone(), url.clone());
-        let footer = DialogFooter::new()
-            .child(Button::new("group-link-paste-cancel").label("Cancel").outline().on_click(|_, window, cx| window.close_all_dialogs(cx)))
-            .child(Button::new("group-link-paste-open").label("Open").primary().disabled(!valid).on_click(move |_, window, cx| {
-                open_state.read(cx).open_group_link(open_url.clone());
-                window.close_all_dialogs(cx);
-            }));
-        dialog
-            .title("Join with a group link")
-            .w(px(440.))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(div().debug_selector(|| "group-link-paste-field".into()).child(Input::new(&input)))
-                    .child(div().text_xs().text_color(palette.text_secondary).child("Paste a signal.group link someone shared with you.")),
-            )
-            .footer(footer)
-    });
-}
-
 /// Desktop's "N groups in common" (`ConversationDetailsGroups`): groups
 /// we're in with them, by title.
 pub fn groups_in_common(state: &AppState, aci: &str) -> Vec<Conversation> {
@@ -985,17 +954,22 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn links_are_pasted_to_open_them(cx: &mut TestAppContext) {
+    fn a_group_link_from_a_message_or_macos_opens_the_join_dialog(cx: &mut TestAppContext) {
         let (mut cx, state, backend, _dir) = demo(cx);
         let cx = &mut cx;
-        cx.update(|window, cx| open_paste_link(state.clone(), window, cx));
+        // Links before linking are ignored, as Desktop's are.
+        let linked = state.clone();
+        wait(cx, "the account", &move |cx| linked.read_with(cx, |s, _| s.our_aci().is_some()));
+        // As a link clicked in a message, then as macOS hands over sgnl://.
         let (url, _) = link(7, 2);
-        assert!(!found(cx, "group-join-dialog"));
-        // Typed into the field (it has focus once clicked).
-        click_at(cx, "group-link-paste-field");
-        cx.simulate_input(&url);
-        press(cx, "group-link-paste-open");
-        wait(cx, "the join dialog", &|cx| cx.debug_bounds("group-join-dialog").is_some());
+        let sgnl = url.replacen("https://", "sgnl://", 1);
+        for link in [url, sgnl] {
+            assert!(!found(cx, "group-join-dialog"));
+            assert!(state.update(cx, |s, cx| s.open_signal_link(&link, cx)), "{link}");
+            wait(cx, "the join dialog", &|cx| cx.debug_bounds("group-join-dialog").is_some());
+            cx.update(|window, cx| window.close_all_dialogs(cx));
+            cx.run_until_parked();
+        }
         backend.shutdown();
     }
 }
