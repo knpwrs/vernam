@@ -89,7 +89,9 @@ pub fn switch_country(text: &str, selected: Option<&str>) -> Option<(String, Str
     let parsed_region = selected.and_then(|r| r.parse::<phonenumber::country::Id>().ok());
     let number = phonenumber::parse(parsed_region, text.trim()).ok()?;
     let region = number.metadata(&phonenumber::metadata::DATABASE)?.id().to_owned();
-    if Some(region.as_str()) == selected {
+    // A number of no country ("+800", region "001") stays as typed: Desktop
+    // switches to a region it can't list or read the number in.
+    if Some(region.as_str()) == selected || crate::countries::country(&region).is_none() {
         return None;
     }
     let national = number.national();
@@ -157,6 +159,8 @@ mod tests {
         assert_eq!(switch_country("+44 20 7946 0000", Some("GB")), None);
         assert_eq!(switch_country("20 7946", None), None);
         assert_eq!(switch_country("abc", Some("GB")), None);
+        // A number of no country keeps its "+".
+        assert_eq!(switch_country("+800 1234 5678", Some("US")), None);
     }
 
     #[test]

@@ -29,7 +29,8 @@ pub fn countries() -> Vec<Country> {
 
 /// The country `region` names, if it's one listed.
 pub fn country(region: &str) -> Option<Country> {
-    countries().into_iter().find(|c| c.region == region)
+    let &(region, name) = NAMES.iter().find(|(r, _)| *r == region)?;
+    Some(Country { region, name, code: format!("+{}", calling_code(region)?) })
 }
 
 /// A region's calling code: libphonenumber's, or Desktop's for the regions

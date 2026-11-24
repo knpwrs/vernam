@@ -157,15 +157,21 @@ impl Compose {
 
     /// The pencil or ⌘N while it's open (Desktop's `START_COMPOSING`): a
     /// Find pane goes back to a fresh New chat; New chat keeps its search.
+    /// A Find pane's lookup isn't dropped (back and Escape wait for it too;
+    /// Desktop's still opens its chat when it comes).
     pub fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.step != Step::NewChat {
+        if self.step != Step::NewChat && self.finding.is_none() {
             self.show_new_chat(window, cx);
         }
         self.search_input().update(cx, |input, cx| input.focus(window, cx));
     }
 
     /// Shows a Find pane (Desktop's `showFindByUsername`, `showFindByPhoneNumber`).
+    /// Not while New chat's own lookup runs: its answer would land on the pane.
     fn show_find(&mut self, step: Step, window: &mut Window, cx: &mut Context<Self>) {
+        if self.finding.is_some() {
+            return;
+        }
         let placeholder = if step == Step::FindByUsername { "Username" } else { "Phone number" };
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         let subscription = cx.subscribe_in(&input, window, |this, input, event: &InputEvent, window, cx| match event {
@@ -452,6 +458,11 @@ impl Compose {
     /// Opens a chat picked from the list, and closes the composer.
     fn open(&mut self, id: ConversationId, entry: Option<DirectoryEntry>, cx: &mut Context<Self>) {
         let archived = self.state.read(cx).archived.iter().any(|c| c.id == id);
+        self.open_into(id, entry, archived, cx);
+    }
+
+    /// [`Self::open`], showing the archive after or not.
+    fn open_into(&mut self, id: ConversationId, entry: Option<DirectoryEntry>, archived: bool, cx: &mut Context<Self>) {
         self.state.update(cx, |state, cx| match entry {
             Some(entry) if state.conversation(&id).is_none() => state.start_conversation(entry, cx),
             _ => state.select(Some(id), cx),
@@ -514,10 +525,11 @@ impl Compose {
             Ok(entry) => {
                 // The Find panes go back to the inbox (Desktop's `showInbox`
                 // after `showConversation`), even for an archived chat.
-                let from_find = self.step != Step::NewChat;
-                self.open(entry.id.clone(), Some(entry.clone()), cx);
-                if from_find {
-                    cx.emit(ComposeEvent::Opened { archived: false });
+                // One event: the sidebar drops the composer at the first.
+                if self.step == Step::NewChat {
+                    self.open(entry.id.clone(), Some(entry.clone()), cx);
+                } else {
+                    self.open_into(entry.id.clone(), Some(entry.clone()), false, cx);
                 }
                 return;
             }
@@ -871,13 +883,17 @@ impl Compose {
 
 /// The countries Desktop's search would keep for `term`, as indexes.
 fn country_matches(countries: &[signal_backend::countries::Country], term: &str) -> Vec<usize> {
-    let term = term.trim();
-    let words = searchable(term);
+    // Words with single spaces, so "antigua barbuda" finds "Antigua &
+    // Barbuda" (its "&" a space).
+    let words = |text: &str| searchable(text).split_whitespace().collect::<Vec<_>>().join(" ");
+    let term = words(term);
     let digits: String = term.chars().filter(char::is_ascii_digit).collect();
+    // Nothing to match by (empty, or only "+"): every country.
+    let all = term.trim_start_matches('+').trim().is_empty();
     countries
         .iter()
         .enumerate()
-        .filter(|(_, c)| term.is_empty() || (!words.trim().is_empty() && searchable(c.name).contains(words.trim())) || (!digits.is_empty() && c.code[1..].starts_with(&digits)))
+        .filter(|(_, c)| all || words(c.name).contains(&term) || (!digits.is_empty() && c.code[1..].starts_with(&digits)))
         .map(|(ix, _)| ix)
         .collect()
 }
@@ -1272,6 +1288,55 @@ mod tests {
         }
 
         #[gpui_kit::test]
+        fn a_find_pane_goes_to_the_inbox_even_for_an_archived_chat(cx: &mut TestAppContext) {
+            let mut m = mount(cx);
+            open(&mut m);
+            // A chat that's archived.
+            let chat = m.state.update(&mut m.cx, |s, _| {
+                let chat = s.conversations.remove(0);
+                s.archived.push(chat.clone());
+                chat
+            });
+            show(&mut m, Step::FindByUsername);
+            let compose = compose(&mut m);
+            let opened = Rc::new(std::cell::RefCell::new(Vec::new()));
+            let seen = opened.clone();
+            let _watch = m.cx.update(|_, cx| cx.subscribe(&compose, move |_, event: &ComposeEvent, _| {
+                if let ComposeEvent::Opened { archived } = event {
+                    seen.borrow_mut().push(*archived);
+                }
+            }));
+            let entry = DirectoryEntry { id: chat.id.clone(), kind: chat.kind, title: chat.title.clone(), phone: None };
+            compose.update_in(&mut m.cx, |c, window, cx| {
+                c.finding = Some(("someone.42".into(), Finding::Username("someone.42".into())));
+                c.found("someone.42", &Ok(entry), window, cx);
+            });
+            m.cx.run_until_parked();
+            // One event, for the inbox (Desktop's `showInbox`).
+            assert_eq!(*opened.borrow(), [false]);
+            m.backend.shutdown();
+        }
+
+        #[gpui_kit::test]
+        fn a_lookup_keeps_the_find_panes_and_new_chat_where_they_are(cx: &mut TestAppContext) {
+            let mut m = mount(cx);
+            open(&mut m);
+            // New chat's own lookup running: a Find pane doesn't open over it.
+            let compose = compose(&mut m);
+            compose.update(&mut m.cx, |c, _| c.finding = Some(("nobody.99".into(), Finding::Username("nobody.99".into()))));
+            show(&mut m, Step::FindByPhoneNumber);
+            assert_eq!(step(&mut m), Step::NewChat);
+            // A Find pane's lookup running: ⌘N doesn't drop it.
+            compose.update(&mut m.cx, |c, _| c.finding = None);
+            show(&mut m, Step::FindByUsername);
+            compose.update(&mut m.cx, |c, _| c.finding = Some(("nobody.99".into(), Finding::Username("nobody.99".into()))));
+            m.sidebar.update_in(&mut m.cx, |s, window, cx| s.open_compose(window, cx));
+            assert_eq!(step(&mut m), Step::FindByUsername);
+            assert!(compose.read_with(&m.cx, |c, _| c.finding.is_some()));
+            m.backend.shutdown();
+        }
+
+        #[gpui_kit::test]
         fn find_by_username_looks_up_what_was_typed(cx: &mut TestAppContext) {
             let mut m = mount(cx);
             open(&mut m);
@@ -1368,6 +1433,10 @@ mod tests {
             assert!(names("44").contains(&"GB"));
             assert!(names("+44").contains(&"GB"));
             assert!(names("zzz").is_empty());
+            // A "+" alone matches every code; runs of punctuation are one space.
+            assert_eq!(names("+").len(), all.len());
+            assert!(names("antigua barbuda").contains(&"AG"));
+            assert!(names("congo kinshasa").contains(&"CD"));
         }
 
         #[gpui_kit::test]
