@@ -1999,19 +1999,7 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
             // No servers to ask: a `signal.me/#p/` link finds someone in the
             // demo's directory by number; anything else says so.
             Command::FindRecipient { query } => {
-                let number = match crate::routes::parse(&query) {
-                    Some(crate::routes::Route::ContactByPhoneNumber(number)) => Some(number),
-                    _ => None,
-                };
-                let found = match &number {
-                    Some(number) => db
-                        .search_directory(number, 20)
-                        .await
-                        .ok()
-                        .and_then(|entries| entries.into_iter().find(|e| e.phone.as_deref() == Some(number.as_str()))),
-                    None => None,
-                };
-                let result = found.ok_or_else(|| "Looking people up isn't available in the demo".to_owned());
+                let result = demo_find(&db, &query).await;
                 emit(Event::RecipientFound { query, result });
             }
             Command::SendImages { conversation, images, caption, quote, mentions, styles } => {
@@ -2509,6 +2497,45 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
 pub(crate) const DEMO_BADGE: &str = "DEMO_SUSTAINER";
 
 /// Profiles for the made-up people and for us, a badge, and our username.
+/// The demo's `Command::FindRecipient`, answered from its own data as the
+/// server would: a username someone here has, or a number in the
+/// directory or a chat; anyone else isn't on Signal. Nothing goes out.
+async fn demo_find(db: &AppDb, query: &str) -> Result<signal_store::DirectoryEntry, crate::recipients::FindError> {
+    use crate::recipients::FindError;
+    let me = &SELF[2..];
+    let people = db.compose_contacts(me).await.unwrap_or_default();
+    let entry = |sid: &str, title: String, phone: Option<String>| signal_store::DirectoryEntry {
+        id: ConversationId::direct(sid),
+        kind: ConversationKind::Direct,
+        title,
+        phone,
+    };
+    let number = match crate::routes::parse(query) {
+        Some(crate::routes::Route::ContactByPhoneNumber(number)) => Some(number),
+        _ => None,
+    };
+    if number.is_none()
+        && let Some(username) = crate::recipients::username_in(query)
+    {
+        return people
+            .iter()
+            .find(|p| p.username.as_deref() == Some(username.as_str()))
+            .map(|p| entry(&p.service_id, p.title.clone(), p.phone.clone()))
+            .ok_or_else(|| FindError::NotFound(format!("No one on Signal has the username {username}")));
+    }
+    let Some(e164) = number.or_else(|| crate::recipients::phone_in(query, Some("+14155550100"))) else {
+        return Err(FindError::Invalid("Enter a phone number or a username like name.12".into()));
+    };
+    if let Some(person) = people.iter().find(|p| p.phone.as_deref() == Some(e164.as_str())) {
+        return Ok(entry(&person.service_id, person.title.clone(), person.phone.clone()));
+    }
+    let directory = db.search_directory(&e164, 20).await.unwrap_or_default();
+    directory
+        .into_iter()
+        .find(|e| e.phone.as_deref() == Some(e164.as_str()))
+        .ok_or_else(|| FindError::NotFound(format!("{e164} isn't on Signal")))
+}
+
 async fn seed_profiles(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
     use signal_store::{Badge, BadgeCategory, BadgeImage, FetchedProfile, ProfileBadge};
     let me = aci(SELF);

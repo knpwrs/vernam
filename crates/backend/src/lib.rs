@@ -1255,7 +1255,7 @@ pub enum Event {
     /// if the stored message names one.
     MessageStickerPack { message_id: i64, pack: Option<(Vec<u8>, Vec<u8>)> },
     /// Answer to `Command::FindRecipient`: who it is, or why not.
-    RecipientFound { query: String, result: Result<signal_store::DirectoryEntry, String> },
+    RecipientFound { query: String, result: Result<signal_store::DirectoryEntry, recipients::FindError> },
     /// Answer to `Command::FetchLinkPreview` (`None`: no preview for it).
     LinkPreview { url: String, preview: Option<LinkPreviewDraft> },
     /// Stored author names changed: `(service id, name)` pairs. Loaded

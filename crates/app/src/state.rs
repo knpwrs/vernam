@@ -122,7 +122,7 @@ pub enum AppEvent {
     /// The scheduled messages changed (`AppState::scheduled`).
     ScheduledChanged,
     /// Answer to a username or phone number lookup.
-    RecipientFound { query: String, result: Result<signal_store::DirectoryEntry, String> },
+    RecipientFound { query: String, result: Result<signal_store::DirectoryEntry, signal_backend::recipients::FindError> },
     /// GIF search results (`Err`: why not).
     Gifs { query: String, offset: u32, result: Result<signal_backend::GifResults, String> },
     /// Desktop's "Search in chat": the sidebar's search box searches this
@@ -1473,7 +1473,8 @@ impl AppState {
                 self.link_lookup = None;
                 match result {
                     Ok(entry) => self.start_conversation(entry, cx),
-                    Err(description) => {
+                    Err(error) => {
+                        let description = error.message().to_owned();
                         let title = if description == signal_backend::routes::UNKNOWN_LINK {
                             signal_backend::routes::UNKNOWN_LINK_TITLE
                         } else {

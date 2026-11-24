@@ -63,6 +63,7 @@ use presage::{
     store::{ContentsStore, StateStore, Thread},
 };
 use presage_store_sqlite::{SqliteConnectOptions, SqliteStore};
+use crate::recipients::FindError;
 use signal_store::{
     AppDb, AttachmentMeta, ConversationId, ConversationKind, LinkPreview, ConversationUpdate, DeliveryStatus, Direction,
     Message, NewMessage, Quote, Reaction, RemoteAttachment,
@@ -3125,20 +3126,21 @@ impl Actor {
     }
 
     /// A username or phone number, looked up on Signal's servers.
-    async fn find_recipient(&self, query: &str) -> Result<signal_store::DirectoryEntry, String> {
-        let mut manager = self.manager().ok_or("not connected")?;
+    async fn find_recipient(&self, query: &str) -> Result<signal_store::DirectoryEntry, FindError> {
+        let mut manager = self.manager().ok_or_else(|| FindError::Failed("not connected".into()))?;
         // A `signal.me/#eu/…` link: the username it holds (Desktop's
         // `showConversationViaSignalDotMe`, which shows its "didn't make
         // sense" error when the link is gone or can't be read).
         let linked = match crate::routes::parse(query) {
             Some(crate::routes::Route::ContactByEncryptedUsername(encrypted)) => {
-                let link = url::Url::parse(&crate::routes::Route::username_link(&encrypted)).map_err(|_| crate::routes::UNKNOWN_LINK)?;
+                let unknown = || FindError::Invalid(crate::routes::UNKNOWN_LINK.into());
+                let link = url::Url::parse(&crate::routes::Route::username_link(&encrypted)).map_err(|_| unknown())?;
                 match manager.lookup_username_link(&link).await {
                     Ok(Some(username)) => Some(username),
-                    Ok(None) => return Err(crate::routes::UNKNOWN_LINK.into()),
+                    Ok(None) => return Err(unknown()),
                     Err(error) => {
                         warn!(error = %error, "couldn't read a username link");
-                        return Err(crate::routes::UNKNOWN_LINK.into());
+                        return Err(unknown());
                     }
                 }
             }
@@ -3154,13 +3156,13 @@ impl Actor {
                     title: username,
                     phone: None,
                 }),
-                Ok(None) => Err(format!("No one on Signal has the username {username}")),
-                Err(error) => Err(format!("Couldn't look up {username}: {error}")),
+                Ok(None) => Err(FindError::NotFound(format!("No one on Signal has the username {username}"))),
+                Err(error) => Err(FindError::Failed(format!("Couldn't look up {username}: {error}"))),
             };
         }
         let home = manager.registration_data().phone_number.to_string();
         let Some(e164) = crate::recipients::phone_in(query, Some(&home)) else {
-            return Err("Enter a phone number or a username like name.12".into());
+            return Err(FindError::Invalid("Enter a phone number or a username like name.12".into()));
         };
         match manager.discover_contacts_by_phone_number([e164.as_str()]).await {
             Ok(found) => match found.into_iter().find_map(|(_, sid)| sid) {
@@ -3170,9 +3172,9 @@ impl Actor {
                     title: e164.clone(),
                     phone: Some(e164),
                 }),
-                None => Err(format!("{e164} isn't on Signal")),
+                None => Err(FindError::NotFound(format!("{e164} isn't on Signal"))),
             },
-            Err(error) => Err(format!("Couldn't look up {e164}: {error}")),
+            Err(error) => Err(FindError::Failed(format!("Couldn't look up {e164}: {error}"))),
         }
     }
 

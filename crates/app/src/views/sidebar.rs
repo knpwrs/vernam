@@ -124,8 +124,8 @@ impl Sidebar {
                     this.finding = None;
                     match result {
                         Ok(entry) => this.open_entry(entry.clone(), window, cx),
-                        Err(message) => {
-                            let message = message.clone();
+                        Err(error) => {
+                            let message = error.message().to_owned();
                             this.state.update(cx, |state, cx| state.report_error(message, cx));
                             cx.notify();
                         }
