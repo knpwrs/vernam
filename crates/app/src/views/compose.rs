@@ -100,6 +100,12 @@ struct GroupDraft {
     order: Vec<String>,
     /// Names of people picked by a lookup, who aren't listed.
     found_names: HashMap<String, String>,
+    /// Who each lookup found (the e164 or username sent, to their service
+    /// id), so its row shows them picked (Desktop's `isPhoneNumberChecked`
+    /// and `isUsernameChecked`) and toggles them without asking again.
+    found_by: HashMap<String, String>,
+    /// The pills' scroll, kept at the newest pick (Desktop's `ContactPills`).
+    pills_scroll: gpui_kit::ScrollHandle,
     alerts: Alerts,
     /// The picked photo: its file, and its bytes.
     avatar: Option<(std::path::PathBuf, Vec<u8>)>,
@@ -310,6 +316,8 @@ impl Compose {
                 chosen: BTreeSet::new(),
                 order: Vec::new(),
                 found_names: HashMap::new(),
+                found_by: HashMap::new(),
+                pills_scroll: gpui_kit::ScrollHandle::new(),
                 alerts: Alerts::default(),
                 avatar: None,
                 timer,
@@ -351,6 +359,9 @@ impl Compose {
         if group.chosen.contains(sid) {
             if !group.order.iter().any(|s| s == sid) {
                 group.order.push(sid.to_owned());
+                // Once the new pill is laid out.
+                let scroll = group.pills_scroll.clone();
+                cx.on_next_frame(window, move |_, _, _| scroll.scroll_to_bottom());
             }
         } else {
             group.order.retain(|s| s != sid);
@@ -422,14 +433,22 @@ impl Compose {
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = picked.await else { return };
             let Some(path) = paths.into_iter().next() else { return };
-            let bytes = match std::fs::read(&path) {
-                Ok(bytes) => bytes,
-                Err(error) => return tracing::warn!(%error, "couldn't read the group photo"),
-            };
-            let _ = this.update(cx, |this, cx| {
-                if let Some(group) = &mut this.group {
-                    group.avatar = Some((path, bytes));
-                    cx.notify();
+            // Read and tried as a group photo off the UI thread: a large
+            // file would stall it, and one the backend can't make a photo
+            // of is refused now rather than failing Create.
+            let reading = path.clone();
+            let checked = cx.background_executor().spawn(async move { read_group_photo(&reading) }).await;
+            let _ = this.update_in(cx, |this, window, cx| match checked {
+                Ok(bytes) => {
+                    if let Some(group) = &mut this.group {
+                        group.avatar = Some((path, bytes));
+                        cx.notify();
+                    }
+                }
+                Err(reason) => {
+                    tracing::warn!(%reason, "refused a group photo");
+                    let text = format!("That file can\u{2019}t be used as a group photo: {reason}");
+                    window.open_alert_dialog(cx, move |alert, _, _| alert.description(text.clone()));
                 }
             });
         })
@@ -624,7 +643,9 @@ impl Compose {
         let probably_username = is_probably_a_username(&self.query);
         let mut rows = Vec::new();
         if self.step == Step::ChooseMembers {
-            self.member_rows(&mut rows, &contacts, username.as_deref(), parsed.clone(), term);
+            // Ours is the account's (no contact record holds it).
+            let ours = self.state.read(cx).own_profile.as_ref().and_then(|p| p.username.clone());
+            self.member_rows(&mut rows, &contacts, username.as_deref(), ours.as_deref(), parsed.clone(), term);
         } else if self.step == Step::NewChat || self.step == Step::FindByUsername || self.step == Step::FindByPhoneNumber {
             self.new_chat_rows(&mut rows, &contacts, &groups, &group_order, username.as_deref(), probably_username, parsed.clone(), term);
         }
@@ -697,17 +718,18 @@ impl Compose {
     /// Choose members' rows (Desktop's `LeftPaneChooseGroupMembersHelper.getRow`):
     /// everyone New chat lists but us, then a number to look up, or a
     /// username, unless it's ours or someone listed's.
-    fn member_rows(&self, rows: &mut Vec<Row>, contacts: &[usize], username: Option<&str>, parsed: Option<ParsedPhone>, term: &str) {
+    #[allow(clippy::too_many_arguments)]
+    fn member_rows(&self, rows: &mut Vec<Row>, contacts: &[usize], username: Option<&str>, ours_username: Option<&str>, parsed: Option<ParsedPhone>, term: &str) {
         let listed: Vec<usize> = contacts.iter().copied().filter(|&ix| !self.candidates[ix].contact.me).collect();
         if !listed.is_empty() {
             rows.push(Row::Header("Contacts"));
             rows.extend(listed.iter().map(|&ix| Row::Checkbox(ix)));
         }
         let me = self.candidates.iter().map(|c| &c.contact).find(|c| c.me);
-        let ours_username = me.and_then(|c| c.username.as_deref());
         let ours_phone = me.and_then(|c| c.phone.as_deref());
+        // Usernames match without case, as Signal hashes them.
         let username = username.filter(|name| {
-            Some(*name) != ours_username && !listed.iter().any(|&ix| self.candidates[ix].contact.username.as_deref() == Some(*name))
+            !ours_username.is_some_and(|ours| ours.eq_ignore_ascii_case(name)) && !listed.iter().any(|&ix| self.candidates[ix].contact.username.as_deref() == Some(*name))
         });
         if username.is_none()
             && let Some(phone) = parsed
@@ -750,6 +772,10 @@ impl Compose {
     /// `lookupConversationWithoutServiceId`); ignored while the same one
     /// runs. Another takes its place, and the earlier answer is dropped.
     fn look_up(&mut self, row: &Row, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(sid) = self.found_for(row) {
+            self.toggle_member(&sid, window, cx);
+            return;
+        }
         let (query, finding) = match row {
             Row::Username(name) | Row::UsernameCheckbox(name) => {
                 // Desktop's `usernames.hash` throws for one that can't be a
@@ -781,6 +807,16 @@ impl Compose {
         cx.notify();
     }
 
+    /// Who a checkbox row's lookup already found, if it ran.
+    fn found_for(&self, row: &Row) -> Option<String> {
+        let query = match row {
+            Row::UsernameCheckbox(name) => name.as_str(),
+            Row::PhoneCheckbox(phone, _) => phone.e164.as_str(),
+            _ => return None,
+        };
+        self.group.as_ref()?.found_by.get(query).cloned()
+    }
+
     /// The answer to a lookup of ours: its chat opens and the composer
     /// closes, as picking a contact does, or Desktop's dialog or message
     /// says why not. (Desktop's code calls `showConversation` without
@@ -790,12 +826,19 @@ impl Compose {
         let Some((_, finding)) = self.finding.take_if(|(q, _)| q == query) else { return };
         cx.notify();
         let error = match result {
-            // Choose members: the person found is picked (Desktop toggles
-            // them into the selection).
-            Ok(entry) if self.step == Step::ChooseMembers => {
+            // A lookup from Choose members: the person found is picked
+            // (Desktop toggles them into the selection), whichever step the
+            // group's draft is on when the answer comes; never a chat.
+            Ok(entry) if self.group.is_some() => {
                 let Some(sid) = entry.id.as_direct().map(str::to_owned) else { return };
+                // We're in the group already: a lookup that found us (our own
+                // username or number) adds no one.
+                if self.state.read(cx).our_aci() == Some(sid.as_str()) {
+                    return;
+                }
                 if let Some(group) = &mut self.group {
                     group.found_names.insert(sid.clone(), entry.title.clone());
+                    group.found_by.insert(query.to_owned(), sid.clone());
                 }
                 self.toggle_member(&sid, window, cx);
                 return;
@@ -900,10 +943,11 @@ impl Compose {
                     Row::UsernameCheckbox(_) => "compose-username-checkbox",
                     _ => "compose-phone-checkbox",
                 };
+                let on = self.found_for(&row).is_some_and(|sid| self.group.as_ref().is_some_and(|g| g.chosen.contains(&sid)));
                 let trailing = if fetching {
                     Icon::new(IconName::LoaderCircle).size(px(20.)).text_color(palette.text_secondary).into_any_element()
                 } else {
-                    checkbox(false, palette)
+                    checkbox(on, palette)
                 };
                 let title = div().truncate().child(name.clone()).into_any_element();
                 tile_with(SharedString::from(selector), SELECT_HEIGHT, search_glyph(palette), title, None, Some(selector.to_owned()), Some(trailing), true, palette)
@@ -943,6 +987,23 @@ impl Compose {
             }
         }
     }
+}
+
+/// The largest file taken as a group photo. Vernam's other caps on images
+/// it reads whole (release note media, GIFs) are 25 MiB; a photo the
+/// backend shrinks to 512 pixels needs no more.
+const GROUP_PHOTO_MAX_BYTES: u64 = 25 * 1024 * 1024;
+
+/// A picked group photo's bytes, if it's an image the backend can make a
+/// group photo of and not too large; else why not.
+fn read_group_photo(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    let size = std::fs::metadata(path).map_err(|e| format!("it couldn\u{2019}t be read ({e})."))?.len();
+    if size > GROUP_PHOTO_MAX_BYTES {
+        return Err("it\u{2019}s larger than 25 MB.".into());
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("it couldn\u{2019}t be read ({e})."))?;
+    signal_backend::media::group_avatar(&bytes).map_err(|_| "it isn\u{2019}t an image Vernam can read.".to_owned())?;
+    Ok(bytes)
 }
 
 /// Desktop's `Avatar` with `searchResult`: the search glyph in a circle.
@@ -1201,6 +1262,7 @@ impl Compose {
                 )
         });
         let picked = !order.is_empty();
+        let pills_scroll = self.group.as_ref().map(|g| g.pills_scroll.clone()).unwrap_or_default();
         let state = self.state.clone();
         div()
             .flex_1()
@@ -1235,12 +1297,18 @@ impl Compose {
                         .py(px(4.))
                         .mb(px(10.))
                         .max_h(px(88.))
+                        .track_scroll(&pills_scroll)
                         .overflow_y_scroll()
                         .children(pills),
                 )
             })
             .child(list)
-            .child(self.footer(if picked { "Next" } else { "Skip" }, false, true, cx.listener(|this, _, window, cx| this.show_set_metadata(window, cx))))
+            // Not while a lookup runs: its answer picks into this step's list.
+            .child(self.footer(if picked { "Next" } else { "Skip" }, false, self.finding.is_none(), cx.listener(|this, _, window, cx| {
+                if this.finding.is_none() {
+                    this.show_set_metadata(window, cx);
+                }
+            })))
             .into_any_element()
     }
 
@@ -1617,6 +1685,11 @@ fn is_username_valid(name: &str) -> bool {
 impl Compose {
     /// The rows as text, for tests.
     pub(crate) fn row_texts(&self, cx: &App) -> Vec<String> {
+        // A lookup row is checked when the person it found is picked.
+        let box_of = |row: &Row| {
+            let on = self.found_for(row).is_some_and(|sid| self.group.as_ref().is_some_and(|g| g.chosen.contains(&sid)));
+            if on { "[x]" } else { "[ ]" }
+        };
         self.rows
             .iter()
             .map(|row| match row {
@@ -1633,8 +1706,8 @@ impl Compose {
                     let on = self.group.as_ref().is_some_and(|g| g.chosen.contains(&contact.service_id));
                     format!("[{}] {}", if on { "x" } else { " " }, contact.title)
                 }
-                Row::UsernameCheckbox(name) => format!("[ ] @ {name}"),
-                Row::PhoneCheckbox(phone, _) => format!("[ ] tel {}", phone.e164),
+                Row::UsernameCheckbox(name) => format!("{} @ {name}", box_of(row)),
+                Row::PhoneCheckbox(phone, _) => format!("{} tel {}", box_of(row), phone.e164),
             })
             .collect()
     }
@@ -1938,6 +2011,61 @@ mod tests {
             assert_eq!(picked(&mut m), ["Dana Brooks"]);
             // Still choosing: nothing opened.
             assert_eq!(step(&mut m), Step::ChooseMembers);
+            // Her row shows her picked (Desktop's `isPhoneNumberChecked`),
+            // and clicking it again unpicks her without asking the server.
+            assert_eq!(rows(&mut m), ["# Find by phone number", "[x] tel +14155550177"]);
+            compose.update_in(&mut m.cx, |c, window, cx| {
+                let row = c.rows.iter().find(|r| matches!(r, Row::PhoneCheckbox(..))).cloned().unwrap();
+                c.look_up(&row, window, cx);
+                assert!(c.finding.is_none(), "no lookup");
+            });
+            assert!(picked(&mut m).is_empty());
+            assert_eq!(rows(&mut m), ["# Find by phone number", "[ ] tel +14155550177"]);
+            m.backend.shutdown();
+        }
+
+        #[gpui_kit::test]
+        fn we_cant_be_picked_into_our_own_group(cx: &mut TestAppContext) {
+            let mut m = mount(cx);
+            let state = m.state.clone();
+            wait(&mut m.cx, |cx| state.read_with(cx, |s, _| s.own_profile.as_ref().is_some_and(|p| p.username.is_some())));
+            open(&mut m);
+            new_group(&mut m);
+            // Our username, in any case: no row to look it up.
+            type_in(&mut m, "Riley.07");
+            assert!(rows(&mut m).iter().all(|r| !r.contains("riley") && !r.contains("Riley")), "{:?}", rows(&mut m));
+            // A lookup that finds us anyway adds no one.
+            let me = m.state.read_with(&m.cx, |s, _| s.our_aci().unwrap().to_owned());
+            let entry = DirectoryEntry { id: ConversationId::direct(&me), kind: ConversationKind::Direct, title: "Riley".into(), phone: None };
+            let compose = compose(&mut m);
+            compose.update_in(&mut m.cx, |c, window, cx| {
+                c.finding = Some(("riley.07".into(), Finding::Username("riley.07".into())));
+                c.found("riley.07", &Ok(entry), window, cx);
+            });
+            assert!(picked(&mut m).is_empty());
+            m.backend.shutdown();
+        }
+
+        #[gpui_kit::test]
+        fn a_lookup_answered_after_next_picks_and_opens_nothing(cx: &mut TestAppContext) {
+            let mut m = mount(cx);
+            open(&mut m);
+            new_group(&mut m);
+            type_in(&mut m, "+1 415 555 0177");
+            let compose = compose(&mut m);
+            compose.update_in(&mut m.cx, |c, window, cx| {
+                let row = c.rows.iter().find(|r| matches!(r, Row::PhoneCheckbox(..))).cloned().unwrap();
+                c.look_up(&row, window, cx);
+                // On to naming before the answer (Next waits for it now;
+                // this is the answer landing on the next step regardless).
+                c.show_set_metadata(window, cx);
+            });
+            let selected = m.state.read_with(&m.cx, |s, _| s.selected.clone());
+            wait(&mut m.cx, |cx| compose.read_with(cx, |c, _| c.finding.is_none()));
+            assert_eq!(picked(&mut m), ["Dana Brooks"]);
+            assert_eq!(step(&mut m), Step::SetGroupMetadata);
+            assert!(m.sidebar.read_with(&m.cx, |s, _| s.compose().is_some()), "the draft stays");
+            assert_eq!(m.state.read_with(&m.cx, |s, _| s.selected.clone()), selected, "no chat opened");
             m.backend.shutdown();
         }
 
@@ -1996,11 +2124,48 @@ mod tests {
             m.cx.simulate_keystrokes("escape");
             m.sidebar.update_in(&mut m.cx, |s, window, cx| s.open_compose(window, cx));
             assert_eq!(step(&mut m), Step::SetGroupMetadata);
-            m.state.update(&mut m.cx, |_, cx| cx.emit(AppEvent::GroupCreateFailed));
+            // The backend's answer, as `main.rs` hands it to the state:
+            // Desktop's untitled dialog, and Create works again.
+            let alerts = Rc::new(std::cell::RefCell::new(Vec::new()));
+            let seen = alerts.clone();
+            let _watch = m.cx.update(|_, cx| cx.subscribe(&m.state, move |_, event: &AppEvent, _| {
+                if let AppEvent::Alert { title, description } = event {
+                    seen.borrow_mut().push((title.to_string(), description.to_string()));
+                }
+            }));
+            m.state.update(&mut m.cx, |s, cx| s.handle(signal_backend::Event::GroupCreateFailed { reason: None }, cx));
             m.cx.run_until_parked();
             assert!(!compose.read_with(&m.cx, |c, _| c.creating()));
             assert!(m.sidebar.read_with(&m.cx, |s, _| s.compose().is_some()), "still open to try again");
+            assert_eq!(*alerts.borrow(), [(String::new(), "This group couldn\u{2019}t be created. Check your connection and try again.".to_owned())]);
+            // A reason that isn't the connection says itself.
+            compose.update(&mut m.cx, |c, _| c.group.as_mut().unwrap().creating = true);
+            m.state.update(&mut m.cx, |s, cx| s.handle(signal_backend::Event::GroupCreateFailed { reason: Some("A group needs a name.".into()) }, cx));
+            m.cx.run_until_parked();
+            assert!(!compose.read_with(&m.cx, |c, _| c.creating()));
+            assert_eq!(alerts.borrow().last().map(|(_, d)| d.as_str()), Some("A group needs a name."));
+            // A group made elsewhere (not ours to wait on) leaves the pane.
+            m.state.update(&mut m.cx, |_, cx| cx.emit(AppEvent::GroupCreated));
+            m.cx.run_until_parked();
+            assert!(m.sidebar.read_with(&m.cx, |s, _| s.compose().is_some()));
+            assert_eq!(step(&mut m), Step::SetGroupMetadata);
             m.backend.shutdown();
+        }
+
+        #[test]
+        fn a_group_photo_must_be_an_image_of_at_most_25_mb() {
+            let dir = tempfile::tempdir().unwrap();
+            let not_image = dir.path().join("notes.pdf");
+            std::fs::write(&not_image, b"%PDF-1.7 not an image").unwrap();
+            assert!(read_group_photo(&not_image).is_err());
+            let photo = dir.path().join("photo.png");
+            image::RgbaImage::from_pixel(8, 8, image::Rgba([200, 80, 40, 255])).save(&photo).unwrap();
+            assert!(read_group_photo(&photo).is_ok_and(|bytes| !bytes.is_empty()));
+            // Too large is refused before it's read.
+            let large = dir.path().join("large.png");
+            std::fs::File::create(&large).unwrap().set_len(GROUP_PHOTO_MAX_BYTES + 1).unwrap();
+            assert!(read_group_photo(&large).is_err_and(|reason| reason.contains("25 MB")));
+            assert!(read_group_photo(&dir.path().join("missing.png")).is_err());
         }
 
         #[gpui_kit::test]

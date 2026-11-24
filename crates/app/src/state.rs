@@ -1369,12 +1369,11 @@ impl AppState {
                 self.select(Some(conversation.clone()), cx);
                 cx.emit(AppEvent::GroupCreated);
             }
-            // Desktop's `CREATE_GROUP_REJECTED` dialog, untitled.
-            Event::GroupCreateFailed => {
-                cx.emit(AppEvent::Alert {
-                    title: SharedString::default(),
-                    description: "This group couldn\u{2019}t be created. Check your connection and try again.".into(),
-                });
+            // Desktop's `CREATE_GROUP_REJECTED` dialog, untitled; or what
+            // kept it from being made, when that wasn't the connection.
+            Event::GroupCreateFailed { reason } => {
+                let description = reason.unwrap_or_else(|| "This group couldn\u{2019}t be created. Check your connection and try again.".into());
+                cx.emit(AppEvent::Alert { title: SharedString::default(), description: description.into() });
                 cx.emit(AppEvent::GroupCreateFailed);
             }
             Event::GroupLinkPreview(preview) => cx.emit(AppEvent::GroupLinkPreview(std::rc::Rc::new(preview))),

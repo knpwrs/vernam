@@ -2145,16 +2145,15 @@ impl Actor {
     async fn create_group(self: Rc<Self>, title: String, members: Vec<String>, avatar: Option<Vec<u8>>, expire_timer: u32) {
         let title = title.trim().to_owned();
         if title.is_empty() {
-            self.emit(Event::GroupCreateFailed);
-            return self.emit(Event::Error("A group needs a name".into()));
+            return self.emit(Event::GroupCreateFailed { reason: Some("A group needs a name.".into()) });
         }
         let Some(manager) = self.manager() else {
             warn!("can't create a group: not connected");
-            return self.emit(Event::GroupCreateFailed);
+            return self.emit(Event::GroupCreateFailed { reason: None });
         };
         let Some(me) = Aci::parse_from_service_id_string(&self.self_aci()) else {
             warn!("can't create a group: no account");
-            return self.emit(Event::GroupCreateFailed);
+            return self.emit(Event::GroupCreateFailed { reason: None });
         };
         let mine = self.our_profile_key(&manager).await;
         let mut candidates = Vec::new();
@@ -2167,17 +2166,26 @@ impl Actor {
         // counting us (the UI stops picking people before that).
         let limit = crate::remote_config().group_size_hard_limit();
         if candidates.len() + 1 > limit {
-            self.emit(Event::GroupCreateFailed);
-            return self.emit(Event::Error(format!("Signal groups can have a maximum of {limit} members.")));
+            let reason = format!("Signal groups can have a maximum of {limit} members.");
+            return self.emit(Event::GroupCreateFailed { reason: Some(reason) });
         }
+        // Desktop's avatar picker: the picked image made a group photo,
+        // before anything goes out. One that can't be is its own failure,
+        // not the connection's (the app checks when it's picked too).
+        let photo = match avatar {
+            Some(image) => match tokio::task::spawn_blocking(move || crate::media::group_avatar(&image)).await.map_err(anyhow::Error::from).and_then(|r| r) {
+                Ok(photo) => Some(photo),
+                Err(error) => {
+                    warn!(error = %format!("{error:#}"), "couldn't make the group photo");
+                    let reason = "The group photo couldn\u{2019}t be used. Choose another image and try again.".to_owned();
+                    return self.emit(Event::GroupCreateFailed { reason: Some(reason) });
+                }
+            },
+            None => None,
+        };
         let key: [u8; 32] = rand::Rng::random(&mut rand::rng());
         let created = async {
             let session = crate::groups::GroupSession::new(&manager, key).await?;
-            // Desktop's avatar picker: the picked image made a group photo.
-            let photo = match avatar {
-                Some(image) => Some(tokio::task::spawn_blocking(move || crate::media::group_avatar(&image)).await??),
-                None => None,
-            };
             session.create(&title, (me, mine), &candidates, photo.as_deref(), expire_timer).await?;
             let group = session.fetch().await?;
             self.store.save_group(key, group).await.map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -2187,7 +2195,7 @@ impl Actor {
         if let Err(error) = created {
             // Desktop's dialog says so ("This group couldn't be created").
             warn!(error = %format!("{error:#}"), "couldn't create the group");
-            return self.emit(Event::GroupCreateFailed);
+            return self.emit(Event::GroupCreateFailed { reason: None });
         }
         let conversation = ConversationId::group(&key);
         self.ensure_title(&conversation).await;

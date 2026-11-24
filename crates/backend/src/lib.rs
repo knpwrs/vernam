@@ -1201,8 +1201,9 @@ pub enum Event {
     /// A group we created is ready to open.
     GroupCreated(ConversationId),
     /// Creating a group failed (Desktop's `CREATE_GROUP_REJECTED`: "This
-    /// group couldn't be created").
-    GroupCreateFailed,
+    /// group couldn't be created"). `reason` says why when it isn't the
+    /// connection: no name, too many members, a photo that can't be used.
+    GroupCreateFailed { reason: Option<String> },
     /// What a group link leads to, for Desktop's join dialog.
     GroupLinkPreview(GroupLinkPreview),
     /// Open this group (joined, asked to join, or already in it), with
