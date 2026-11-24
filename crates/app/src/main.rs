@@ -3,6 +3,7 @@
 mod accounts;
 mod assets;
 mod avatar_presets;
+mod avatar_text;
 mod chat_color;
 mod audio;
 mod emoji_usage;

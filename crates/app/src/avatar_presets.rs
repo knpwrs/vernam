@@ -11,13 +11,15 @@ const SIZE: u32 = 1024;
 /// A preset: the illustration and its color (an index into the avatar
 /// colors, A100 = 0 to A210 = 11).
 pub struct Preset {
+    /// Desktop's name for it (`AvatarIconType`), as saved avatars name it.
+    pub name: &'static str,
     pub svg: &'static [u8],
     pub color: u8,
 }
 
 macro_rules! preset {
     ($name:literal, $color:literal) => {
-        Preset { svg: include_bytes!(concat!("../assets/avatars/avatar_", $name, ".svg")), color: $color }
+        Preset { name: $name, svg: include_bytes!(concat!("../assets/avatars/avatar_", $name, ".svg")), color: $color }
     };
 }
 
@@ -54,12 +56,23 @@ pub const GROUP_PRESETS: [Preset; 12] = [
     preset!("surfboard", 11),
 ];
 
+/// The illustration Desktop names `name`, a person's or a group's.
+pub fn by_name(name: &str) -> Option<&'static Preset> {
+    PRESETS.iter().chain(&GROUP_PRESETS).find(|p| p.name == name)
+}
+
 /// The preset as a PNG, its color behind the illustration.
 pub fn render(preset: &Preset) -> anyhow::Result<Vec<u8>> {
+    render_on(preset, preset.color)
+}
+
+/// The preset's illustration on avatar color `color` (Desktop's
+/// `AvatarIconEditor` recolors one), as a PNG.
+pub fn render_on(preset: &Preset, color: u8) -> anyhow::Result<Vec<u8>> {
     use resvg::{tiny_skia, usvg};
     let tree = usvg::Tree::from_data(preset.svg, &usvg::Options::default())?;
     let mut pixmap = tiny_skia::Pixmap::new(SIZE, SIZE).ok_or_else(|| anyhow::anyhow!("no pixmap"))?;
-    let bg = crate::theme::avatar_rgb(preset.color).0;
+    let bg = crate::theme::avatar_rgb(color).0;
     pixmap.fill(tiny_skia::Color::from_rgba8((bg >> 16) as u8, (bg >> 8) as u8, bg as u8, 255));
     let scale = SIZE as f32 / tree.size().width().max(tree.size().height());
     resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
