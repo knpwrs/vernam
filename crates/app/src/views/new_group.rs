@@ -1,8 +1,8 @@
-//! Desktop's "New group" (pick members, name it, give it a photo and a
-//! disappearing message timer, create; or join one by its link) and "Add
-//! members" (pick people, confirm), both within the remote config's group size
-//! limits: rows stop being pickable at the hard limit, and Desktop's
-//! one-time alerts say when the recommended or the hard limit is reached.
+//! Desktop's "Add members" (pick people, confirm) within the remote
+//! config's group size limits: rows stop being pickable at the hard limit,
+//! and Desktop's one-time alerts say when the recommended or the hard
+//! limit is reached. The limits, alerts and `toggle` serve New group too,
+//! which New chat's left pane builds (`compose.rs`).
 
 use std::collections::BTreeSet;
 
@@ -21,27 +21,27 @@ use crate::theme::{Palette, color_for};
 /// Desktop's one-time alerts (`OneTimeModalState`): each shows at most
 /// once while picking.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct Alerts {
+pub(crate) struct Alerts {
     maximum: bool,
     recommended: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SizeAlert {
+pub(crate) enum SizeAlert {
     Maximum,
     Recommended,
 }
 
 /// The group size limits, counting us (see `RemoteConfig`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Limits {
-    recommended: usize,
-    hard: usize,
+pub(crate) struct Limits {
+    pub(crate) recommended: usize,
+    pub(crate) hard: usize,
 }
 
 impl Limits {
     /// The account's limits, from its remote config.
-    fn now(state: &AppState) -> Self {
+    pub(crate) fn now(state: &AppState) -> Self {
         let config = state.remote_config();
         Self { recommended: config.group_size_recommended(), hard: config.group_size_hard_limit() }
     }
@@ -53,7 +53,7 @@ impl Limits {
 /// doesn't happen; one that reaches it, or the recommended limit, brings
 /// that alert the first time. `already` is how many are in the group,
 /// counting us (1 for a new group).
-fn toggle(chosen: &mut BTreeSet<String>, sid: &str, already: usize, limits: Limits, alerts: &mut Alerts) -> Option<SizeAlert> {
+pub(crate) fn toggle(chosen: &mut BTreeSet<String>, sid: &str, already: usize, limits: Limits, alerts: &mut Alerts) -> Option<SizeAlert> {
     if chosen.remove(sid) {
         return None;
     }
@@ -75,7 +75,7 @@ fn toggle(chosen: &mut BTreeSet<String>, sid: &str, already: usize, limits: Limi
 
 /// Desktop's group size alerts (`AddGroupMemberErrorDialog.dom.tsx`), in
 /// its words; `max` as each caller of Desktop's passes it.
-fn show_alert(alert: SizeAlert, max: usize, window: &mut Window, cx: &mut App) {
+pub(crate) fn show_alert(alert: SizeAlert, max: usize, window: &mut Window, cx: &mut App) {
     let (title, description) = match alert {
         SizeAlert::Maximum => ("Maximum group size reached", format!("Signal groups can have a maximum of {max} members.")),
         SizeAlert::Recommended => (
@@ -92,10 +92,6 @@ struct Picking {
     people: Vec<DirectoryEntry>,
     chosen: BTreeSet<String>,
     alerts: Alerts,
-    /// A new group's photo (Desktop's avatar picker): the picked file.
-    avatar: Option<(std::path::PathBuf, Vec<u8>)>,
-    /// A new group's disappearing message timer, in seconds.
-    timer: u32,
 }
 
 /// Who's already in the group (ACIs), when adding to one.
@@ -103,29 +99,20 @@ struct Adding {
     conversation: Conversation,
 }
 
-pub fn open(state: Entity<AppState>, window: &mut Window, cx: &mut App) {
-    let _ = open_picker(state, None, window, cx);
-}
-
 /// Desktop's "Add members" for a group we may add people to.
 pub fn open_add_members(state: Entity<AppState>, conversation: Conversation, window: &mut Window, cx: &mut App) {
-    let _ = open_picker(state, Some(Adding { conversation }), window, cx);
+    let _ = open_picker(state, Adding { conversation }, window, cx);
 }
 
-fn open_picker(state: Entity<AppState>, adding: Option<Adding>, window: &mut Window, cx: &mut App) -> Entity<Picking> {
+fn open_picker(state: Entity<AppState>, adding: Adding, window: &mut Window, cx: &mut App) -> Entity<Picking> {
     let limits = Limits::now(state.read(cx));
-    // A new group has us in it.
-    let already = adding.as_ref().map_or(1, |a| a.conversation.members.len());
-    let existing: BTreeSet<String> = adding.as_ref().map(|a| a.conversation.members.iter().cloned().collect()).unwrap_or_default();
+    let already = adding.conversation.members.len();
+    let existing: BTreeSet<String> = adding.conversation.members.iter().cloned().collect();
     // Desktop's `AddGroupMembersModal`: a full group says so at once; one
     // past the recommended size doesn't say so again.
     let alerts = Alerts { maximum: already >= limits.hard, recommended: already >= limits.recommended };
-    let name = cx.new(|cx| InputState::new(window, cx).placeholder("Group name (required)"));
     let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search name or number"));
-    // Desktop's new group starts with the default timer for new chats
-    // (the composer's `groupExpireTimer`, `universalExpireTimer`).
-    let timer = state.read(cx).prefs.universal_timer;
-    let picking = cx.new(|_| Picking { people: Vec::new(), chosen: BTreeSet::new(), alerts, avatar: None, timer });
+    let picking = cx.new(|_| Picking { people: Vec::new(), chosen: BTreeSet::new(), alerts });
     let backend = state.read(cx).backend.clone();
     let db = backend.db().clone();
     let query = backend.spawn(async move { db.people().await });
@@ -138,24 +125,19 @@ fn open_picker(state: Entity<AppState>, adding: Option<Adding>, window: &mut Win
         });
     })
     .detach();
-    // What Desktop's alerts count: a new group's leave us out
-    // (`LeftPaneChooseGroupMembersHelper`), "Add members" doesn't.
-    let is_adding = adding.is_some();
-    let alert_max = move |alert: SizeAlert| match (alert, is_adding) {
-        (SizeAlert::Maximum, false) => limits.hard - 1,
-        (SizeAlert::Recommended, false) => limits.recommended - 1,
-        (SizeAlert::Maximum, true) => limits.hard,
-        (SizeAlert::Recommended, true) => limits.recommended,
+    // What Desktop's alerts count: "Add members" counts us (a new group's
+    // leave us out, `LeftPaneChooseGroupMembersHelper`).
+    let alert_max = move |alert: SizeAlert| match alert {
+        SizeAlert::Maximum => limits.hard,
+        SizeAlert::Recommended => limits.recommended,
     };
-    let adding_to = adding.map(|a| a.conversation);
-    let title = if adding_to.is_some() { "Add members" } else { "New group" };
+    let group = adding.conversation;
     let picked = picking.clone();
     window.open_dialog(cx, move |dialog, _, cx| {
         let palette = Palette::get(cx);
         let needle = search.read(cx).value().trim().to_lowercase();
         let chosen = picking.read(cx).chosen.clone();
-        // Desktop's `hasSelectedMaximumNumberOfContacts` (new group) and
-        // `ChooseGroupMembersModal` (adding): the group would be full.
+        // Desktop's `ChooseGroupMembersModal`: the group would be full.
         let full = chosen.len() + already >= limits.hard;
         let people: Vec<DirectoryEntry> = picking
             .read(cx)
@@ -210,122 +192,33 @@ fn open_picker(state: Entity<AppState>, adding: Option<Adding>, window: &mut Win
                         .when(on, |d| d.bg(palette.accent)),
                 )
         });
-        let (create_state, create_name, create_picking) = (state.clone(), name.clone(), picking.clone());
-        let ready = !chosen.is_empty() && (adding_to.is_some() || !name.read(cx).value().trim().is_empty());
-        let target = adding_to.clone();
+        let (add_state, add_picking) = (state.clone(), picking.clone());
+        let ready = !chosen.is_empty();
+        let target = group.clone();
         let footer = DialogFooter::new()
             .child(Button::new("new-group-cancel").label("Cancel").outline().on_click(|_, window, cx| window.close_all_dialogs(cx)))
-            .child(
-                Button::new("new-group-create")
-                    .label(if target.is_some() { "Update" } else { "Create" })
-                    .primary()
-                    .disabled(!ready)
-                    .on_click(move |_, window, cx| {
-                        let members: Vec<String> = create_picking.read(cx).chosen.iter().cloned().collect();
-                        match &target {
-                            Some(group) => confirm_additions(create_state.clone(), group.clone(), members, window, cx),
-                            None => {
-                                let title = create_name.read(cx).value().trim().to_string();
-                                let (avatar, expire_timer) = {
-                                    let picking = create_picking.read(cx);
-                                    (picking.avatar.as_ref().map(|(_, bytes)| bytes.clone()), picking.timer)
-                                };
-                                create_state.read(cx).send(Command::CreateGroup { title, members, avatar, expire_timer });
-                                window.close_all_dialogs(cx);
-                            }
-                        }
-                    }),
-            );
+            .child(Button::new("new-group-create").label("Update").primary().disabled(!ready).on_click(move |_, window, cx| {
+                let members: Vec<String> = add_picking.read(cx).chosen.iter().cloned().collect();
+                confirm_additions(add_state.clone(), target.clone(), members, window, cx);
+            }));
         dialog
-            .title(title)
+            .title("Add members")
             .w(px(440.))
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .when(adding_to.is_none(), |d| d.child(Input::new(&name)).child(new_group_extras(&state, &picking, palette, cx)))
                     .child(Input::new(&search))
                     .child(div().text_xs().text_color(palette.text_secondary).child(format!("{} chosen", chosen.len())))
                     .child(div().id("new-group-people").h(px(320.)).overflow_y_scroll().children(rows)),
             )
             .footer(footer)
     });
-    if is_adding && already >= limits.hard {
+    if already >= limits.hard {
         show_alert(SizeAlert::Maximum, limits.hard, window, cx);
     }
     picked
-}
-
-/// A new group's photo and disappearing message timer (Desktop's
-/// `GroupPeekView` step), and joining one by a link instead.
-fn new_group_extras(state: &Entity<AppState>, picking: &Entity<Picking>, palette: Palette, cx: &App) -> impl IntoElement {
-    use gpui_kit::component::Sizable as _;
-    use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
-    let (photo, timer) = {
-        let p = picking.read(cx);
-        (p.avatar.as_ref().map(|(path, _)| path.clone()), p.timer)
-    };
-    let pick = picking.clone();
-    let choose = Button::new("new-group-photo").label(if photo.is_some() { "Change photo" } else { "Add photo" }).outline().small().on_click(
-        move |_, window, cx| {
-            let picked = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
-                files: true,
-                directories: false,
-                multiple: false,
-                prompt: Some("Choose a group photo".into()),
-            });
-            let pick = pick.clone();
-            window
-                .spawn(cx, async move |cx| {
-                    let Ok(Ok(Some(paths))) = picked.await else { return };
-                    let Some(path) = paths.into_iter().next() else { return };
-                    let Ok(bytes) = std::fs::read(&path) else { return };
-                    pick.update(cx, |p, cx| {
-                        p.avatar = Some((path, bytes));
-                        cx.notify();
-                    });
-                })
-                .detach();
-        },
-    );
-    let timers = picking.clone();
-    let timer_button = Button::new("new-group-timer")
-        .label(format!("Disappearing messages: {}", crate::views::chat_menu::format_timer_long(timer)))
-        .outline()
-        .small()
-        .dropdown_menu(move |mut menu, _, _| {
-            for seconds in crate::views::chat_menu::TIMER_CHOICES {
-                let timers = timers.clone();
-                menu = menu.item(PopupMenuItem::new(crate::views::chat_menu::format_timer_long(seconds)).checked(timer == seconds).on_click(
-                    move |_, window, cx| {
-                        timers.update(cx, |p, _| p.timer = seconds);
-                        window.refresh();
-                    },
-                ));
-            }
-            menu
-        });
-    let link_state = state.clone();
-    div()
-        .flex()
-        .flex_wrap()
-        .items_center()
-        .gap_2()
-        .when_some(photo, |d, path| d.child(crate::views::common::group_photo(Some(&path), "", 0, px(32.))))
-        .child(choose)
-        .child(timer_button)
-        .child(
-            Button::new("new-group-join-link")
-                .label("Join with a group link")
-                .ghost()
-                .small()
-                .text_color(palette.accent)
-                .on_click(move |_, window, cx| {
-                    window.close_all_dialogs(cx);
-                    crate::views::group_admin::open_paste_link(link_state.clone(), window, cx);
-                }),
-        )
 }
 
 /// Desktop's `ConfirmAdditionsModal`: "Add Alice to "Hikers"?".
@@ -426,7 +319,7 @@ mod tests {
         let hikers = ConversationId(HIKERS.into());
         wait(&mut cx, "the demo group", &|cx| state.read_with(cx, |s, _| s.conversation(&hikers).is_some_and(|c| c.can_add_members)));
         let group = state.read_with(&cx, |s, _| s.conversation(&hikers).cloned()).unwrap();
-        let picking = cx.update(|window, cx| open_picker(state.clone(), Some(Adding { conversation: group }), window, cx));
+        let picking = cx.update(|window, cx| open_picker(state.clone(), Adding { conversation: group }, window, cx));
         let row = |who: &str| -> &'static str { Box::leak(format!("pick-{who}").into_boxed_str()) };
         wait(&mut cx, "the people", &|cx| cx.debug_bounds(row(ANA)).is_some() && cx.debug_bounds(row(MAYA)).is_some());
         // Members are there, but can't be picked again.

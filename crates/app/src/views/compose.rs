@@ -8,10 +8,14 @@
 //! (`LeftPaneFindByUsernameHelper`, `LeftPaneFindByPhoneNumberHelper`),
 //! each a field and a Next button that looks the entry up.
 //!
-//! Not here yet: New group as a left-pane flow (it opens the New group
-//! dialog), and the contacts' "Manage Contact" menu, whose Remove the
+//! "New group" goes on in the pane too: "Choose members"
+//! (`LeftPaneChooseGroupMembersHelper`), then "Name this group"
+//! (`LeftPaneSetGroupMetadataHelper`), which creates it.
+//!
+//! Not here yet: the contacts' "Manage Contact" menu, whose Remove the
 //! backend doesn't do.
 
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
@@ -26,6 +30,7 @@ use signal_store::{ComposeContact, Conversation, ConversationId, ConversationKin
 
 use crate::state::{AppEvent, AppState};
 use crate::theme::Palette;
+use crate::views::new_group::{Alerts, Limits, SizeAlert};
 
 /// Row heights (Desktop's `ConversationList` `calculateRowHeight`).
 const HEADER_HEIGHT: f32 = 40.;
@@ -48,6 +53,12 @@ enum Row {
     Username(String),
     /// "Find by phone number": the number as read, and as typed.
     Phone(ParsedPhone, String),
+    /// Choose members' rows: a contact to pick (`ContactCheckbox`), and a
+    /// username or number to look up and pick (`UsernameCheckbox`,
+    /// `PhoneNumberCheckbox`).
+    Checkbox(usize),
+    UsernameCheckbox(String),
+    PhoneCheckbox(ParsedPhone, String),
 }
 
 /// Asks the sidebar to close the composer.
@@ -77,7 +88,31 @@ enum Step {
     NewChat,
     FindByUsername,
     FindByPhoneNumber,
+    ChooseMembers,
+    SetGroupMetadata,
 }
+
+/// The group being made (Desktop's group-creation state), kept from
+/// Choose members to Name this group and back.
+struct GroupDraft {
+    /// Who's picked, and in the order picked (the pills' order).
+    chosen: BTreeSet<String>,
+    order: Vec<String>,
+    /// Names of people picked by a lookup, who aren't listed.
+    found_names: HashMap<String, String>,
+    alerts: Alerts,
+    /// The picked photo: its file, and its bytes.
+    avatar: Option<(std::path::PathBuf, Vec<u8>)>,
+    /// The disappearing message timer, in seconds.
+    timer: u32,
+    name: Entity<InputState>,
+    /// "Create" was pressed and the backend hasn't answered.
+    creating: bool,
+    _subscription: Subscription,
+}
+
+/// Desktop's `maxLengthCount` for a group's name, in characters.
+const GROUP_NAME_MAX: usize = 32;
 
 /// A Find pane's field, and for a number the country picked.
 struct Find {
@@ -103,6 +138,8 @@ pub struct Compose {
     /// The username or number being looked up (as sent), and the text to
     /// name it by.
     finding: Option<(String, Finding)>,
+    /// New group's choices, from Choose members on.
+    group: Option<GroupDraft>,
     load: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -128,6 +165,14 @@ impl Compose {
                 // A profile brings a new name to search and a new About.
                 AppEvent::ConversationsChanged | AppEvent::ProfileChanged(_) => this.load(cx),
                 AppEvent::RecipientFound { query, result } => this.found(query, result, window, cx),
+                AppEvent::GroupCreated => this.group_created(cx),
+                // The dialog is the state's (Desktop's `CREATE_GROUP_REJECTED`).
+                AppEvent::GroupCreateFailed => {
+                    if let Some(group) = &mut this.group {
+                        group.creating = false;
+                        cx.notify();
+                    }
+                }
                 _ => {}
             }),
         ];
@@ -142,6 +187,7 @@ impl Compose {
             rows: Rc::default(),
             list: ListState::new(0, ListAlignment::Top, px(SELECT_HEIGHT * 8.)),
             finding: None,
+            group: None,
             load: None,
             _subscriptions: subscriptions,
         };
@@ -150,9 +196,19 @@ impl Compose {
         this
     }
 
-    /// Its field: New chat's search, or the Find pane's.
+    /// Its field: New chat's (and Choose members') search, the Find
+    /// pane's, or the group's name.
     pub fn search_input(&self) -> Entity<InputState> {
-        self.find.as_ref().map_or_else(|| self.search.clone(), |find| find.input.clone())
+        match (self.step, &self.find, &self.group) {
+            (Step::SetGroupMetadata, _, Some(group)) => group.name.clone(),
+            (_, Some(find), _) => find.input.clone(),
+            _ => self.search.clone(),
+        }
+    }
+
+    /// A group is being created: nothing leaves the pane until it's answered.
+    fn creating(&self) -> bool {
+        self.group.as_ref().is_some_and(|g| g.creating)
     }
 
     /// The pencil or ⌘N while it's open (Desktop's `START_COMPOSING`): a
@@ -160,7 +216,7 @@ impl Compose {
     /// A Find pane's lookup isn't dropped (back and Escape wait for it too;
     /// Desktop's still opens its chat when it comes).
     pub fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.step != Step::NewChat && self.finding.is_none() {
+        if self.step != Step::NewChat && self.finding.is_none() && !self.creating() {
             self.show_new_chat(window, cx);
         }
         self.search_input().update(cx, |input, cx| input.focus(window, cx));
@@ -198,16 +254,23 @@ impl Compose {
 
     /// Back from a Find pane to a fresh New chat (Desktop's `startComposing`),
     /// which isn't while a lookup runs.
+    /// From Choose members it's New chat again, the picks dropped (Desktop's
+    /// `startComposing`); from Name this group, Choose members with them
+    /// kept (`showChooseGroupMembers`), not while creating.
     fn back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.finding.is_some() {
+        if self.finding.is_some() || self.creating() {
             return;
         }
-        self.show_new_chat(window, cx);
+        match self.step {
+            Step::SetGroupMetadata => self.show_choose_members(window, cx),
+            _ => self.show_new_chat(window, cx),
+        }
     }
 
     fn show_new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.step = Step::NewChat;
         self.find = None;
+        self.group = None;
         self.finding = None;
         self.query.clear();
         self.search.update(cx, |input, cx| {
@@ -215,6 +278,162 @@ impl Compose {
             input.focus(window, cx);
         });
         self.rebuild(false, cx);
+    }
+
+    /// Choose members (Desktop's `showChooseGroupMembers`): a fresh pick
+    /// from New chat, or the same one back from Name this group; the
+    /// search starts empty either way. Not while a lookup runs.
+    fn show_choose_members(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.finding.is_some() {
+            return;
+        }
+        if self.group.is_none() {
+            // Desktop starts a new group with the default timer for new
+            // chats (`universalExpireTimer`).
+            let timer = self.state.read(cx).prefs.universal_timer;
+            let name = cx.new(|cx| InputState::new(window, cx).placeholder("Group name (required)"));
+            let subscription = cx.subscribe_in(&name, window, |this, input, event: &InputEvent, window, cx| match event {
+                // Desktop's `Input` refuses more than 32 characters.
+                InputEvent::Change => {
+                    use unicode_segmentation::UnicodeSegmentation as _;
+                    let text = input.read(cx).value().to_string();
+                    if text.graphemes(true).count() > GROUP_NAME_MAX {
+                        let kept: String = text.graphemes(true).take(GROUP_NAME_MAX).collect();
+                        input.update(cx, |input, cx| input.set_value(kept, window, cx));
+                    }
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } => this.create(cx),
+                _ => {}
+            });
+            self.group = Some(GroupDraft {
+                chosen: BTreeSet::new(),
+                order: Vec::new(),
+                found_names: HashMap::new(),
+                alerts: Alerts::default(),
+                avatar: None,
+                timer,
+                name,
+                creating: false,
+                _subscription: subscription,
+            });
+        }
+        self.step = Step::ChooseMembers;
+        self.find = None;
+        self.query.clear();
+        self.search.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+            input.focus(window, cx);
+        });
+        self.rebuild(false, cx);
+    }
+
+    /// Name this group (Desktop's `startSettingGroupMetadata`).
+    fn show_set_metadata(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(group) = &self.group else { return };
+        // Desktop disables Next past the hard limit, which picking can't reach.
+        if group.chosen.len() + 1 > Limits::now(self.state.read(cx)).hard {
+            return;
+        }
+        let name = group.name.clone();
+        self.step = Step::SetGroupMetadata;
+        name.update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    /// Picks or unpicks someone for the new group (Desktop's
+    /// `toggleSelectedContactForGroupAddition`), with its size alerts,
+    /// which count the members besides us.
+    fn toggle_member(&mut self, sid: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let limits = Limits::now(self.state.read(cx));
+        let Some(group) = &mut self.group else { return };
+        let alert = crate::views::new_group::toggle(&mut group.chosen, sid, 1, limits, &mut group.alerts);
+        if group.chosen.contains(sid) {
+            if !group.order.iter().any(|s| s == sid) {
+                group.order.push(sid.to_owned());
+            }
+        } else {
+            group.order.retain(|s| s != sid);
+        }
+        if let Some(alert) = alert {
+            let max = match alert {
+                SizeAlert::Maximum => limits.hard - 1,
+                SizeAlert::Recommended => limits.recommended - 1,
+            };
+            crate::views::new_group::show_alert(alert, max, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// A picked person's name, and the first name a pill shows (Desktop's
+    /// `systemGivenName ?? firstName`, else the title; here the profile's
+    /// given name, else the title).
+    fn member_names(&self, sid: &str) -> (String, String) {
+        if let Some(c) = self.candidates.iter().map(|c| &c.contact).find(|c| c.service_id == sid) {
+            let first = if c.profile_given.trim().is_empty() { c.title.clone() } else { c.profile_given.clone() };
+            return (c.title.clone(), first);
+        }
+        let title = self.group.as_ref().and_then(|g| g.found_names.get(sid).cloned()).unwrap_or_else(|| "Unknown".into());
+        (title.clone(), title)
+    }
+
+    /// "Create" (Desktop's `createGroup`): for a name that isn't blank, and
+    /// not twice.
+    fn create(&mut self, cx: &mut Context<Self>) {
+        if self.step != Step::SetGroupMetadata {
+            return;
+        }
+        let Some(group) = &mut self.group else { return };
+        let title = group.name.read(cx).value().trim().to_string();
+        if group.creating || title.is_empty() {
+            return;
+        }
+        group.creating = true;
+        let command = signal_backend::Command::CreateGroup {
+            title,
+            members: group.order.clone(),
+            avatar: group.avatar.as_ref().map(|(_, bytes)| bytes.clone()),
+            expire_timer: group.timer,
+        };
+        self.state.read(cx).send(command);
+        cx.notify();
+    }
+
+    /// The group we created opened (the state selected it): the composer
+    /// closes, to the inbox (Desktop's `showConversation` with
+    /// `switchToAssociatedView`).
+    fn group_created(&mut self, cx: &mut Context<Self>) {
+        if self.creating() {
+            if let Some(group) = &mut self.group {
+                group.creating = false;
+            }
+            cx.emit(ComposeEvent::Opened { archived: false });
+        }
+    }
+
+    /// Picks a photo for the new group (Desktop's `AvatarPreview` upload).
+    fn pick_photo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose a group photo".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = picked.await else { return };
+            let Some(path) = paths.into_iter().next() else { return };
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) => return tracing::warn!(%error, "couldn't read the group photo"),
+            };
+            let _ = this.update(cx, |this, cx| {
+                if let Some(group) = &mut this.group {
+                    group.avatar = Some((path, bytes));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// The account's region (Desktop's `regionCode`), from its number.
@@ -236,7 +455,7 @@ impl Compose {
                 let phone = signal_backend::recipients::parse_phone_in(&text, region.as_deref())?;
                 phone.valid.then(|| Row::Phone(phone, text.trim().to_owned()))
             }
-            Step::NewChat => None,
+            Step::NewChat | Step::ChooseMembers | Step::SetGroupMetadata => None,
         }
     }
 
@@ -404,35 +623,10 @@ impl Compose {
         let username = username_from_search(&self.query);
         let probably_username = is_probably_a_username(&self.query);
         let mut rows = Vec::new();
-        if self.query.is_empty() {
-            rows.extend([Row::NewGroup, Row::FindByUsername, Row::FindByPhoneNumber]);
-        }
-        if !contacts.is_empty() && !probably_username {
-            rows.push(Row::Header("Contacts"));
-            rows.extend(contacts.iter().map(|&ix| Row::Contact(ix)));
-        }
-        if !group_order.is_empty() && !probably_username {
-            rows.push(Row::Header("Groups"));
-            rows.extend(group_order.iter().map(|&ix| Row::Group(groups[ix].id.clone())));
-        }
-        // Desktop compares with the `username` of the contacts listed,
-        // which it keeps only for people known by nothing else.
-        let listed_username = |name: &str| {
-            contacts.iter().any(|&ix| {
-                let c = &self.candidates[ix].contact;
-                c.username.as_deref() == Some(name) && c.title == name
-            })
-        };
-        if let Some(name) = username.as_deref().filter(|name| !listed_username(name)) {
-            rows.push(Row::Header("Find by username"));
-            rows.push(Row::Username(name.to_owned()));
-        }
-        if username.is_none()
-            && let Some(phone) = parsed.clone()
-            && !contacts.iter().any(|&ix| self.candidates[ix].contact.phone.as_deref() == Some(phone.e164.as_str()))
-        {
-            rows.push(Row::Header("Find by phone number"));
-            rows.push(Row::Phone(phone, term.to_owned()));
+        if self.step == Step::ChooseMembers {
+            self.member_rows(&mut rows, &contacts, username.as_deref(), parsed.clone(), term);
+        } else if self.step == Step::NewChat || self.step == Step::FindByUsername || self.step == Step::FindByPhoneNumber {
+            self.new_chat_rows(&mut rows, &contacts, &groups, &group_order, username.as_deref(), probably_username, parsed.clone(), term);
         }
         if *self.rows != rows {
             if keep_place {
@@ -453,6 +647,80 @@ impl Compose {
             self.rows = Rc::new(rows);
         }
         cx.notify();
+    }
+
+    /// New chat's rows (Desktop's `LeftPaneComposeHelper.getRow`).
+    #[allow(clippy::too_many_arguments)]
+    fn new_chat_rows(
+        &self,
+        rows: &mut Vec<Row>,
+        contacts: &[usize],
+        groups: &[Conversation],
+        group_order: &[usize],
+        username: Option<&str>,
+        probably_username: bool,
+        parsed: Option<ParsedPhone>,
+        term: &str,
+    ) {
+        if self.query.is_empty() {
+            rows.extend([Row::NewGroup, Row::FindByUsername, Row::FindByPhoneNumber]);
+        }
+        if !contacts.is_empty() && !probably_username {
+            rows.push(Row::Header("Contacts"));
+            rows.extend(contacts.iter().map(|&ix| Row::Contact(ix)));
+        }
+        if !group_order.is_empty() && !probably_username {
+            rows.push(Row::Header("Groups"));
+            rows.extend(group_order.iter().map(|&ix| Row::Group(groups[ix].id.clone())));
+        }
+        // Desktop compares with the `username` of the contacts listed,
+        // which it keeps only for people known by nothing else.
+        let listed_username = |name: &str| {
+            contacts.iter().any(|&ix| {
+                let c = &self.candidates[ix].contact;
+                c.username.as_deref() == Some(name) && c.title == name
+            })
+        };
+        if let Some(name) = username.filter(|name| !listed_username(name)) {
+            rows.push(Row::Header("Find by username"));
+            rows.push(Row::Username(name.to_owned()));
+        }
+        if username.is_none()
+            && let Some(phone) = parsed
+            && !contacts.iter().any(|&ix| self.candidates[ix].contact.phone.as_deref() == Some(phone.e164.as_str()))
+        {
+            rows.push(Row::Header("Find by phone number"));
+            rows.push(Row::Phone(phone, term.to_owned()));
+        }
+    }
+
+    /// Choose members' rows (Desktop's `LeftPaneChooseGroupMembersHelper.getRow`):
+    /// everyone New chat lists but us, then a number to look up, or a
+    /// username, unless it's ours or someone listed's.
+    fn member_rows(&self, rows: &mut Vec<Row>, contacts: &[usize], username: Option<&str>, parsed: Option<ParsedPhone>, term: &str) {
+        let listed: Vec<usize> = contacts.iter().copied().filter(|&ix| !self.candidates[ix].contact.me).collect();
+        if !listed.is_empty() {
+            rows.push(Row::Header("Contacts"));
+            rows.extend(listed.iter().map(|&ix| Row::Checkbox(ix)));
+        }
+        let me = self.candidates.iter().map(|c| &c.contact).find(|c| c.me);
+        let ours_username = me.and_then(|c| c.username.as_deref());
+        let ours_phone = me.and_then(|c| c.phone.as_deref());
+        let username = username.filter(|name| {
+            Some(*name) != ours_username && !listed.iter().any(|&ix| self.candidates[ix].contact.username.as_deref() == Some(*name))
+        });
+        if username.is_none()
+            && let Some(phone) = parsed
+            && Some(phone.e164.as_str()) != ours_phone
+            && !listed.iter().any(|&ix| self.candidates[ix].contact.phone.as_deref() == Some(phone.e164.as_str()))
+        {
+            rows.push(Row::Header("Find by phone number"));
+            rows.push(Row::PhoneCheckbox(phone, term.to_owned()));
+        }
+        if let Some(name) = username {
+            rows.push(Row::Header("Find by username"));
+            rows.push(Row::UsernameCheckbox(name.to_owned()));
+        }
     }
 
     /// Opens a chat picked from the list, and closes the composer.
@@ -483,7 +751,7 @@ impl Compose {
     /// runs. Another takes its place, and the earlier answer is dropped.
     fn look_up(&mut self, row: &Row, window: &mut Window, cx: &mut Context<Self>) {
         let (query, finding) = match row {
-            Row::Username(name) => {
+            Row::Username(name) | Row::UsernameCheckbox(name) => {
                 // Desktop's `usernames.hash` throws for one that can't be a
                 // username (`alice.007`), which it reports as not valid.
                 if !is_username_valid(name) {
@@ -495,7 +763,7 @@ impl Compose {
                 }
                 (name.clone(), Finding::Username(name.clone()))
             }
-            Row::Phone(phone, typed) => {
+            Row::Phone(phone, typed) | Row::PhoneCheckbox(phone, typed) => {
                 if !phone.valid {
                     let text = format!("User not found. \u{201c}{typed}\u{201d} is not a valid phone number.");
                     window.open_alert_dialog(cx, move |alert, _, _| alert.description(text.clone()));
@@ -522,6 +790,16 @@ impl Compose {
         let Some((_, finding)) = self.finding.take_if(|(q, _)| q == query) else { return };
         cx.notify();
         let error = match result {
+            // Choose members: the person found is picked (Desktop toggles
+            // them into the selection).
+            Ok(entry) if self.step == Step::ChooseMembers => {
+                let Some(sid) = entry.id.as_direct().map(str::to_owned) else { return };
+                if let Some(group) = &mut self.group {
+                    group.found_names.insert(sid.clone(), entry.title.clone());
+                }
+                self.toggle_member(&sid, window, cx);
+                return;
+            }
             Ok(entry) => {
                 // The Find panes go back to the inbox (Desktop's `showInbox`
                 // after `showConversation`), even for an archived chat.
@@ -572,10 +850,7 @@ impl Compose {
             Row::NewGroup => {
                 let icon = step_icon(IconName::Users, palette);
                 tile(SharedString::from("compose-new-group"), SELECT_HEIGHT, icon, div().child("New group").into_any_element(), None, Some("compose-new-group".into()), palette)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        crate::views::new_group::open(this.state.clone(), window, cx);
-                        cx.emit(ComposeEvent::Handoff);
-                    }))
+                    .on_click(cx.listener(|this, _, window, cx| this.show_choose_members(window, cx)))
                     .into_any_element()
             }
             Row::FindByUsername | Row::FindByPhoneNumber => {
@@ -589,35 +864,50 @@ impl Compose {
             }
             Row::Contact(index) => {
                 let Some(contact) = self.candidates.get(*index).map(|c| c.contact.clone()) else { return div().into_any_element() };
-                let state = self.state.read(cx);
-                let avatar = if contact.me {
-                    crate::views::common::chat_placeholder(ConversationKind::NoteToSelf, &contact.title, 0, px(32.))
-                } else {
-                    crate::views::common::badged_avatar(state, &contact.service_id, &contact.title, 32., cx)
-                };
-                let name = div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .min_w_0()
-                    .child(div().truncate().child(if contact.me { "Note to Self".to_owned() } else { contact.title.clone() }))
-                    .when(contact.me, |d| d.child(crate::views::common::official_badge(palette)))
-                    .when(contact.system_contact && !contact.me, |d| {
-                        d.child(
-                            div()
-                                .debug_selector(|| "system-contact-emblem".into())
-                                .child(Icon::new(IconName::CircleUser).size(px(14.)).text_color(palette.text_secondary)),
-                        )
-                    });
-                let about = (!contact.me && !contact.about.is_empty()).then(|| match contact.about_emoji.as_str() {
-                    "" => contact.about.clone(),
-                    emoji => format!("{emoji} {}", contact.about),
-                });
+                let avatar = contact_avatar(&self.state, &contact, 32., cx);
                 let id = SharedString::from(format!("compose-contact-{}", contact.service_id));
                 let selector = format!("compose-contact-{}", contact.title);
                 let index = *index;
-                tile(id, SELECT_HEIGHT, avatar, name.into_any_element(), about, Some(selector), palette)
+                tile(id, SELECT_HEIGHT, avatar, contact_name(&contact, palette), contact_about(&contact), Some(selector), palette)
                     .on_click(cx.listener(move |this, _, _, cx| this.open_contact(index, cx)))
+                    .into_any_element()
+            }
+            // Desktop's `ContactCheckbox`: the contact row with a round
+            // checkbox, which can't be ticked once the group is full.
+            Row::Checkbox(index) => {
+                let Some(contact) = self.candidates.get(*index).map(|c| c.contact.clone()) else { return div().into_any_element() };
+                let hard = Limits::now(self.state.read(cx)).hard;
+                let (on, full) = self.group.as_ref().map_or((false, false), |g| (g.chosen.contains(&contact.service_id), g.chosen.len() + 1 >= hard));
+                let disabled = !on && full;
+                let avatar = contact_avatar(&self.state, &contact, 32., cx);
+                let id = SharedString::from(format!("compose-member-{}", contact.service_id));
+                let selector = format!("compose-member-{}", contact.title);
+                let sid = contact.service_id.clone();
+                tile_with(id, SELECT_HEIGHT, avatar, contact_name(&contact, palette), contact_about(&contact), Some(selector), Some(checkbox(on, palette)), !disabled, palette)
+                    .when(disabled, |d| d.opacity(0.5))
+                    .when(!disabled, |d| d.on_click(cx.listener(move |this, _, window, cx| this.toggle_member(&sid, window, cx))))
+                    .into_any_element()
+            }
+            // Desktop's `UsernameCheckbox` and `PhoneNumberCheckbox`: looked
+            // up when clicked, a spinner instead of the checkbox meanwhile.
+            Row::UsernameCheckbox(name) | Row::PhoneCheckbox(_, name) => {
+                let fetching = self.finding.as_ref().is_some_and(|(query, _)| match &row {
+                    Row::UsernameCheckbox(name) => query == name,
+                    Row::PhoneCheckbox(phone, _) => *query == phone.e164,
+                    _ => false,
+                });
+                let selector = match &row {
+                    Row::UsernameCheckbox(_) => "compose-username-checkbox",
+                    _ => "compose-phone-checkbox",
+                };
+                let trailing = if fetching {
+                    Icon::new(IconName::LoaderCircle).size(px(20.)).text_color(palette.text_secondary).into_any_element()
+                } else {
+                    checkbox(false, palette)
+                };
+                let title = div().truncate().child(name.clone()).into_any_element();
+                tile_with(SharedString::from(selector), SELECT_HEIGHT, search_glyph(palette), title, None, Some(selector.to_owned()), Some(trailing), true, palette)
+                    .on_click(cx.listener(move |this, _, window, cx| this.look_up(&row, window, cx)))
                     .into_any_element()
             }
             Row::Group(id) => {
@@ -638,16 +928,7 @@ impl Compose {
                     Row::Phone(phone, _) => *query == phone.e164,
                     _ => false,
                 });
-                let avatar = div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .justify_center()
-                    .size(px(32.))
-                    .rounded_full()
-                    .bg(palette.row_hover)
-                    .child(Icon::new(IconName::Search).size(px(16.)).text_color(palette.text))
-                    .into_any_element();
+                let avatar = search_glyph(palette);
                 let selector = match &row {
                     Row::Username(_) => "compose-username-result",
                     _ => "compose-phone-result",
@@ -662,6 +943,70 @@ impl Compose {
             }
         }
     }
+}
+
+/// Desktop's `Avatar` with `searchResult`: the search glyph in a circle.
+fn search_glyph(palette: Palette) -> gpui_kit::AnyElement {
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(px(32.))
+        .rounded_full()
+        .bg(palette.row_hover)
+        .child(Icon::new(IconName::Search).size(px(16.)).text_color(palette.text))
+        .into_any_element()
+}
+
+/// A contact's avatar: Note to Self's icon, or their photo with its badge.
+fn contact_avatar(state: &Entity<AppState>, contact: &ComposeContact, size: f32, cx: &App) -> gpui_kit::AnyElement {
+    if contact.me {
+        return crate::views::common::chat_placeholder(ConversationKind::NoteToSelf, &contact.title, 0, px(size));
+    }
+    crate::views::common::badged_avatar(state.read(cx), &contact.service_id, &contact.title, size, cx)
+}
+
+/// Desktop's `ContactName`: the name, Note to Self's check, or the
+/// address-book emblem.
+fn contact_name(contact: &ComposeContact, palette: Palette) -> gpui_kit::AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .min_w_0()
+        .child(div().truncate().child(if contact.me { "Note to Self".to_owned() } else { contact.title.clone() }))
+        .when(contact.me, |d| d.child(crate::views::common::official_badge(palette)))
+        .when(contact.system_contact && !contact.me, |d| {
+            d.child(
+                div()
+                    .debug_selector(|| "system-contact-emblem".into())
+                    .child(Icon::new(IconName::CircleUser).size(px(14.)).text_color(palette.text_secondary)),
+            )
+        })
+        .into_any_element()
+}
+
+/// The About line under a contact (not Note to Self's), with its emoji.
+fn contact_about(contact: &ComposeContact) -> Option<String> {
+    (!contact.me && !contact.about.is_empty()).then(|| match contact.about_emoji.as_str() {
+        "" => contact.about.clone(),
+        emoji => format!("{emoji} {}", contact.about),
+    })
+}
+
+/// Desktop's `ListTile.checkbox`: a round box, filled with a check when on.
+fn checkbox(on: bool, palette: Palette) -> gpui_kit::AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(20.))
+        .rounded_full()
+        .border_2()
+        .border_color(if on { palette.accent } else { palette.text_secondary })
+        .when(on, |d| d.bg(palette.accent).child(Icon::new(IconName::Check).size(px(14.)).text_color(gpui_kit::white())))
+        .into_any_element()
 }
 
 /// Desktop's `ComposeStepButton` icon: a 32px circle with a 20px glyph.
@@ -690,15 +1035,33 @@ fn tile(
     selector: Option<String>,
     palette: Palette,
 ) -> gpui_kit::Stateful<gpui_kit::Div> {
+    tile_with(id, height, leading, title, subtitle, selector, None, true, palette)
+}
+
+/// [`tile`] with a trailing element (a checkbox, a spinner), and one that
+/// isn't clicked (`isClickable: false`: no pointer or hover).
+#[allow(clippy::too_many_arguments)]
+fn tile_with(
+    id: SharedString,
+    height: f32,
+    leading: gpui_kit::AnyElement,
+    title: gpui_kit::AnyElement,
+    subtitle: Option<String>,
+    selector: Option<String>,
+    trailing: Option<gpui_kit::AnyElement>,
+    clickable: bool,
+    palette: Palette,
+) -> gpui_kit::Stateful<gpui_kit::Div> {
     let inner = div()
-        .size_full()
+        .flex_1()
+        .min_w_0()
+        .h_full()
         .flex()
         .items_center()
         .px(px(14.))
         .py(px(6.))
         .rounded(px(12.))
-        .cursor_pointer()
-        .hover(|d| d.bg(palette.row_hover))
+        .when(clickable, |d| d.cursor_pointer().hover(|d| d.bg(palette.row_hover)))
         .child(div().flex_none().mr(px(12.)).child(leading))
         .child(
             div()
@@ -710,10 +1073,12 @@ fn tile(
                 .when_some(subtitle, |d, text| {
                     d.child(div().truncate().text_size(px(12.)).line_height(px(17.)).text_color(palette.text_secondary).child(text))
                 }),
-        );
+        )
+        .when_some(trailing, |d, trailing| d.child(div().flex_none().ml(px(12.)).child(trailing)));
     div()
         .id(id)
         .when_some(selector, |d, s| d.debug_selector(move || s))
+        .w_full()
         .h(px(height))
         .px(px(10.))
         .py(px(2.))
@@ -726,13 +1091,15 @@ impl Render for Compose {
         let palette = Palette::get(cx);
         let entity = cx.entity();
         let empty = self.rows.is_empty();
-        let new_chat = self.step == Step::NewChat;
-        let busy = self.finding.is_some();
+        let step = self.step;
+        let busy = self.finding.is_some() || self.creating();
         // Desktop's Find panes reuse "Back to member selection" for theirs.
-        let (title, back_label) = match self.step {
+        let (title, back_label) = match step {
             Step::NewChat => ("New chat", "Back to inbox"),
             Step::FindByUsername => ("Find by username", "Back to member selection"),
             Step::FindByPhoneNumber => ("Find by phone number", "Back to member selection"),
+            Step::ChooseMembers => ("Choose members", "Back"),
+            Step::SetGroupMetadata => ("Name this group", "Back to member selection"),
         };
         let header = div()
             .flex()
@@ -745,13 +1112,39 @@ impl Render for Compose {
                     .small()
                     .icon(IconName::ChevronLeft)
                     .tooltip(back_label)
-                    .disabled(!new_chat && busy)
+                    .disabled(step != Step::NewChat && busy)
                     .on_click(cx.listener(|this, _, window, cx| match this.step {
                         Step::NewChat => cx.emit(ComposeEvent::Close),
                         _ => this.back(window, cx),
                     })),
             )
             .child(div().flex_1().pr(px(40.)).text_center().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child(title));
+        let list_or_empty = |empty_text: &'static str, selector: &'static str| {
+            if empty {
+                div().debug_selector(move || selector.into()).mt(px(27.)).px_4().w_full().text_center().child(empty_text).into_any_element()
+            } else {
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(list(self.list.clone(), move |ix, _, cx| entity.update(cx, |this, cx| this.render_row(ix, cx))).size_full())
+                    .child(Scrollbar::vertical(&self.list).mode(ScrollbarMode::Hover))
+                    .into_any_element()
+            }
+        };
+        let search = div()
+            .px(px(16.))
+            .pb(px(8.))
+            .child(Input::new(&self.search).prefix(Icon::new(IconName::Search).size_4().text_color(palette.text_secondary)));
+        let body = match step {
+            Step::NewChat => div().flex_1().min_h_0().flex().flex_col().child(search).child(list_or_empty("No chats found", "compose-no-chats")).into_any_element(),
+            Step::FindByUsername | Step::FindByPhoneNumber => self.render_find(palette, cx),
+            Step::ChooseMembers => {
+                let list = list_or_empty("No contacts found", "compose-no-contacts");
+                self.render_choose_members(search.into_any_element(), list, palette, cx)
+            }
+            Step::SetGroupMetadata => self.render_metadata(palette, cx),
+        };
         div()
             .id("compose")
             .debug_selector(|| "compose".into())
@@ -760,8 +1153,9 @@ impl Render for Compose {
             .flex()
             .flex_col()
             // Escape goes back (Desktop's `onEscapeShortcut`): to the inbox
-            // from New chat, to New chat from a Find pane (not while it
-            // looks something up).
+            // from New chat, to New chat from a Find pane or Choose members,
+            // to Choose members from Name this group (not while it looks
+            // something up or creates the group).
             .capture_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
                     cx.stop_propagation();
@@ -772,39 +1166,211 @@ impl Render for Compose {
                 }
             }))
             .child(header)
-            .when(new_chat, |d| {
+            .child(body)
+    }
+}
+
+impl Compose {
+    /// Desktop's `LeftPaneChooseGroupMembersHelper`: the search, the picks
+    /// as pills, the list, and Next (or Skip with no one picked).
+    fn render_choose_members(&mut self, search: gpui_kit::AnyElement, list: gpui_kit::AnyElement, palette: Palette, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let order = self.group.as_ref().map(|g| g.order.clone()).unwrap_or_default();
+        let pills = order.iter().map(|sid| {
+            let (title, first) = self.member_names(sid);
+            let avatar = crate::views::common::person_photo(self.state.read(cx), sid, self.state.read(cx).photo_of(sid), &title, crate::theme::color_for(sid), px(20.));
+            let remove = sid.clone();
+            let selector = format!("compose-pill-{title}");
+            div()
+                .debug_selector(move || selector)
+                .flex()
+                .items_center()
+                .px(px(8.))
+                .py(px(4.))
+                .rounded(px(6.))
+                .bg(palette.row_hover)
+                .max_w_full()
+                .child(avatar)
+                .child(div().px(px(6.)).text_size(px(13.)).line_height(px(18.)).truncate().child(first))
+                .child(
+                    Button::new(SharedString::from(format!("compose-pill-remove-{sid}")))
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::X)
+                        .tooltip("Remove contact")
+                        .on_click(cx.listener(move |this, _, window, cx| this.toggle_member(&remove, window, cx))),
+                )
+        });
+        let picked = !order.is_empty();
+        let state = self.state.clone();
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(search)
+            // Vernam's: Desktop joins a group only from its link, which
+            // Vernam can take pasted here (the old New group dialog had it).
+            .child(
+                div().px(px(16.)).pb(px(8.)).child(
+                    Button::new("compose-join-link")
+                        .label("Join with a group link")
+                        .ghost()
+                        .xsmall()
+                        .text_color(palette.accent)
+                        .on_click(cx.listener(move |_, _, window, cx| {
+                            crate::views::group_admin::open_paste_link(state.clone(), window, cx);
+                            cx.emit(ComposeEvent::Handoff);
+                        })),
+                ),
+            )
+            .when(picked, |d| {
                 d.child(
                     div()
+                        .id("compose-pills")
+                        .flex()
+                        .flex_wrap()
+                        .gap_x(px(12.))
+                        .gap_y(px(8.))
                         .px(px(16.))
-                        .pb(px(8.))
-                        .child(Input::new(&self.search).prefix(Icon::new(IconName::Search).size_4().text_color(palette.text_secondary))),
+                        .py(px(4.))
+                        .mb(px(10.))
+                        .max_h(px(88.))
+                        .overflow_y_scroll()
+                        .children(pills),
                 )
-                .when(empty, |d| {
-                    d.child(
-                        div()
-                            .debug_selector(|| "compose-no-chats".into())
-                            .mt(px(27.))
-                            .px_4()
-                            .w_full()
-                            .text_center()
-                            .child("No chats found"),
-                    )
-                })
-                .when(!empty, |d| {
-                    d.child(
-                        div()
-                            .relative()
-                            .flex_1()
-                            .min_h_0()
-                            .child(
-                                list(self.list.clone(), move |ix, _, cx| entity.update(cx, |this, cx| this.render_row(ix, cx)))
-                                    .size_full(),
-                            )
-                            .child(Scrollbar::vertical(&self.list).mode(ScrollbarMode::Hover)),
-                    )
-                })
             })
-            .when(!new_chat, |d| d.child(self.render_find(palette, cx)))
+            .child(list)
+            .child(self.footer(if picked { "Next" } else { "Skip" }, false, true, cx.listener(|this, _, window, cx| this.show_set_metadata(window, cx))))
+            .into_any_element()
+    }
+
+    /// Desktop's `LeftPaneSetGroupMetadataHelper`: the group's photo, name
+    /// and disappearing message timer, who's in it, and Create.
+    fn render_metadata(&mut self, palette: Palette, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+        let Some(group) = &self.group else { return div().into_any_element() };
+        let creating = group.creating;
+        let ready = !creating && !group.name.read(cx).value().trim().is_empty();
+        let timer = group.timer;
+        let photo = group.avatar.as_ref().map(|(path, _)| path.clone());
+        let name = group.name.clone();
+        let title = name.read(cx).value().to_string();
+        let order = group.order.clone();
+        // Desktop's `AvatarPreview`: 96px, the upload button on it.
+        let preview = div()
+            .id("compose-group-photo")
+            .debug_selector(|| "compose-group-photo".into())
+            .relative()
+            .size(px(96.))
+            .when(!creating, |d| d.cursor_pointer().on_click(cx.listener(|this, _, window, cx| this.pick_photo(window, cx))))
+            .child(crate::views::common::group_photo(photo.as_deref(), &title, 0, px(96.)))
+            .child(
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .right_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(32.))
+                    .rounded_full()
+                    .bg(palette.background)
+                    .border_1()
+                    .border_color(palette.panel_border)
+                    .child(Icon::new(IconName::Camera).size(px(16.)).text_color(palette.text)),
+            );
+        let timer_button = Button::new("compose-group-timer")
+            .label(crate::views::chat_menu::format_timer_long(timer))
+            .outline()
+            .small()
+            .disabled(creating)
+            .dropdown_menu({
+                let this = cx.entity();
+                move |mut menu, _, _| {
+                    for seconds in crate::views::chat_menu::TIMER_CHOICES {
+                        let this = this.clone();
+                        menu = menu.item(PopupMenuItem::new(crate::views::chat_menu::format_timer_long(seconds)).checked(timer == seconds).on_click(
+                            move |_, _, cx| {
+                                this.update(cx, |this, cx| {
+                                    if let Some(group) = &mut this.group {
+                                        group.timer = seconds;
+                                        cx.notify();
+                                    }
+                                });
+                            },
+                        ));
+                    }
+                    menu
+                }
+            });
+        let members = order.iter().map(|sid| {
+            let (title, _) = self.member_names(sid);
+            let avatar = crate::views::common::badged_avatar(self.state.read(cx), sid, &title, 32., cx);
+            let contact = self.candidates.iter().map(|c| &c.contact).find(|c| &c.service_id == sid);
+            let name = match contact {
+                Some(contact) => contact_name(contact, palette),
+                None => div().truncate().child(title.clone()).into_any_element(),
+            };
+            let about = contact.and_then(contact_about);
+            tile_with(SharedString::from(format!("compose-group-member-{sid}")), SELECT_HEIGHT, avatar, name, about, Some(format!("compose-group-member-{title}")), None, false, palette)
+        });
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id("compose-metadata")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .child(div().flex().justify_center().child(preview))
+                    .child(div().m(px(16.)).child(Input::new(&name).disabled(creating)))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .mx(px(16.))
+                            .mb(px(16.))
+                            .child(div().mr(px(12.)).child("Disappearing messages"))
+                            .child(timer_button),
+                    )
+                    .when(!order.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .h(px(HEADER_HEIGHT))
+                                .flex()
+                                .items_end()
+                                .pb(px(8.))
+                                .pl(px(16.))
+                                .text_size(px(14.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Members"),
+                        )
+                        .children(members)
+                    }),
+            )
+            .child(self.footer("Create", creating, ready, cx.listener(|this, _, _, cx| this.create(cx))))
+            .into_any_element()
+    }
+
+    /// A pane's button at the bottom right (Desktop's `getFooterContents`).
+    fn footer(
+        &self,
+        label: &'static str,
+        loading: bool,
+        enabled: bool,
+        on_click: impl Fn(&gpui_kit::ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> gpui_kit::AnyElement {
+        div()
+            .flex()
+            .justify_end()
+            .p(px(12.))
+            .child(Button::new("compose-next").primary().label(label).loading(loading).disabled(!enabled || loading).on_click(on_click))
+            .into_any_element()
     }
 }
 
@@ -1062,6 +1628,13 @@ impl Compose {
                 Row::Group(id) => self.state.read(cx).conversation(id).map_or_else(String::new, |g| g.title.clone()),
                 Row::Username(name) => format!("@ {name}"),
                 Row::Phone(phone, _) => format!("tel {}{}", phone.e164, if phone.valid { "" } else { " (invalid)" }),
+                Row::Checkbox(ix) => {
+                    let contact = &self.candidates[*ix].contact;
+                    let on = self.group.as_ref().is_some_and(|g| g.chosen.contains(&contact.service_id));
+                    format!("[{}] {}", if on { "x" } else { " " }, contact.title)
+                }
+                Row::UsernameCheckbox(name) => format!("[ ] @ {name}"),
+                Row::PhoneCheckbox(phone, _) => format!("[ ] tel {}", phone.e164),
             })
             .collect()
     }
@@ -1284,6 +1857,149 @@ mod tests {
             show(&mut m, Step::FindByPhoneNumber);
             m.sidebar.update_in(&mut m.cx, |s, window, cx| s.open_compose(window, cx));
             assert_eq!(step(&mut m), Step::NewChat);
+            m.backend.shutdown();
+        }
+
+        fn new_group(m: &mut Mounted) {
+            let compose = compose(m);
+            compose.update_in(&mut m.cx, |c, window, cx| c.show_choose_members(window, cx));
+            m.cx.run_until_parked();
+        }
+
+        fn pick(m: &mut Mounted, title: &str) {
+            let compose = compose(m);
+            compose.update_in(&mut m.cx, |c, window, cx| {
+                let sid = c.candidates.iter().find(|c| c.contact.title == title).unwrap().contact.service_id.clone();
+                c.toggle_member(&sid, window, cx);
+            });
+            m.cx.run_until_parked();
+        }
+
+        fn picked(m: &mut Mounted) -> Vec<String> {
+            compose(m).read_with(&m.cx, |c, _| c.group.as_ref().map(|g| g.order.iter().map(|sid| c.member_names(sid).0).collect()).unwrap_or_default())
+        }
+
+        fn footer_label(m: &mut Mounted) -> &'static str {
+            compose(m).read_with(&m.cx, |c, _| if c.group.as_ref().is_some_and(|g| !g.order.is_empty()) { "Next" } else { "Skip" })
+        }
+
+        #[gpui_kit::test]
+        fn choosing_members_picks_in_order_and_back_drops_them(cx: &mut TestAppContext) {
+            let mut m = mount(cx);
+            open(&mut m);
+            new_group(&mut m);
+            assert_eq!(step(&mut m), Step::ChooseMembers);
+            // Everyone New chat lists but Note to Self, with checkboxes.
+            let listed = rows(&mut m);
+            assert_eq!(listed[0], "# Contacts");
+            assert!(listed.contains(&"[ ] Maya Chen".to_owned()));
+            assert!(!listed.iter().any(|r| r.contains("Note to Self") || r.contains("[New group]")));
+            assert_eq!(footer_label(&mut m), "Skip");
+            // Picked in order, shown as pills in that order.
+            pick(&mut m, "Jordan Reyes");
+            pick(&mut m, "Maya Chen");
+            assert_eq!(picked(&mut m), ["Jordan Reyes", "Maya Chen"]);
+            assert!(rows(&mut m).contains(&"[x] Maya Chen".to_owned()));
+            assert!(m.cx.debug_bounds("compose-pill-Jordan Reyes").is_some());
+            assert_eq!(footer_label(&mut m), "Next");
+            // Unpicking, as the pill's x does.
+            pick(&mut m, "Jordan Reyes");
+            assert_eq!(picked(&mut m), ["Maya Chen"]);
+            // Search narrows the list, and offers a username like it to
+            // look up, as Desktop does.
+            type_in(&mut m, "maya");
+            assert_eq!(rows(&mut m), ["# Contacts", "[x] Maya Chen", "# Find by username", "[ ] @ maya"]);
+            // Too short for a username, and no number: nothing.
+            type_in(&mut m, "zz");
+            assert!(m.cx.debug_bounds("compose-no-contacts").is_some());
+            // Escape: New chat again, the picks dropped.
+            m.cx.simulate_keystrokes("escape");
+            m.cx.run_until_parked();
+            assert_eq!(step(&mut m), Step::NewChat);
+            new_group(&mut m);
+            assert!(picked(&mut m).is_empty());
+            m.backend.shutdown();
+        }
+
+        #[gpui_kit::test]
+        fn a_number_looked_up_while_choosing_is_picked(cx: &mut TestAppContext) {
+            let mut m = mount(cx);
+            open(&mut m);
+            new_group(&mut m);
+            // Dana is in the demo's directory but not listed.
+            type_in(&mut m, "+1 415 555 0177");
+            assert_eq!(rows(&mut m), ["# Find by phone number", "[ ] tel +14155550177"]);
+            let compose = compose(&mut m);
+            compose.update_in(&mut m.cx, |c, window, cx| {
+                let row = c.rows.iter().find(|r| matches!(r, Row::PhoneCheckbox(..))).cloned().unwrap();
+                c.look_up(&row, window, cx);
+            });
+            wait(&mut m.cx, |cx| compose.read_with(cx, |c, _| c.group.as_ref().is_some_and(|g| !g.order.is_empty())));
+            assert_eq!(picked(&mut m), ["Dana Brooks"]);
+            // Still choosing: nothing opened.
+            assert_eq!(step(&mut m), Step::ChooseMembers);
+            m.backend.shutdown();
+        }
+
+        #[gpui_kit::test]
+        fn naming_the_group_keeps_the_picks_and_enter_creates_it(cx: &mut TestAppContext) {
+            let mut m = mount(cx);
+            open(&mut m);
+            new_group(&mut m);
+            pick(&mut m, "Maya Chen");
+            pick(&mut m, "Ana Souza");
+            let compose = compose(&mut m);
+            compose.update_in(&mut m.cx, |c, window, cx| c.show_set_metadata(window, cx));
+            m.cx.run_until_parked();
+            assert_eq!(step(&mut m), Step::SetGroupMetadata);
+            assert!(m.cx.debug_bounds("compose-group-member-Maya Chen").is_some());
+            // Back to Choose members keeps the picks.
+            m.cx.simulate_keystrokes("escape");
+            m.cx.run_until_parked();
+            assert_eq!(step(&mut m), Step::ChooseMembers);
+            assert_eq!(picked(&mut m), ["Maya Chen", "Ana Souza"]);
+            compose.update_in(&mut m.cx, |c, window, cx| c.show_set_metadata(window, cx));
+            m.cx.run_until_parked();
+            // A blank name doesn't create.
+            m.cx.simulate_keystrokes("enter");
+            assert!(!compose.read_with(&m.cx, |c, _| c.creating()));
+            // At most 32 characters.
+            m.cx.simulate_input(&"x".repeat(40));
+            let name = compose.read_with(&m.cx, |c, cx| c.group.as_ref().unwrap().name.read(cx).value().to_string());
+            assert_eq!(name.chars().count(), GROUP_NAME_MAX);
+            let name = compose.read_with(&m.cx, |c, _| c.group.as_ref().unwrap().name.clone());
+            m.cx.update(|window, cx| name.update(cx, |n, cx| n.set_value("", window, cx)));
+            m.cx.simulate_input("Ridge runners");
+            // Enter creates it; it opens and the composer closes.
+            m.cx.simulate_keystrokes("enter");
+            let state = m.state.clone();
+            wait(&mut m.cx, |cx| state.read_with(cx, |s, _| s.selected.as_ref().and_then(|id| s.conversation(id)).is_some_and(|c| c.title == "Ridge runners")));
+            wait(&mut m.cx, |cx| m.sidebar.read_with(cx, |s, _| s.compose().is_none()));
+            let members = m.state.read_with(&m.cx, |s, _| s.selected.as_ref().and_then(|id| s.conversation(id)).map(|c| c.members.len()));
+            assert_eq!(members, Some(2));
+            m.backend.shutdown();
+        }
+
+        #[gpui_kit::test]
+        fn a_failed_create_lets_it_be_tried_again(cx: &mut TestAppContext) {
+            let mut m = mount(cx);
+            open(&mut m);
+            new_group(&mut m);
+            let compose = compose(&mut m);
+            compose.update_in(&mut m.cx, |c, window, cx| {
+                c.show_set_metadata(window, cx);
+                if let Some(g) = &mut c.group {
+                    g.creating = true;
+                }
+            });
+            // Creating: back and ⌘N wait for the answer.
+            m.cx.simulate_keystrokes("escape");
+            m.sidebar.update_in(&mut m.cx, |s, window, cx| s.open_compose(window, cx));
+            assert_eq!(step(&mut m), Step::SetGroupMetadata);
+            m.state.update(&mut m.cx, |_, cx| cx.emit(AppEvent::GroupCreateFailed));
+            m.cx.run_until_parked();
+            assert!(!compose.read_with(&m.cx, |c, _| c.creating()));
+            assert!(m.sidebar.read_with(&m.cx, |s, _| s.compose().is_some()), "still open to try again");
             m.backend.shutdown();
         }
 

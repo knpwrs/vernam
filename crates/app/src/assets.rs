@@ -16,6 +16,7 @@ gpui_kit::assets::icon_assets!(
         Ban,
         Bell,
         BellOff,
+        Camera,
         ChevronLeft,
         ChevronRight,
         CircleUser,
