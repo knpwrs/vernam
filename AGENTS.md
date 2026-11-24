@@ -6,6 +6,8 @@ Lessons from building this client and from its code reviews. README.md covers wh
 
 ## Signal Desktop is the reference
 
+Parity with Signal Desktop is a goal: Vernam should look and behave as Desktop does, down to details like what an avatar shows while its photo loads. Deviate only on purpose, and say so in a comment where the code differs, with the reason, so the next parity check doesn't undo it.
+
 When behavior is in question (what a read sync marks, how a reaction finds its target, what a backup field means), read Signal Desktop's source and do what it does. Cite the file in a comment (`ts/util/safetyNumber`, `ts/messageModifiers/ReadSyncs`). `.signal-desktop-hash` names the last Desktop commit Vernam has been checked against; the `desktop-parity` skill (`.claude/skills/desktop-parity`) catches up from there and moves it forward. Guessing from the protocol alone produced most of the real-account bugs:
 
 - **Edited messages answer to every edit's timestamp.** Reactions, receipts and read syncs for an edited message name the latest edit, not the original. `message_edits` records each edit's timestamp and lookups match it. A transferred backup dates an edited message by its latest revision; the original date is the oldest revision's.
