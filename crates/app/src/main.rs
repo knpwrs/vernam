@@ -2,6 +2,7 @@
 
 mod accounts;
 mod assets;
+mod avatar_data;
 mod avatar_presets;
 mod avatar_text;
 mod chat_color;

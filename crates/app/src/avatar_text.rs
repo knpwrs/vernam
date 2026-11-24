@@ -139,6 +139,12 @@ fn measure(text: &str, font_size: f32) -> (f32, f32) {
     }
 }
 
+/// The font size `text` gets in a bubble of `size` (Desktop's editor fits
+/// its input the same way, at 120 pixels).
+pub fn fitted_size(text: &str, size: f32) -> f32 {
+    fitted_font_size(size, text, |candidate| measure(text, candidate))
+}
+
 /// The text photo: `text` (at most three characters) on `bg`, in `fg`, as
 /// a 1024-pixel PNG.
 pub fn render(text: &str, bg: u32, fg: u32) -> anyhow::Result<Vec<u8>> {

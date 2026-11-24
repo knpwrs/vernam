@@ -106,12 +106,39 @@ struct GroupDraft {
     alerts: Alerts,
     /// The photo from "Group Avatar" (Desktop's `AvatarEditor`).
     avatar: Option<crate::views::avatar_editor::Photo>,
+    /// The photos "Group Avatar" keeps (Desktop's composer
+    /// `userAvatarData`), the group's once it's made.
+    avatars: Vec<crate::avatar_data::AvatarData>,
+    /// Where those uploaded are, deleted with the draft unless the group is
+    /// made.
+    avatar_dir: std::path::PathBuf,
+    kept: bool,
     /// The disappearing message timer, in seconds.
     timer: u32,
     name: Entity<InputState>,
     /// "Create" was pressed and the backend hasn't answered.
     creating: bool,
     _subscription: Subscription,
+}
+
+impl Drop for GroupDraft {
+    /// A draft dropped without its group made: the photos it uploaded
+    /// aren't anyone's. (Desktop leaves them on disk.)
+    fn drop(&mut self) {
+        if self.kept {
+            return;
+        }
+        let names: Vec<String> = self.avatars.iter().filter_map(|a| a.image.clone()).collect();
+        if names.is_empty() {
+            return;
+        }
+        let dir = self.avatar_dir.clone();
+        std::thread::spawn(move || {
+            for name in names {
+                crate::avatar_data::remove_image(&dir, &name);
+            }
+        });
+    }
 }
 
 /// Desktop's `maxLengthCount` for a group's name, in characters.
@@ -168,7 +195,7 @@ impl Compose {
                 // A profile brings a new name to search and a new About.
                 AppEvent::ConversationsChanged | AppEvent::ProfileChanged(_) => this.load(cx),
                 AppEvent::RecipientFound { query, result } => this.found(query, result, window, cx),
-                AppEvent::GroupCreated => this.group_created(cx),
+                AppEvent::GroupCreated(conversation) => this.group_created(conversation, cx),
                 // The dialog is the state's (Desktop's `CREATE_GROUP_REJECTED`).
                 AppEvent::GroupCreateFailed => {
                     if let Some(group) = &mut this.group {
@@ -317,6 +344,9 @@ impl Compose {
                 pills_scroll: gpui_kit::ScrollHandle::new(),
                 alerts: Alerts::default(),
                 avatar: None,
+                avatars: crate::avatar_data::defaults(true),
+                avatar_dir: crate::avatar_data::dir(self.state.read(cx).backend.data_dir()),
+                kept: false,
                 timer,
                 name,
                 creating: false,
@@ -430,10 +460,24 @@ impl Compose {
     /// The group we created opened (the state selected it): the composer
     /// closes, to the inbox (Desktop's `showConversation` with
     /// `switchToAssociatedView`).
-    fn group_created(&mut self, cx: &mut Context<Self>) {
+    fn group_created(&mut self, conversation: &ConversationId, cx: &mut Context<Self>) {
         if self.creating() {
             if let Some(group) = &mut self.group {
                 group.creating = false;
+                // Its photos are the group's now (Desktop's `createGroupV2`
+                // with `avatars`).
+                group.kept = true;
+                let json = serde_json::to_string(&group.avatars).unwrap_or_default();
+                let key = crate::avatar_data::group_key(conversation);
+                let db = self.state.read(cx).backend.db().clone();
+                let saving = self.state.read(cx).backend.spawn(async move { db.set_setting(&key, &json).await });
+                cx.background_executor()
+                    .spawn(async move {
+                        if let Err(error) = saving.await {
+                            tracing::warn!(%error, "couldn't keep a new group's photos");
+                        }
+                    })
+                    .detach();
             }
             cx.emit(ComposeEvent::Opened { archived: false });
         }
@@ -445,11 +489,20 @@ impl Compose {
         let Some(group) = &self.group else { return };
         let current = group.avatar.clone();
         let this = cx.entity();
+        let listing = cx.entity();
         crate::views::avatar_editor::open_dialog(
             "Group Avatar",
             current,
-            &crate::avatar_presets::GROUP_PRESETS,
-            || crate::views::common::group_photo(None, "", 0, px(96.)),
+            group.avatars.clone(),
+            group.avatar_dir.clone(),
+            |size| crate::views::common::group_photo(None, "", 0, px(size)),
+            move |list, cx| {
+                listing.update(cx, |this, _| {
+                    if let Some(group) = &mut this.group {
+                        group.avatars = list.to_vec();
+                    }
+                })
+            },
             move |photo, _, cx| {
                 this.update(cx, |this, cx| {
                     if let Some(group) = &mut this.group {
@@ -2101,6 +2154,33 @@ mod tests {
             wait(&mut m.cx, |cx| m.sidebar.read_with(cx, |s, _| s.compose().is_none()));
             let members = m.state.read_with(&m.cx, |s, _| s.selected.as_ref().and_then(|id| s.conversation(id)).map(|c| c.members.len()));
             assert_eq!(members, Some(2));
+            // Its photos (Desktop's `avatars`) are the group's now.
+            let group = m.state.read_with(&m.cx, |s, _| s.selected.clone().unwrap());
+            let db = m.backend.db().clone();
+            let key = crate::avatar_data::group_key(&group);
+            let kept = futures::executor::block_on(m.backend.spawn(async move { db.setting(&key).await })).unwrap();
+            assert_eq!(kept.and_then(|json| crate::avatar_data::parse(&json)).map(|list| list.len()), Some(12));
+            m.backend.shutdown();
+        }
+
+        #[gpui_kit::test]
+        fn a_draft_left_deletes_the_photos_it_uploaded(cx: &mut TestAppContext) {
+            let mut m = mount(cx);
+            open(&mut m);
+            new_group(&mut m);
+            let compose = compose(&mut m);
+            // A photo "Group Avatar" saved for the draft.
+            let dir = compose.read_with(&m.cx, |c, _| c.group.as_ref().unwrap().avatar_dir.clone());
+            let name = crate::avatar_data::write_image(&dir, b"\xff\xd8").unwrap();
+            compose.update(&mut m.cx, |c, _| {
+                let group = c.group.as_mut().unwrap();
+                group.avatars = crate::avatar_data::replace(&group.avatars, crate::avatar_data::AvatarData { id: 0, color: None, icon: None, text: None, image: Some(name.clone()) }, None);
+            });
+            // Back to New chat: the draft goes, and its photo with it.
+            m.cx.simulate_keystrokes("escape");
+            m.cx.run_until_parked();
+            assert!(compose.read_with(&m.cx, |c, _| c.group.is_none()));
+            wait(&mut m.cx, |_| !dir.join(&name).exists());
             m.backend.shutdown();
         }
 
@@ -2217,7 +2297,7 @@ mod tests {
             assert!(!compose.read_with(&m.cx, |c, _| c.creating()));
             assert_eq!(alerts.borrow().last().map(|(_, d)| d.as_str()), Some("A group needs a name."));
             // A group made elsewhere (not ours to wait on) leaves the pane.
-            m.state.update(&mut m.cx, |_, cx| cx.emit(AppEvent::GroupCreated));
+            m.state.update(&mut m.cx, |_, cx| cx.emit(AppEvent::GroupCreated(ConversationId::group(&[9; 32]))));
             m.cx.run_until_parked();
             assert!(m.sidebar.read_with(&m.cx, |s, _| s.compose().is_some()));
             assert_eq!(step(&mut m), Step::SetGroupMetadata);

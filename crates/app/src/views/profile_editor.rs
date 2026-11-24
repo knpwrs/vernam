@@ -103,11 +103,11 @@ pub struct ProfileEditor {
     about: Entity<InputState>,
     about_emoji: Option<String>,
     picker: Option<Entity<EmojiPicker>>,
-    photo: StagedPhoto,
-    /// The preset the staged photo is, ringed in the grid.
-    preset: Option<usize>,
-    /// The pick or preset being waited on (a slower, older one is dropped).
-    latest: crate::views::avatar_editor::Latest,
+    /// The avatar page's editor, made each time the page opens (so a photo
+    /// still being made for the page left can't land on it reopened), once
+    /// our photos are read.
+    avatar: Option<Entity<crate::views::avatar_editor::AvatarEditor>>,
+    avatar_load: Option<gpui_kit::Task<()>>,
     nickname: Entity<InputState>,
     digits: Entity<InputState>,
     username: UsernameState,
@@ -180,9 +180,8 @@ impl ProfileEditor {
             about,
             about_emoji: None,
             picker: None,
-            photo: StagedPhoto::Current,
-            preset: None,
-            latest: Default::default(),
+            avatar: None,
+            avatar_load: None,
             nickname,
             digits,
             username: UsernameState::default(),
@@ -206,9 +205,9 @@ impl ProfileEditor {
     pub fn go(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
         let profile = self.profile(cx).unwrap_or_default();
         self.filling = true;
-        // A photo or preset still being made for the page left is dropped,
-        // so it can't land on the avatar page after coming back.
-        self.latest.next();
+        // The avatar page's editor goes with it.
+        self.avatar = None;
+        self.avatar_load = None;
         match page {
             Page::Name => {
                 self.given.update(cx, |i, cx| i.set_value(profile.given_name.clone(), window, cx));
@@ -220,10 +219,7 @@ impl ProfileEditor {
                 self.about_emoji = Some(profile.about_emoji.clone()).filter(|e| !e.is_empty());
                 self.about.update(cx, |i, cx| i.focus(window, cx));
             }
-            Page::Avatar => {
-                self.photo = StagedPhoto::Current;
-                self.preset = None;
-            }
+            Page::Avatar => self.load_avatar_editor(&profile, cx),
             Page::Username => {
                 let current = profile.username.clone().unwrap_or_default();
                 let nickname = usernames::nickname_of(&current).to_owned();
@@ -362,8 +358,12 @@ impl ProfileEditor {
     }
 
     fn photo_changed(&self, cx: &App) -> Option<ProfileEdit> {
+        let editor = self.avatar.as_ref()?.read(cx);
+        if !editor.changed() {
+            return None;
+        }
         let mut edit = self.edit(cx)?;
-        edit.avatar = match &self.photo {
+        edit.avatar = match editor.staged() {
             StagedPhoto::Current => return None,
             StagedPhoto::Remove => AvatarChange::Remove,
             StagedPhoto::New(bytes, _) => AvatarChange::New(bytes.clone()),
@@ -371,16 +371,54 @@ impl ProfileEditor {
         Some(edit)
     }
 
-    /// A picked photo or a preset (`preset`), or why it can't be used.
-    fn stage_photo(&mut self, photo: Result<StagedPhoto, String>, preset: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
-        match photo {
-            Ok(photo) => {
-                self.photo = photo;
-                self.preset = preset;
-            }
-            Err(reason) => window.push_notification(Notification::error(format!("That image can't be used: {reason}")), cx),
-        }
-        cx.notify();
+    /// Reads the photos we keep (Desktop's `avatars` on our own
+    /// conversation), then makes the avatar page's editor over them.
+    fn load_avatar_editor(&mut self, profile: &OwnProfile, cx: &mut Context<Self>) {
+        let backend = self.state.read(cx).backend.clone();
+        let db = backend.db().clone();
+        let read = backend.spawn(async move { db.setting(crate::avatar_data::OURS).await });
+        let dir = crate::avatar_data::dir(backend.data_dir());
+        let profile = profile.clone();
+        self.avatar_load = Some(cx.spawn(async move |this, cx| {
+            let list = match read.await {
+                Ok(Some(json)) => crate::avatar_data::parse(&json).unwrap_or_else(|| {
+                    tracing::warn!("our saved photos couldn't be read; showing the presets");
+                    crate::avatar_data::defaults(false)
+                }),
+                Ok(None) => crate::avatar_data::defaults(false),
+                Err(error) => {
+                    tracing::warn!(%error, "couldn't read our saved photos; showing the presets");
+                    crate::avatar_data::defaults(false)
+                }
+            };
+            let _ = this.update(cx, |this, cx| {
+                let name = profile.name().unwrap_or_default();
+                let photo = profile.photo.clone();
+                let current_name = name.clone();
+                let current: crate::views::avatar_editor::CurrentView =
+                    std::rc::Rc::new(move |size| crate::views::common::person_avatar(photo.as_deref(), &current_name, 0, px(size)));
+                let placeholder: crate::views::avatar_editor::CurrentView =
+                    std::rc::Rc::new(move |size| crate::views::common::avatar(&name, 0, px(size)).into_any_element());
+                let saving = backend.clone();
+                let on_list = move |list: &[crate::avatar_data::AvatarData], cx: &mut App| {
+                    let json = serde_json::to_string(list).unwrap_or_default();
+                    let db = saving.db().clone();
+                    let write = saving.spawn(async move { db.set_setting(crate::avatar_data::OURS, &json).await });
+                    cx.background_executor()
+                        .spawn(async move {
+                            if let Err(error) = write.await {
+                                tracing::warn!(%error, "couldn't keep our saved photos");
+                            }
+                        })
+                        .detach();
+                };
+                let has_current = profile.photo.is_some();
+                this.avatar = Some(cx.new(|cx| {
+                    crate::views::avatar_editor::AvatarEditor::new("profile", list, None, has_current, current, placeholder, dir, on_list, cx)
+                }));
+                cx.notify();
+            });
+        }));
     }
 
     fn nickname_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -763,50 +801,29 @@ impl ProfileEditor {
             ))
     }
 
-    fn render_avatar(&mut self, profile: &OwnProfile, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
-        let save = self.photo_changed(cx);
-        let has_photo = match &self.photo {
-            StagedPhoto::Current => profile.photo.is_some(),
-            StagedPhoto::Remove => false,
-            StagedPhoto::New(..) => true,
+    fn render_avatar(&mut self, _profile: &OwnProfile, _palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::views::avatar_editor::Footer;
+        let Some(editor) = self.avatar.clone() else {
+            // Our saved photos are being read (a settings row).
+            return div().into_any_element();
         };
-        let editor = crate::views::avatar_editor::body(
-            "profile",
-            photo_element(&self.photo, profile, 96.),
-            has_photo,
-            &crate::avatar_presets::PRESETS,
-            self.preset,
-            palette,
-            cx,
-            |this: &mut Self, window, cx| {
-                let request = this.latest.next();
-                crate::views::avatar_editor::pick_photo("Choose photo", window, cx, move |this: &mut Self, photo, window, cx| {
-                    if this.latest.is(request) {
-                        this.stage_photo(photo, None, window, cx);
+        let save = self.photo_changed(cx);
+        let footer = match editor.read(cx).footer(cx) {
+            // Making a text photo or recoloring a preset: its own Cancel and
+            // Save (Desktop's `AvatarModalButtons` in each editor).
+            Footer::Sub { can_save } => footer(
+                Button::new("profile-cancel").label("Cancel").outline().on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(editor) = this.avatar.clone() {
+                        editor.update(cx, |e, cx| e.cancel_sub(cx));
                     }
-                })
-            },
-            |this: &mut Self, _, cx| {
-                this.latest.next();
-                this.photo = StagedPhoto::Remove;
-                this.preset = None;
-                cx.notify();
-            },
-            |this: &mut Self, ix, window, cx| {
-                let request = this.latest.next();
-                crate::views::avatar_editor::stage_preset(&crate::avatar_presets::PRESETS[ix], window, cx, move |this: &mut Self, photo, window, cx| {
-                    if this.latest.is(request) {
-                        this.stage_photo(photo, Some(ix), window, cx);
+                })),
+                Button::new("profile-save").label("Save").primary().disabled(!can_save).on_click(cx.listener(|this, _, window, cx| {
+                    if let Some(editor) = this.avatar.clone() {
+                        editor.update(cx, |e, cx| e.save_sub(window, cx));
                     }
-                });
-            },
-        );
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(editor)
-            .child(footer(
+                })),
+            ),
+            Footer::Main { .. } => footer(
                 Button::new("profile-cancel").label("Cancel").outline().on_click(cx.listener(|this, _, window, cx| this.back(window, cx))),
                 Button::new("profile-save")
                     .label("Save")
@@ -815,10 +832,16 @@ impl ProfileEditor {
                     .loading(self.saving)
                     .on_click(cx.listener(|this, _, _, cx| {
                         if let Some(edit) = this.photo_changed(cx) {
+                            // The photo chosen moves to the front of the list.
+                            if let Some(editor) = this.avatar.clone() {
+                                editor.update(cx, |e, cx| e.commit(cx));
+                            }
                             this.save(edit, cx);
                         }
                     })),
-            ))
+            ),
+        };
+        div().flex().flex_col().gap_3().child(editor).child(footer).into_any_element()
     }
 
     fn render_username(&mut self, palette: Palette, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1032,23 +1055,28 @@ mod tests {
         wait(cx, "our photo", &mut |cx| own(&state, cx).photo.is_some());
         let photo = std::fs::read(own(&state, cx).photo.unwrap()).unwrap();
         assert!(photo.starts_with(&[0xff, 0xd8]));
+        // The preset chosen moved to the front of the photos we keep
+        // (Desktop's `replaceAvatar(selected, selected)` on Save).
+        let db = backend.db().clone();
+        let kept = futures::executor::block_on(backend.spawn(async move { db.setting(crate::avatar_data::OURS).await })).unwrap();
+        let kept = crate::avatar_data::parse(&kept.expect("our photos kept")).unwrap();
+        assert_eq!((kept[0].icon.as_deref(), kept[0].id, kept.len()), (Some("cat"), 3, 12));
         // And removed.
         cx.update(|window, cx| editor.update(cx, |e, cx| e.go(Page::Avatar, window, cx)));
         press(cx, "profile-remove-photo");
         press(cx, "profile-save");
         wait(cx, "no photo", &mut |cx| own(&state, cx).photo.is_none());
         // A pick still being made when the page is left (Cancel, then back
-        // to the avatar) is stale: it can't land on the page reopened.
-        let pending = cx.update(|window, cx| {
-            editor.update(cx, |e, cx| {
-                e.go(Page::Avatar, window, cx);
-                let pending = e.latest.next();
-                e.go(Page::Main, window, cx);
-                e.go(Page::Avatar, window, cx);
-                pending
-            })
-        });
-        assert!(editor.read_with(cx, |e, _| !e.latest.is(pending)));
+        // to the avatar) can't land on the page reopened: it has a new
+        // editor, and the old one is gone.
+        cx.update(|window, cx| editor.update(cx, |e, cx| e.go(Page::Avatar, window, cx)));
+        wait(cx, "the editor", &mut |cx| editor.read_with(cx, |e, _| e.avatar.is_some()));
+        let first = editor.read_with(cx, |e, _| e.avatar.as_ref().map(|a| a.downgrade()));
+        let first = first.expect("the avatar page's editor");
+        cx.update(|window, cx| editor.update(cx, |e, cx| e.go(Page::Main, window, cx)));
+        cx.update(|window, cx| editor.update(cx, |e, cx| e.go(Page::Avatar, window, cx)));
+        wait(cx, "the editor again", &mut |cx| editor.read_with(cx, |e, _| e.avatar.is_some()));
+        assert!(first.upgrade().is_none(), "the old editor is gone");
         backend.shutdown();
     }
 

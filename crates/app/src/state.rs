@@ -105,7 +105,7 @@ pub enum AppEvent {
     ConversationsChanged,
     /// A group we created opened (New group's "Create"); the state
     /// selected it.
-    GroupCreated,
+    GroupCreated(ConversationId),
     /// Creating a group failed; Desktop's dialog has been shown.
     GroupCreateFailed,
     /// The account was unlinked and its data wiped.
@@ -1367,7 +1367,7 @@ impl AppState {
             Event::GroupCreated(conversation) => {
                 self.reload_conversations(cx);
                 self.select(Some(conversation.clone()), cx);
-                cx.emit(AppEvent::GroupCreated);
+                cx.emit(AppEvent::GroupCreated(conversation.clone()));
             }
             // Desktop's `CREATE_GROUP_REJECTED` dialog, untitled; or what
             // kept it from being made, when that wasn't the connection.

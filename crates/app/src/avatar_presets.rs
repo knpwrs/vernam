@@ -62,6 +62,7 @@ pub fn by_name(name: &str) -> Option<&'static Preset> {
 }
 
 /// The preset as a PNG, its color behind the illustration.
+#[cfg(test)]
 pub fn render(preset: &Preset) -> anyhow::Result<Vec<u8>> {
     render_on(preset, preset.color)
 }
