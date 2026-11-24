@@ -2305,7 +2305,7 @@ impl AppState {
     }
 
     /// A group link (`https://signal.group/#…`, `sgnl://signal.group/#…` or
-    /// `sgnl://joingroup/#…`), from a message, a paste or the OS: Desktop's
+    /// `sgnl://joingroup/#…`), from a message or the OS: Desktop's
     /// join dialog shows the group, or its chat opens if we're in it.
     pub fn open_group_link(&self, url: String) {
         self.send(Command::OpenGroupLink { url });

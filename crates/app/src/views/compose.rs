@@ -333,7 +333,6 @@ impl Compose {
         self.rebuild(false, cx);
     }
 
-    /// Name this group (Desktop's `startSettingGroupMetadata`).
     /// Desktop's "Custom Time" dialog for the new group's timer.
     fn open_custom_timer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(current) = self.group.as_ref().map(|g| g.timer) else { return };
@@ -354,6 +353,7 @@ impl Compose {
         }
     }
 
+    /// Name this group (Desktop's `startSettingGroupMetadata`).
     fn show_set_metadata(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(group) = &self.group else { return };
         // Desktop disables Next past the hard limit, which picking can't reach.
@@ -1346,7 +1346,10 @@ impl Compose {
                         );
                     }
                     let this = this.clone();
-                    menu.item(PopupMenuItem::new("Custom time...").checked(custom).on_click(move |_, window, cx| {
+                    // Desktop's last item drops its ellipsis once a custom
+                    // time is set (`selectedCustomDisappearingTimeOption`).
+                    let label = if custom { "Custom time" } else { "Custom time..." };
+                    menu.item(PopupMenuItem::new(label).checked(custom).on_click(move |_, window, cx| {
                         this.update(cx, |this, cx| this.open_custom_timer(window, cx));
                     }))
                 }

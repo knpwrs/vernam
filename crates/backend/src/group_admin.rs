@@ -343,7 +343,9 @@ impl LinkError {
 
 /// Whether `url` is a group link, as Desktop's `groupInvitesRoute` matches
 /// one: `https://signal.group/#…`, `sgnl://signal.group/#…` or
-/// `sgnl://joingroup/#…`.
+/// `sgnl://joingroup/#…`. (Only tests ask now: a link is opened, not
+/// pasted.)
+#[cfg(test)]
 pub fn is_group_link(url: &str) -> bool {
     invite_code(url).is_some()
 }

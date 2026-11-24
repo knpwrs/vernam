@@ -248,9 +248,16 @@ pub const AVATAR_SIZE: u32 = 512;
 /// the middle square (`cover`, `crop`), scaled down to at most 512 pixels
 /// a side, and saved as a JPEG (`canvasToBytes`, the browser's default
 /// quality, 0.92). Transparent parts come out black, as on Desktop's
-/// canvas.
+/// canvas. A photo's EXIF orientation is applied first, as the browser
+/// draws it upright on Desktop's canvas (and as `media::group_avatar`
+/// does): a portrait phone photo isn't sideways.
 pub fn avatar_image(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let image = image::load_from_memory(bytes).context("not an image")?;
+    use image::ImageDecoder as _;
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().context("not an image")?;
+    let mut decoder = reader.into_decoder().context("not an image")?;
+    let orientation = decoder.orientation().context("not an image")?;
+    let mut image = image::DynamicImage::from_decoder(decoder).context("not an image")?;
+    image.apply_orientation(orientation);
     let side = image.width().min(image.height());
     if side < 2 {
         bail!("the image is too small");
@@ -499,6 +506,29 @@ mod tests {
         let nameless = ProfileEdit { given_name: "  ".into(), ..edit() };
         let kept = Kept { has_avatar: false, badge_ids: &[], payment_address: None, sharing_number: false };
         assert!(profile_request(&nameless, aci(), key(), &kept, &mut rng).is_err());
+    }
+
+    #[test]
+    fn a_photo_turned_by_its_exif_comes_out_upright() {
+        // 40x20, red on the left and blue on the right, marked "turn a
+        // quarter clockwise" (orientation 6): upright it's 20x40, red on
+        // top. Its middle square is then red above blue (unturned, it
+        // would be red beside blue).
+        let wide = image::RgbImage::from_fn(40, 20, |x, _| if x < 20 { image::Rgb([255, 0, 0]) } else { image::Rgb([0, 0, 255]) });
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95).encode_image(&wide).unwrap();
+        let exif = crate::media::minimal_exif(6);
+        let mut turned = jpeg[..2].to_vec();
+        turned.extend_from_slice(&[0xFF, 0xE1]);
+        turned.extend_from_slice(&((exif.len() + 2) as u16).to_be_bytes());
+        turned.extend_from_slice(&exif);
+        turned.extend_from_slice(&jpeg[2..]);
+        let photo = image::load_from_memory(&avatar_image(&turned).unwrap()).unwrap().to_rgb8();
+        assert_eq!((photo.width(), photo.height()), (20, 20));
+        let red = |p: &image::Rgb<u8>| p.0[0] > 180 && p.0[2] < 80;
+        let blue = |p: &image::Rgb<u8>| p.0[2] > 180 && p.0[0] < 80;
+        assert!(red(photo.get_pixel(2, 2)), "top left");
+        assert!(blue(photo.get_pixel(2, 17)), "bottom left: {:?}", photo.get_pixel(2, 17));
     }
 
     #[test]

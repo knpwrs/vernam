@@ -472,7 +472,7 @@ fn exif_orientation(tiff: &[u8]) -> Option<u16> {
 }
 
 /// An EXIF block holding only the orientation tag.
-fn minimal_exif(orientation: u16) -> Vec<u8> {
+pub(crate) fn minimal_exif(orientation: u16) -> Vec<u8> {
     let mut exif = EXIF_SIGNATURE.to_vec();
     exif.extend_from_slice(b"MM\0\x2a\0\0\0\x08"); // big-endian TIFF, IFD0 at 8
     exif.extend_from_slice(&1u16.to_be_bytes()); // one entry

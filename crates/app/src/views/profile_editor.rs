@@ -21,6 +21,8 @@ use signal_store::{remaining_count, truncate_text};
 
 use crate::state::{AppEvent, AppState};
 use crate::theme::Palette;
+// The photo staged on the avatar page.
+use crate::views::avatar_editor::Staged as StagedPhoto;
 use crate::views::emoji_picker::{EmojiPicker, PickerEvent};
 
 /// Desktop's preset abouts (`getDefaultBios`).
@@ -79,9 +81,6 @@ impl Page {
     }
 }
 
-/// The photo staged on the avatar page.
-use crate::views::avatar_editor::Staged as StagedPhoto;
-
 /// The username editor's state (Desktop's `usernameReservation`).
 #[derive(Default)]
 struct UsernameState {
@@ -105,6 +104,10 @@ pub struct ProfileEditor {
     about_emoji: Option<String>,
     picker: Option<Entity<EmojiPicker>>,
     photo: StagedPhoto,
+    /// The preset the staged photo is, ringed in the grid.
+    preset: Option<usize>,
+    /// The pick or preset being waited on (a slower, older one is dropped).
+    latest: crate::views::avatar_editor::Latest,
     nickname: Entity<InputState>,
     digits: Entity<InputState>,
     username: UsernameState,
@@ -178,6 +181,8 @@ impl ProfileEditor {
             about_emoji: None,
             picker: None,
             photo: StagedPhoto::Current,
+            preset: None,
+            latest: Default::default(),
             nickname,
             digits,
             username: UsernameState::default(),
@@ -201,6 +206,9 @@ impl ProfileEditor {
     pub fn go(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
         let profile = self.profile(cx).unwrap_or_default();
         self.filling = true;
+        // A photo or preset still being made for the page left is dropped,
+        // so it can't land on the avatar page after coming back.
+        self.latest.next();
         match page {
             Page::Name => {
                 self.given.update(cx, |i, cx| i.set_value(profile.given_name.clone(), window, cx));
@@ -212,7 +220,10 @@ impl ProfileEditor {
                 self.about_emoji = Some(profile.about_emoji.clone()).filter(|e| !e.is_empty());
                 self.about.update(cx, |i, cx| i.focus(window, cx));
             }
-            Page::Avatar => self.photo = StagedPhoto::Current,
+            Page::Avatar => {
+                self.photo = StagedPhoto::Current;
+                self.preset = None;
+            }
             Page::Username => {
                 let current = profile.username.clone().unwrap_or_default();
                 let nickname = usernames::nickname_of(&current).to_owned();
@@ -360,10 +371,13 @@ impl ProfileEditor {
         Some(edit)
     }
 
-    /// A picked or preset photo, or why it can't be used.
-    fn stage_photo(&mut self, photo: Result<StagedPhoto, String>, window: &mut Window, cx: &mut Context<Self>) {
+    /// A picked photo or a preset (`preset`), or why it can't be used.
+    fn stage_photo(&mut self, photo: Result<StagedPhoto, String>, preset: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
         match photo {
-            Ok(photo) => self.photo = photo,
+            Ok(photo) => {
+                self.photo = photo;
+                self.preset = preset;
+            }
             Err(reason) => window.push_notification(Notification::error(format!("That image can't be used: {reason}")), cx),
         }
         cx.notify();
@@ -761,16 +775,30 @@ impl ProfileEditor {
             photo_element(&self.photo, profile, 96.),
             has_photo,
             &crate::avatar_presets::PRESETS,
+            self.preset,
             palette,
             cx,
-            |_, window, cx| crate::views::avatar_editor::pick_photo("Choose photo", window, cx, |this: &mut Self, photo, window, cx| this.stage_photo(photo, window, cx)),
-            |this, _, cx| {
+            |this: &mut Self, window, cx| {
+                let request = this.latest.next();
+                crate::views::avatar_editor::pick_photo("Choose photo", window, cx, move |this: &mut Self, photo, window, cx| {
+                    if this.latest.is(request) {
+                        this.stage_photo(photo, None, window, cx);
+                    }
+                })
+            },
+            |this: &mut Self, _, cx| {
+                this.latest.next();
                 this.photo = StagedPhoto::Remove;
+                this.preset = None;
                 cx.notify();
             },
-            |this, ix, window, cx| {
-                let photo = StagedPhoto::from_preset(&crate::avatar_presets::PRESETS[ix]);
-                this.stage_photo(photo, window, cx);
+            |this: &mut Self, ix, window, cx| {
+                let request = this.latest.next();
+                crate::views::avatar_editor::stage_preset(&crate::avatar_presets::PRESETS[ix], window, cx, move |this: &mut Self, photo, window, cx| {
+                    if this.latest.is(request) {
+                        this.stage_photo(photo, Some(ix), window, cx);
+                    }
+                });
             },
         );
         div()
@@ -1009,6 +1037,18 @@ mod tests {
         press(cx, "profile-remove-photo");
         press(cx, "profile-save");
         wait(cx, "no photo", &mut |cx| own(&state, cx).photo.is_none());
+        // A pick still being made when the page is left (Cancel, then back
+        // to the avatar) is stale: it can't land on the page reopened.
+        let pending = cx.update(|window, cx| {
+            editor.update(cx, |e, cx| {
+                e.go(Page::Avatar, window, cx);
+                let pending = e.latest.next();
+                e.go(Page::Main, window, cx);
+                e.go(Page::Avatar, window, cx);
+                pending
+            })
+        });
+        assert!(editor.read_with(cx, |e, _| !e.latest.is(pending)));
         backend.shutdown();
     }
 
