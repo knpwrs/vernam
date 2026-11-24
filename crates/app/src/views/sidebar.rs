@@ -101,10 +101,9 @@ pub enum SidebarEvent {
 
 impl gpui_kit::EventEmitter<SidebarEvent> for Sidebar {}
 
-/// "New chat", open in place of the chat list, and its search field.
+/// "New chat", open in place of the chat list.
 struct Compose {
     view: Entity<crate::views::compose::Compose>,
-    search: Entity<InputState>,
     _subscription: Subscription,
 }
 
@@ -224,7 +223,7 @@ impl Sidebar {
     pub fn open_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use crate::views::compose::ComposeEvent;
         if let Some(compose) = &self.compose {
-            compose.search.update(cx, |search, cx| search.focus(window, cx));
+            compose.view.update(cx, |compose, cx| compose.start(window, cx));
             return;
         }
         cx.emit(SidebarEvent::Expand);
@@ -239,27 +238,26 @@ impl Sidebar {
             // picked is archived.
             this.set_archive_open(archived, cx);
             if let ComposeEvent::Close = event {
-                let search = this.search_input();
+                let search = this.search_input(cx);
                 search.update(cx, |search, cx| search.focus(window, cx));
             }
             cx.notify();
         });
-        let search = compose.read(cx).search_input();
-        self.compose = Some(Compose { view: compose, search, _subscription: subscription });
+        self.compose = Some(Compose { view: compose, _subscription: subscription });
         cx.notify();
     }
 
     /// The narrow sidebar's search button: widen, then search.
     fn expand_to_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         cx.emit(SidebarEvent::Expand);
-        let search = self.search_input();
+        let search = self.search_input(cx);
         search.update(cx, |search, cx| search.focus(window, cx));
     }
 
-    pub fn search_input(&self) -> Entity<InputState> {
+    pub fn search_input(&self, cx: &App) -> Entity<InputState> {
         // "New chat"'s while it's open, which hides the others.
         if let Some(compose) = &self.compose {
-            return compose.search.clone();
+            return compose.view.read(cx).search_input();
         }
         match &self.chat_search {
             Some(search) => search.input.clone(),
@@ -1473,7 +1471,7 @@ mod tests {
             // Again now and then: the demo seeds in the background.
             if attempt % 50 == 0 {
                 sidebar.update_in(&mut cx, |sidebar, window, cx| {
-                    let input = sidebar.search_input();
+                    let input = sidebar.search_input(cx);
                     input.update(cx, |input, cx| input.set_value("ridge", window, cx));
                     sidebar.set_query("ridge".into(), cx);
                 });
@@ -1495,11 +1493,11 @@ mod tests {
 
         // Backspace in the empty box searches everything again.
         sidebar.update_in(&mut cx, |sidebar, window, cx| {
-            let input = sidebar.search_input();
+            let input = sidebar.search_input(cx);
             input.update(cx, |input, cx| input.set_value("", window, cx));
             sidebar.set_query(String::new(), cx);
         });
-        let input = sidebar.read_with(&cx, |s, _| s.search_input());
+        let input = sidebar.read_with(&cx, |s, cx| s.search_input(cx));
         cx.update(|window, cx| window.focus(&input.focus_handle(cx), cx));
         cx.simulate_keystrokes("backspace");
         cx.run_until_parked();
@@ -1623,7 +1621,7 @@ mod tests {
         };
         cx.run_until_parked();
         assert_eq!(drawn(&mut cx).first().map(|(ix, _)| *ix), Some(0), "the list starts at the top");
-        let input = sidebar.read_with(&cx, |s, _| s.search_input());
+        let input = sidebar.read_with(&cx, |s, cx| s.search_input(cx));
         cx.update(|window, cx| window.focus(&input.focus_handle(cx), cx));
         // Nothing matches: the list empties, then refills on clearing.
         cx.simulate_input("zzzz");

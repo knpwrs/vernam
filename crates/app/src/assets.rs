@@ -19,6 +19,7 @@ gpui_kit::assets::icon_assets!(
         ChevronLeft,
         ChevronRight,
         CircleUser,
+        Hash,
         Hand,
         LayoutGrid,
         SquareUser,

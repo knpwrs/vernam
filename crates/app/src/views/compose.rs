@@ -4,10 +4,13 @@
 //! every group you could message; typing narrows them, and offers to look
 //! up a username or number on Signal.
 //!
-//! Not here yet: "Find by username" and "Find by phone number" (their own
-//! panes in Desktop), New group as a left-pane flow (it opens the New
-//! group dialog), and the contacts' "Manage Contact" menu, whose Remove
-//! the backend doesn't do.
+//! "Find by username" and "Find by phone number" replace it in the pane
+//! (`LeftPaneFindByUsernameHelper`, `LeftPaneFindByPhoneNumberHelper`),
+//! each a field and a Next button that looks the entry up.
+//!
+//! Not here yet: New group as a left-pane flow (it opens the New group
+//! dialog), and the contacts' "Manage Contact" menu, whose Remove the
+//! backend doesn't do.
 
 use std::rc::Rc;
 
@@ -15,7 +18,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
-use gpui_kit::component::{Icon, Sizable as _, WindowExt as _};
+use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _};
 use gpui_kit::prelude::*;
 use gpui_kit::{App, Context, Entity, FontWeight, ListAlignment, ListOffset, ListState, SharedString, Subscription, Task, Window, div, list, px};
 use signal_backend::recipients::{FindError, ParsedPhone};
@@ -34,6 +37,9 @@ const WEEK_MS: f64 = 7. * 24. * 60. * 60. * 1000.;
 #[derive(Debug, Clone, PartialEq)]
 enum Row {
     NewGroup,
+    /// The "Find by username" and "Find by phone number" buttons.
+    FindByUsername,
+    FindByPhoneNumber,
     Header(&'static str),
     /// An index into the loaded contacts.
     Contact(usize),
@@ -65,8 +71,28 @@ struct Candidate {
     names: Vec<String>,
 }
 
+/// Which pane shows (Desktop's `ComposerStep`, the steps built here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    NewChat,
+    FindByUsername,
+    FindByPhoneNumber,
+}
+
+/// A Find pane's field, and for a number the country picked.
+struct Find {
+    input: Entity<InputState>,
+    /// Desktop's `selectedRegion`: none until one is picked or a typed
+    /// country code picks one.
+    region: Option<String>,
+    _subscription: Subscription,
+}
+
 pub struct Compose {
     state: Entity<AppState>,
+    step: Step,
+    /// The Find pane's field, while one shows.
+    find: Option<Find>,
     search: Entity<InputState>,
     /// The search text as typed (Desktop hides the top rows for any text,
     /// spaces too, but filters by the trimmed text).
@@ -108,6 +134,8 @@ impl Compose {
         search.update(cx, |search, cx| search.focus(window, cx));
         let mut this = Self {
             state,
+            step: Step::NewChat,
+            find: None,
             search,
             query: String::new(),
             candidates: Rc::default(),
@@ -122,9 +150,158 @@ impl Compose {
         this
     }
 
-    /// Its search field.
+    /// Its field: New chat's search, or the Find pane's.
     pub fn search_input(&self) -> Entity<InputState> {
-        self.search.clone()
+        self.find.as_ref().map_or_else(|| self.search.clone(), |find| find.input.clone())
+    }
+
+    /// The pencil or ⌘N while it's open (Desktop's `START_COMPOSING`): a
+    /// Find pane goes back to a fresh New chat; New chat keeps its search.
+    pub fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.step != Step::NewChat {
+            self.show_new_chat(window, cx);
+        }
+        self.search_input().update(cx, |input, cx| input.focus(window, cx));
+    }
+
+    /// Shows a Find pane (Desktop's `showFindByUsername`, `showFindByPhoneNumber`).
+    fn show_find(&mut self, step: Step, window: &mut Window, cx: &mut Context<Self>) {
+        let placeholder = if step == Step::FindByUsername { "Username" } else { "Phone number" };
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+        let subscription = cx.subscribe_in(&input, window, |this, input, event: &InputEvent, window, cx| match event {
+            InputEvent::Change if this.step == Step::FindByPhoneNumber => {
+                let text = input.read(cx).value().to_string();
+                let selected = this.find.as_ref().and_then(|f| f.region.clone());
+                if let Some((region, national)) = signal_backend::recipients::switch_country(&text, selected.as_deref()) {
+                    if let Some(find) = &mut this.find {
+                        find.region = Some(region);
+                    }
+                    input.update(cx, |input, cx| input.set_value(national, window, cx));
+                }
+                cx.notify();
+            }
+            InputEvent::Change => cx.notify(),
+            InputEvent::PressEnter { .. } => this.next(window, cx),
+            _ => {}
+        });
+        input.update(cx, |input, cx| input.focus(window, cx));
+        self.find = Some(Find { input, region: None, _subscription: subscription });
+        self.step = step;
+        cx.notify();
+    }
+
+    /// Back from a Find pane to a fresh New chat (Desktop's `startComposing`),
+    /// which isn't while a lookup runs.
+    fn back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.finding.is_some() {
+            return;
+        }
+        self.show_new_chat(window, cx);
+    }
+
+    fn show_new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.step = Step::NewChat;
+        self.find = None;
+        self.finding = None;
+        self.query.clear();
+        self.search.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+            input.focus(window, cx);
+        });
+        self.rebuild(false, cx);
+    }
+
+    /// The account's region (Desktop's `regionCode`), from its number.
+    fn home_region(&self, cx: &App) -> Option<String> {
+        let phone = self.state.read(cx).account.as_ref()?.phone.clone()?;
+        signal_backend::recipients::region_of(&phone)
+    }
+
+    /// What Next would look up, if it may (Desktop's `#doLookup` checks):
+    /// a username-like entry, or a valid number read with the country
+    /// picked or the account's.
+    fn next_lookup(&self, cx: &App) -> Option<Row> {
+        let find = self.find.as_ref()?;
+        let text = find.input.read(cx).value().to_string();
+        match self.step {
+            Step::FindByUsername => username_from_search(&text).map(Row::Username),
+            Step::FindByPhoneNumber => {
+                let region = find.region.clone().or_else(|| self.home_region(cx));
+                let phone = signal_backend::recipients::parse_phone_in(&text, region.as_deref())?;
+                phone.valid.then(|| Row::Phone(phone, text.trim().to_owned()))
+            }
+            Step::NewChat => None,
+        }
+    }
+
+    /// Next, or Enter in a Find pane's field.
+    fn next(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.finding.is_some() {
+            return;
+        }
+        if let Some(row) = self.next_lookup(cx) {
+            self.look_up(&row, window, cx);
+        }
+    }
+
+    /// Picks a country (Desktop's `setComposeSelectedRegion`).
+    fn pick_country(&mut self, region: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(find) = &mut self.find {
+            find.region = Some(region.to_owned());
+            let input = find.input.clone();
+            input.update(cx, |input, cx| input.focus(window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Desktop's `ChooseCountryCodeModal`: "Country code", a search, and
+    /// every country with its calling code; picking one closes it. Desktop
+    /// searches names and codes with Fuse (threshold 0.1); here a name has
+    /// to contain the text (without case or accents), or a code the digits.
+    fn open_country_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
+        let focus = search.clone();
+        let countries = Rc::new(signal_backend::countries::countries());
+        let entity = cx.entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let palette = Palette::get(cx);
+            let term = search.read(cx).value().to_string();
+            let rows = country_matches(&countries, &term).into_iter().map(|ix| {
+                let country = countries[ix].clone();
+                let entity = entity.clone();
+                let selector = format!("country-{}", country.region);
+                div()
+                    .id(SharedString::from(selector.clone()))
+                    .debug_selector(move || selector)
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_2()
+                    .py_1p5()
+                    .rounded_lg()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(palette.row_hover))
+                    .child(div().flex_1().truncate().child(country.name))
+                    .child(div().text_color(palette.text_secondary).child(country.code.clone()))
+                    .on_click(move |_, window, cx| {
+                        window.close_dialog(cx);
+                        entity.update(cx, |this, cx| this.pick_country(country.region, window, cx));
+                    })
+            });
+            dialog
+                .title("Country code")
+                .w(px(440.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(Input::new(&search).cleanable(true))
+                        .child(div().id("country-list").h(px(360.)).overflow_y_scroll().children(rows)),
+                )
+        });
+        // After opening: the dialog takes the focus as it opens.
+        focus.update(cx, |input, cx| input.focus(window, cx));
     }
 
     /// Reads who to list again.
@@ -222,7 +399,7 @@ impl Compose {
         let probably_username = is_probably_a_username(&self.query);
         let mut rows = Vec::new();
         if self.query.is_empty() {
-            rows.push(Row::NewGroup);
+            rows.extend([Row::NewGroup, Row::FindByUsername, Row::FindByPhoneNumber]);
         }
         if !contacts.is_empty() && !probably_username {
             rows.push(Row::Header("Contacts"));
@@ -335,7 +512,13 @@ impl Compose {
         cx.notify();
         let error = match result {
             Ok(entry) => {
+                // The Find panes go back to the inbox (Desktop's `showInbox`
+                // after `showConversation`), even for an archived chat.
+                let from_find = self.step != Step::NewChat;
                 self.open(entry.id.clone(), Some(entry.clone()), cx);
+                if from_find {
+                    cx.emit(ComposeEvent::Opened { archived: false });
+                }
                 return;
             }
             Err(error) => error,
@@ -381,6 +564,15 @@ impl Compose {
                         crate::views::new_group::open(this.state.clone(), window, cx);
                         cx.emit(ComposeEvent::Handoff);
                     }))
+                    .into_any_element()
+            }
+            Row::FindByUsername | Row::FindByPhoneNumber => {
+                let (icon, label, selector, step) = match &row {
+                    Row::FindByUsername => (IconName::AtSign, "Find by username", "compose-find-by-username", Step::FindByUsername),
+                    _ => (IconName::Hash, "Find by phone number", "compose-find-by-phone-number", Step::FindByPhoneNumber),
+                };
+                tile(SharedString::from(selector), SELECT_HEIGHT, step_icon(icon, palette), div().child(label).into_any_element(), None, Some(selector.into()), palette)
+                    .on_click(cx.listener(move |this, _, window, cx| this.show_find(step, window, cx)))
                     .into_any_element()
             }
             Row::Contact(index) => {
@@ -522,74 +714,172 @@ impl Render for Compose {
         let palette = Palette::get(cx);
         let entity = cx.entity();
         let empty = self.rows.is_empty();
+        let new_chat = self.step == Step::NewChat;
+        let busy = self.finding.is_some();
+        // Desktop's Find panes reuse "Back to member selection" for theirs.
+        let (title, back_label) = match self.step {
+            Step::NewChat => ("New chat", "Back to inbox"),
+            Step::FindByUsername => ("Find by username", "Back to member selection"),
+            Step::FindByPhoneNumber => ("Find by phone number", "Back to member selection"),
+        };
+        let header = div()
+            .flex()
+            .items_center()
+            .py(px(15.))
+            .pl(px(12.))
+            .child(
+                Button::new("compose-back")
+                    .ghost()
+                    .small()
+                    .icon(IconName::ChevronLeft)
+                    .tooltip(back_label)
+                    .disabled(!new_chat && busy)
+                    .on_click(cx.listener(|this, _, window, cx| match this.step {
+                        Step::NewChat => cx.emit(ComposeEvent::Close),
+                        _ => this.back(window, cx),
+                    })),
+            )
+            .child(div().flex_1().pr(px(40.)).text_center().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).child(title));
         div()
             .id("compose")
             .debug_selector(|| "compose".into())
+            .relative()
             .size_full()
             .flex()
             .flex_col()
-            // Escape goes back to the inbox (Desktop's `onEscapeShortcut`).
-            .capture_key_down(cx.listener(|_, event: &gpui_kit::KeyDownEvent, _, cx| {
+            // Escape goes back (Desktop's `onEscapeShortcut`): to the inbox
+            // from New chat, to New chat from a Find pane (not while it
+            // looks something up).
+            .capture_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
                     cx.stop_propagation();
-                    cx.emit(ComposeEvent::Close);
+                    match this.step {
+                        Step::NewChat => cx.emit(ComposeEvent::Close),
+                        _ => this.back(window, cx),
+                    }
                 }
             }))
-            .child(
-                div()
+            .child(header)
+            .when(new_chat, |d| {
+                d.child(
+                    div()
+                        .px(px(16.))
+                        .pb(px(8.))
+                        .child(Input::new(&self.search).prefix(Icon::new(IconName::Search).size_4().text_color(palette.text_secondary))),
+                )
+                .when(empty, |d| {
+                    d.child(
+                        div()
+                            .debug_selector(|| "compose-no-chats".into())
+                            .mt(px(27.))
+                            .px_4()
+                            .w_full()
+                            .text_center()
+                            .child("No chats found"),
+                    )
+                })
+                .when(!empty, |d| {
+                    d.child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_h_0()
+                            .child(
+                                list(self.list.clone(), move |ix, _, cx| entity.update(cx, |this, cx| this.render_row(ix, cx)))
+                                    .size_full(),
+                            )
+                            .child(Scrollbar::vertical(&self.list).mode(ScrollbarMode::Hover)),
+                    )
+                })
+            })
+            .when(!new_chat, |d| d.child(self.render_find(palette, cx)))
+    }
+}
+
+impl Compose {
+    /// A Find pane's field (and for a number, the country above it) and
+    /// its Next button at the bottom right (Desktop's `getFooterContents`).
+    fn render_find(&mut self, palette: Palette, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let Some(find) = &self.find else { return div().into_any_element() };
+        let busy = self.finding.is_some();
+        let ready = !busy && self.next_lookup(cx).is_some();
+        let field = Input::new(&find.input).disabled(busy);
+        let body = match self.step {
+            Step::FindByUsername => div()
+                .flex()
+                .flex_col()
+                .mt(px(8.))
+                .px(px(16.))
+                .child(field)
+                .child(
+                    div()
+                        .mt(px(12.))
+                        .text_size(px(12.))
+                        .line_height(px(16.))
+                        .text_color(palette.text_secondary)
+                        .child("Enter a username followed by a dot and its set of numbers."),
+                ),
+            _ => {
+                // Desktop's `CountryCodeSelect`: the country picked or
+                // "Country code", its calling code or the account's.
+                let picked = find.region.as_deref().and_then(signal_backend::countries::country);
+                let code = picked
+                    .as_ref()
+                    .map(|c| c.code.clone())
+                    .or_else(|| self.home_region(cx).and_then(|r| signal_backend::countries::calling_code(&r)).map(|c| format!("+{c}")))
+                    .unwrap_or_default();
+                let name = picked.as_ref().map_or("Country code", |c| c.name);
+                let select = div()
+                    .id("compose-country")
+                    .debug_selector(|| "compose-country".into())
                     .flex()
                     .items_center()
-                    .py(px(15.))
-                    .pl(px(12.))
-                    .child(
-                        Button::new("compose-back")
-                            .ghost()
-                            .small()
-                            .icon(IconName::ChevronLeft)
-                            .tooltip("Back to inbox")
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(ComposeEvent::Close))),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .pr(px(40.))
-                            .text_center()
-                            .text_size(px(14.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("New chat"),
-                    ),
-            )
+                    .gap(px(12.))
+                    .h(px(28.))
+                    .px(px(12.))
+                    .rounded(px(8.))
+                    .bg(palette.row_hover)
+                    .text_size(px(13.))
+                    .line_height(px(18.))
+                    .when(!busy, |d| d.cursor_pointer().on_click(cx.listener(|this, _, window, cx| this.open_country_picker(window, cx))))
+                    .child(div().flex_1().truncate().child(name))
+                    .child(div().child(code))
+                    .child(Icon::new(IconName::ChevronDown).size(px(16.)).text_color(palette.text_secondary));
+                div().flex().flex_col().gap(px(12.)).mt(px(8.)).px(px(16.)).child(select).child(field)
+            }
+        };
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(body)
+            .child(div().flex_1())
             .child(
-                div()
-                    .px(px(16.))
-                    .pb(px(8.))
-                    .child(Input::new(&self.search).prefix(Icon::new(IconName::Search).size_4().text_color(palette.text_secondary))),
+                div().flex().justify_end().p(px(12.)).child(
+                    Button::new("compose-next")
+                        .primary()
+                        .label("Next")
+                        .loading(busy)
+                        .disabled(!ready)
+                        .on_click(cx.listener(|this, _, window, cx| this.next(window, cx))),
+                ),
             )
-            .when(empty, |d| {
-                d.child(
-                    div()
-                        .debug_selector(|| "compose-no-chats".into())
-                        .mt(px(27.))
-                        .px_4()
-                        .w_full()
-                        .text_center()
-                        .child("No chats found"),
-                )
-            })
-            .when(!empty, |d| {
-                d.child(
-                    div()
-                        .relative()
-                        .flex_1()
-                        .min_h_0()
-                        .child(
-                            list(self.list.clone(), move |ix, _, cx| entity.update(cx, |this, cx| this.render_row(ix, cx)))
-                                .size_full(),
-                        )
-                        .child(Scrollbar::vertical(&self.list).mode(ScrollbarMode::Hover)),
-                )
-            })
+            .into_any_element()
     }
+}
+
+/// The countries Desktop's search would keep for `term`, as indexes.
+fn country_matches(countries: &[signal_backend::countries::Country], term: &str) -> Vec<usize> {
+    let term = term.trim();
+    let words = searchable(term);
+    let digits: String = term.chars().filter(char::is_ascii_digit).collect();
+    countries
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| term.is_empty() || (!words.trim().is_empty() && searchable(c.name).contains(words.trim())) || (!digits.is_empty() && c.code[1..].starts_with(&digits)))
+        .map(|(ix, _)| ix)
+        .collect()
 }
 
 /// Desktop's `toSearchableTokens` (`ts/util/filterAndSortConversations.std.ts`):
@@ -749,6 +1039,8 @@ impl Compose {
             .iter()
             .map(|row| match row {
                 Row::NewGroup => "[New group]".to_owned(),
+                Row::FindByUsername => "[Find by username]".to_owned(),
+                Row::FindByPhoneNumber => "[Find by phone number]".to_owned(),
                 Row::Header(text) => format!("# {text}"),
                 Row::Contact(ix) => self.candidates[*ix].contact.title.clone(),
                 Row::Group(id) => self.state.read(cx).conversation(id).map_or_else(String::new, |g| g.title.clone()),
@@ -913,11 +1205,11 @@ mod tests {
         fn new_chat_lists_contacts_then_groups_and_closes_back_to_the_search(cx: &mut TestAppContext) {
             let mut m = mount(cx);
             // Something typed in the inbox's search stays for later.
-            m.sidebar.update_in(&mut m.cx, |s, window, cx| s.search_input().update(cx, |i, cx| i.set_value("hike", window, cx)));
+            m.sidebar.update_in(&mut m.cx, |s, window, cx| s.search_input(cx).update(cx, |i, cx| i.set_value("hike", window, cx)));
             m.cx.run_until_parked();
             open(&mut m);
             let rows = rows(&mut m);
-            assert_eq!(rows[..2], ["[New group]".to_owned(), "# Contacts".to_owned()]);
+            assert_eq!(rows[..4], ["[New group]", "[Find by username]", "[Find by phone number]", "# Contacts"].map(String::from));
             let groups = rows.iter().position(|r| r == "# Groups").expect("a Groups section");
             for person in ["Maya Chen", "Jordan Reyes", "Note to Self"] {
                 assert!(rows[2..groups].iter().any(|r| r == person), "{person} in {rows:?}");
@@ -930,9 +1222,152 @@ mod tests {
             m.cx.simulate_keystrokes("escape");
             m.cx.run_until_parked();
             assert!(m.sidebar.read_with(&m.cx, |s, _| s.compose().is_none()));
-            let query = m.sidebar.read_with(&m.cx, |s, cx| s.search_input().read(cx).value().to_string());
+            let query = m.sidebar.read_with(&m.cx, |s, cx| s.search_input(cx).read(cx).value().to_string());
             assert_eq!(query, "hike");
             m.backend.shutdown();
+        }
+
+        fn step(m: &mut Mounted) -> Step {
+            compose(m).read_with(&m.cx, |c, _| c.step)
+        }
+
+        fn find_text(m: &mut Mounted) -> String {
+            compose(m).read_with(&m.cx, |c, cx| c.find.as_ref().map(|f| f.input.read(cx).value().to_string()).unwrap_or_default())
+        }
+
+        fn next_ready(m: &mut Mounted) -> bool {
+            compose(m).read_with(&m.cx, |c, cx| c.next_lookup(cx).is_some())
+        }
+
+        fn show(m: &mut Mounted, step: Step) {
+            let compose = compose(m);
+            compose.update_in(&mut m.cx, |c, window, cx| c.show_find(step, window, cx));
+            m.cx.run_until_parked();
+        }
+
+        #[gpui_kit::test]
+        fn the_find_panes_open_from_new_chat_and_go_back_to_a_fresh_one(cx: &mut TestAppContext) {
+            let mut m = mount(cx);
+            open(&mut m);
+            // Their buttons go while anything is typed.
+            type_in(&mut m, " ");
+            assert!(!rows(&mut m).iter().any(|r| r.starts_with("[Find")));
+            show(&mut m, Step::FindByUsername);
+            assert_eq!(step(&mut m), Step::FindByUsername);
+            // The pane's field is the one the sidebar focuses.
+            let field = compose(&mut m).read_with(&m.cx, |c, _| c.search_input());
+            assert_eq!(m.sidebar.read_with(&m.cx, |s, cx| s.search_input(cx)), field);
+            // Escape: New chat again, its search empty, the buttons back.
+            m.cx.simulate_keystrokes("escape");
+            m.cx.run_until_parked();
+            assert_eq!(step(&mut m), Step::NewChat);
+            assert!(m.sidebar.read_with(&m.cx, |s, _| s.compose().is_some()));
+            assert_eq!(compose(&mut m).read_with(&m.cx, |c, _| c.query.clone()), "");
+            assert!(rows(&mut m).contains(&"[Find by phone number]".to_owned()));
+            // ⌘N from a Find pane does the same.
+            show(&mut m, Step::FindByPhoneNumber);
+            m.sidebar.update_in(&mut m.cx, |s, window, cx| s.open_compose(window, cx));
+            assert_eq!(step(&mut m), Step::NewChat);
+            m.backend.shutdown();
+        }
+
+        #[gpui_kit::test]
+        fn find_by_username_looks_up_what_was_typed(cx: &mut TestAppContext) {
+            let mut m = mount(cx);
+            open(&mut m);
+            show(&mut m, Step::FindByUsername);
+            assert!(!next_ready(&mut m), "nothing typed");
+            m.cx.simulate_input("x");
+            assert!(!next_ready(&mut m), "too short for a username");
+            m.cx.simulate_input("1");
+            m.cx.simulate_keystrokes("backspace backspace");
+            // Not anyone's: Desktop's dialog, and the pane stays.
+            m.cx.simulate_input("nobody.99");
+            assert!(next_ready(&mut m));
+            m.cx.simulate_keystrokes("enter");
+            wait(&mut m.cx, |cx| cx.update(|window, cx| window.has_active_dialog(cx)));
+            assert_eq!(step(&mut m), Step::FindByUsername);
+            m.cx.update(|window, cx| window.close_dialog(cx));
+            // Someone's: their chat opens and the composer closes.
+            let compose = compose(&mut m);
+            compose.update_in(&mut m.cx, |c, window, cx| {
+                let input = c.find.as_ref().unwrap().input.clone();
+                input.update(cx, |i, cx| i.set_value("maya.42", window, cx));
+                c.next(window, cx);
+            });
+            let state = m.state.clone();
+            wait(&mut m.cx, |cx| state.read_with(cx, |s, _| s.selected.as_ref().and_then(|id| s.conversation(id)).is_some_and(|c| c.title == "Maya Chen")));
+            assert!(m.sidebar.read_with(&m.cx, |s, _| s.compose().is_none()));
+            m.backend.shutdown();
+        }
+
+        #[gpui_kit::test]
+        fn find_by_phone_number_switches_country_and_looks_the_number_up(cx: &mut TestAppContext) {
+            let mut m = mount(cx);
+            open(&mut m);
+            show(&mut m, Step::FindByPhoneNumber);
+            // The demo's own number has no country to read a number by.
+            m.cx.simulate_input("415 555 0177");
+            assert!(!next_ready(&mut m), "no country to read it with");
+            m.cx.simulate_keystrokes("cmd-a backspace");
+            // A typed country code picks the country and leaves the rest.
+            m.cx.simulate_input("+1 202 555 0187");
+            let region = compose(&mut m).read_with(&m.cx, |c, _| c.find.as_ref().and_then(|f| f.region.clone()));
+            assert_eq!(region.as_deref(), Some("US"));
+            assert_eq!(find_text(&mut m), "2025550187");
+            assert!(next_ready(&mut m));
+            // No one has it: Desktop's dialog with the number as typed.
+            m.cx.simulate_keystrokes("enter");
+            wait(&mut m.cx, |cx| cx.update(|window, cx| window.has_active_dialog(cx)));
+            m.cx.update(|window, cx| window.close_dialog(cx));
+            // Dana's, in the directory: her chat opens, the composer closes.
+            let compose = compose(&mut m);
+            compose.update_in(&mut m.cx, |c, window, cx| {
+                let input = c.find.as_ref().unwrap().input.clone();
+                input.update(cx, |i, cx| i.set_value("415 555 0177", window, cx));
+                c.next(window, cx);
+            });
+            let state = m.state.clone();
+            wait(&mut m.cx, |cx| state.read_with(cx, |s, _| s.selected.as_ref().and_then(|id| s.conversation(id)).is_some_and(|c| c.title == "Dana Brooks")));
+            assert!(m.sidebar.read_with(&m.cx, |s, _| s.compose().is_none()));
+            m.backend.shutdown();
+        }
+
+        #[gpui_kit::test]
+        fn the_country_dialog_lists_and_filters_countries_and_picks_one(cx: &mut TestAppContext) {
+            let mut m = mount(cx);
+            open(&mut m);
+            show(&mut m, Step::FindByPhoneNumber);
+            let compose = compose(&mut m);
+            compose.update_in(&mut m.cx, |c, window, cx| c.open_country_picker(window, cx));
+            m.cx.run_until_parked();
+            assert!(m.cx.debug_bounds("country-AF").is_some(), "Afghanistan first");
+            m.cx.simulate_input("united k");
+            m.cx.run_until_parked();
+            assert!(m.cx.debug_bounds("country-GB").is_some());
+            assert!(m.cx.debug_bounds("country-AF").is_none());
+            let gb = m.cx.debug_bounds("country-GB").unwrap();
+            m.cx.simulate_click(gb.center(), gpui_kit::Modifiers::none());
+            m.cx.run_until_parked();
+            assert!(!m.cx.update(|window, cx| window.has_active_dialog(cx)));
+            let region = compose.read_with(&m.cx, |c, _| c.find.as_ref().and_then(|f| f.region.clone()));
+            assert_eq!(region.as_deref(), Some("GB"));
+            // A London number now reads.
+            m.cx.simulate_input("020 7946 0958");
+            assert!(next_ready(&mut m));
+            m.backend.shutdown();
+        }
+
+        #[test]
+        fn countries_filter_by_name_or_code() {
+            let all = signal_backend::countries::countries();
+            let names = |term: &str| country_matches(&all, term).into_iter().map(|ix| all[ix].region).collect::<Vec<_>>();
+            assert_eq!(names("").len(), all.len());
+            assert!(names("Åland").contains(&"AX"));
+            assert!(names("aland").contains(&"AX"), "without accents");
+            assert!(names("44").contains(&"GB"));
+            assert!(names("+44").contains(&"GB"));
+            assert!(names("zzz").is_empty());
         }
 
         #[gpui_kit::test]

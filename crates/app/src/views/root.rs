@@ -349,7 +349,7 @@ impl RootView {
         } else if let Some(conversation) = &self.conversation {
             window.focus(&conversation.focus_handle(cx), cx);
         } else {
-            let search = self.sidebar.read(cx).search_input();
+            let search = self.sidebar.read(cx).search_input(cx);
             search.update(cx, |search, cx| search.focus(window, cx));
         }
     }
@@ -671,7 +671,7 @@ impl Render for RootView {
                 }
                 // A narrow list widens to search, as Desktop's does.
                 this.expand_sidebar(cx);
-                let search = this.sidebar.read(cx).search_input();
+                let search = this.sidebar.read(cx).search_input(cx);
                 search.update(cx, |search, cx| search.focus(window, cx));
             }))
             .on_action(cx.listener(|this, _: &SearchInChat, _, cx| {
