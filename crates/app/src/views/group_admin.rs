@@ -24,7 +24,7 @@ use signal_store::{Conversation, ConversationId, ConversationKind, Membership};
 
 use crate::state::AppState;
 use crate::theme::{Palette, color_for};
-use crate::views::common::{conversation_avatar, person_avatar};
+use crate::views::common::conversation_avatar;
 
 /// Names for service ids, loaded from the database (who isn't known by
 /// name shows as "Unknown", as in Desktop).
@@ -646,7 +646,7 @@ pub fn open_join(state: Entity<AppState>, preview: std::rc::Rc<signal_backend::G
                     .items_center()
                     .gap_2()
                     .text_center()
-                    .child(person_avatar(preview.avatar.as_deref(), &preview.title, color, px(80.)))
+                    .child(crate::views::common::group_photo(preview.avatar.as_deref(), &preview.title, color, px(80.)))
                     .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(preview.title.clone()))
                     .child(div().text_sm().text_color(palette.text_secondary).child(format!("Group · {members}")))
                     .when_some(preview.description.clone(), |d, text| d.child(div().text_sm().child(text)))

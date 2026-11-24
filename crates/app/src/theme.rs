@@ -168,19 +168,32 @@ pub fn name_color(members: &[String], author: &str, dark: bool) -> Hsla {
     c(if dark { dark_value } else { light })
 }
 
-/// Up to two initials for an avatar.
-pub fn initials(name: &str) -> String {
-    if name.trim_start().starts_with('+') {
-        return "#".into(); // phone number
+/// Up to two initials for an avatar, or none when the name has no letters
+/// (a phone number), as Desktop's `getInitials` (`ts/util/getInitials.std.ts`):
+/// only letters count, a name that is already two capitals is kept, and
+/// the letters keep their case.
+pub fn initials(name: &str) -> Option<String> {
+    use unicode_properties::{GeneralCategoryGroup, UnicodeGeneralCategory as _};
+    // Letters (`\p{L}`), with each separator (`\p{Z}`) a space; marks,
+    // digits, symbols and control characters (a tab) drop out.
+    let letters: String = name
+        .chars()
+        .filter_map(|c| match c.general_category_group() {
+            GeneralCategoryGroup::Letter => Some(c),
+            GeneralCategoryGroup::Separator => Some(' '),
+            _ => None,
+        })
+        .collect();
+    let words: Vec<&str> = letters.split_whitespace().collect();
+    let first = words.first()?;
+    if words.len() == 1 && first.chars().count() == 2 && first.to_uppercase() == *first {
+        return Some((*first).to_owned());
     }
-    let mut words = name.split_whitespace().filter(|w| w.chars().next().is_some_and(char::is_alphanumeric));
-    let first = words.next().and_then(|w| w.chars().next());
-    let last = words.next_back().and_then(|w| w.chars().next());
-    match (first, last) {
-        (Some(a), Some(b)) => format!("{}{}", a.to_uppercase(), b.to_uppercase()),
-        (Some(a), None) => a.to_uppercase().to_string(),
-        _ => "#".into(),
-    }
+    let initial = |word: &str| word.chars().next().map(String::from).unwrap_or_default();
+    Some(match words.last() {
+        Some(last) if words.len() > 1 => initial(first) + &initial(last),
+        _ => initial(first),
+    })
 }
 
 #[cfg(test)]
@@ -204,11 +217,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn initials_work() {
-        assert_eq!(initials("Ada Lovelace"), "AL");
-        assert_eq!(initials("ada"), "A");
-        assert_eq!(initials("Grace Brewster Hopper"), "GH");
-        assert_eq!(initials("+1 555 0100"), "#");
-        assert_eq!(initials(""), "#");
+    fn initials_follow_desktop() {
+        let of = |name: &str| initials(name);
+        assert_eq!(of("Ada Lovelace").as_deref(), Some("AL"));
+        assert_eq!(of("Grace Brewster Hopper").as_deref(), Some("GH"));
+        // The letters keep their case.
+        assert_eq!(of("ada").as_deref(), Some("a"));
+        // Two capitals are kept as they are.
+        assert_eq!(of("JE").as_deref(), Some("JE"));
+        // Only letters count: digits, emoji and punctuation drop out.
+        assert_eq!(of("(Ada) 7 🚀 Lovelace!").as_deref(), Some("AL"));
+        assert_eq!(of("Team 7").as_deref(), Some("T"));
+        assert_eq!(of("Élodie Ünal").as_deref(), Some("ÉÜ"));
+        // Letters by Unicode category: a vowel sign (a mark) and a Roman
+        // numeral (a letter number) drop out, and a tab joins the words.
+        assert_eq!(of("रवि").as_deref(), Some("रव"));
+        assert_eq!(of("Henry Ⅷ").as_deref(), Some("H"));
+        assert_eq!(of("Ada\tLovelace").as_deref(), Some("A"));
+        // No letters: no initials (Desktop draws its person icon).
+        assert_eq!(of("+1 555 0100"), None);
+        assert_eq!(of("🚀"), None);
+        assert_eq!(of(""), None);
     }
 }

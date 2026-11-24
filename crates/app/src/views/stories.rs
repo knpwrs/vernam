@@ -276,7 +276,10 @@ impl StoriesPane {
         let latest = group.stories.last().cloned();
         let avatar = match state.conversation(&group.chat) {
             Some(chat) => conversation_avatar(chat, px(48.)),
-            None => crate::views::common::avatar(&group.title, crate::theme::color_for(&group.chat.0), px(48.)).into_any_element(),
+            None => {
+                let kind = if group.chat.is_group() { signal_store::ConversationKind::Group } else { signal_store::ConversationKind::Direct };
+                crate::views::common::chat_placeholder(kind, &group.title, crate::theme::color_for(&group.chat.0), px(48.))
+            }
         };
         let replied = group.stories.iter().any(|s| !s.replies.is_empty());
         let chat = group.chat.clone();

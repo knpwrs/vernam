@@ -9,21 +9,25 @@ use signal_store::{Conversation, ConversationKind, DeliveryStatus};
 
 use crate::theme::{Palette, avatar_colors, initials};
 
-/// A round avatar with initials.
+/// What Vernam names someone it knows nothing about, as Desktop names them
+/// "Unknown contact" (or "Deleted Account", which Vernam doesn't track).
+/// Vernam mostly writes "Unknown" where Desktop writes "Unknown contact",
+/// so that counts too, though someone really named "Unknown" then gets the
+/// icon where Desktop would show "U".
+const UNKNOWN_NAMES: [&str; 3] = ["Unknown", "Unknown contact", "Deleted Account"];
+
+/// A person's round avatar without a photo: their initials, or Desktop's
+/// person icon when there are none to show (a name without letters, such
+/// as a phone number) or the name only says they're unknown
+/// (`shouldUseInitials` in `ts/components/Avatar.dom.tsx`).
 pub fn avatar(name: &str, color: u8, size: Pixels) -> Div {
+    let label = initials(name).filter(|_| !UNKNOWN_NAMES.contains(&name.trim()));
     let (bg, fg) = avatar_colors(color);
-    div()
-        .flex()
-        .flex_none()
-        .items_center()
-        .justify_center()
-        .size(size)
-        .rounded_full()
-        .bg(bg)
-        .text_color(fg)
-        .text_size(size * 0.4)
-        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-        .child(SharedString::from(initials(name)))
+    let circle = div().flex().flex_none().items_center().justify_center().size(size).rounded_full().bg(bg).text_color(fg);
+    match label {
+        Some(label) => circle.text_size(size * 0.4).font_weight(gpui_kit::FontWeight::SEMIBOLD).child(SharedString::from(label)),
+        None => circle.debug_selector(|| "avatar-person-icon".into()).child(Icon::new(IconName::User).size(size * 0.5).text_color(fg)),
+    }
 }
 
 /// The room left at the window's top for the macOS traffic lights (Desktop's
@@ -83,7 +87,7 @@ pub fn badged_avatar(state: &crate::state::AppState, service_id: &str, name: &st
 
 /// `photo` when there is one; Desktop's gradient when their photo wasn't
 /// downloaded because we haven't accepted them (`Avatar.dom.tsx`,
-/// `hasAvatar && !hasLocalImage`); otherwise their initials.
+/// `hasAvatar && !hasLocalImage`); otherwise [`avatar`].
 pub fn person_photo(
     state: &crate::state::AppState,
     service_id: &str,
@@ -223,8 +227,21 @@ fn avatar_photo(path: std::path::PathBuf, size: Pixels, placeholder: impl Fn() -
         .into_any_element()
 }
 
+/// A group's avatar from its photo, if any: the group icon without one,
+/// while it loads, or when it doesn't (Desktop's `Avatar` with
+/// `conversationType="group"`), for a group that isn't a chat here yet.
+pub fn group_photo(photo: Option<&std::path::Path>, title: &str, color: u8, size: Pixels) -> AnyElement {
+    let title = title.to_owned();
+    let placeholder = move || chat_placeholder(ConversationKind::Group, &title, color, size);
+    match photo {
+        Some(path) => avatar_photo(path.to_path_buf(), size, placeholder),
+        None => placeholder(),
+    }
+}
+
 /// A person's avatar: their profile photo once downloaded, else (and
-/// while it loads, or when it doesn't) initials.
+/// while it loads, or when it doesn't) [`avatar`]: initials or the person
+/// icon.
 pub fn person_avatar(photo: Option<&std::path::Path>, name: &str, color: u8, size: Pixels) -> AnyElement {
     match photo {
         Some(path) => {
@@ -267,7 +284,7 @@ pub fn signal_avatar(size: Pixels) -> AnyElement {
 }
 
 /// A conversation's avatar: its downloaded photo, else (like Signal Desktop)
-/// a people icon for groups, a note icon for Note to Self, or initials,
+/// a people icon for groups, a note icon for Note to Self, or [`avatar`],
 /// which also stand in for a photo while it loads or when it doesn't.
 pub fn conversation_avatar(conversation: &Conversation, size: Pixels) -> AnyElement {
     if conversation.id.is_signal() {
@@ -286,8 +303,8 @@ pub fn conversation_avatar(conversation: &Conversation, size: Pixels) -> AnyElem
 }
 
 /// A chat's avatar without a photo: the group or Note to Self icon, or the
-/// title's initials.
-fn chat_placeholder(kind: ConversationKind, title: &str, color: u8, size: Pixels) -> AnyElement {
+/// title's [`avatar`].
+pub fn chat_placeholder(kind: ConversationKind, title: &str, color: u8, size: Pixels) -> AnyElement {
     let icon = match kind {
         ConversationKind::Group => Some(IconName::Users),
         ConversationKind::NoteToSelf => Some(IconName::NotebookText),
@@ -559,6 +576,26 @@ mod tests {
         vcx.run_until_parked();
         let bounds = vcx.debug_bounds("avatar-fallback").expect("nothing drawn");
         assert_eq!(bounds.size.height, px(28.));
+    }
+
+    /// Draws a person's avatar without a photo.
+    struct Nameplate(&'static str);
+
+    impl Render for Nameplate {
+        fn render(&mut self, _: &mut gpui_kit::Window, _: &mut gpui_kit::Context<Self>) -> impl IntoElement {
+            div().child(person_avatar(None, self.0, 3, px(28.)))
+        }
+    }
+
+    /// Desktop's person icon stands in for initials when the name has no
+    /// letters or only says they're unknown.
+    #[gpui_kit::test]
+    fn names_without_initials_get_the_person_icon(cx: &mut gpui_kit::TestAppContext) {
+        for (name, icon) in [("+1 555 0100", true), ("Unknown", true), ("Unknown contact", true), ("Ada Lovelace", false)] {
+            let (_, vcx) = cx.add_window_view(|_, _| Nameplate(name));
+            vcx.run_until_parked();
+            assert_eq!(vcx.debug_bounds("avatar-person-icon").is_some(), icon, "{name}");
+        }
     }
 
     /// A photo that loads shows itself.

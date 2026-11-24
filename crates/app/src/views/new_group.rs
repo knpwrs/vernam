@@ -17,7 +17,6 @@ use signal_store::{Conversation, DirectoryEntry};
 
 use crate::state::AppState;
 use crate::theme::{Palette, color_for};
-use crate::views::common::person_avatar;
 
 /// Desktop's one-time alerts (`OneTimeModalState`): each shows at most
 /// once while picking.
@@ -313,7 +312,7 @@ fn new_group_extras(state: &Entity<AppState>, picking: &Entity<Picking>, palette
         .flex_wrap()
         .items_center()
         .gap_2()
-        .when_some(photo, |d, path| d.child(person_avatar(Some(&path), "", 0, px(32.))))
+        .when_some(photo, |d, path| d.child(crate::views::common::group_photo(Some(&path), "", 0, px(32.))))
         .child(choose)
         .child(timer_button)
         .child(
