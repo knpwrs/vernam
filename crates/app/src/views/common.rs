@@ -199,15 +199,38 @@ pub fn badge_image(state: &crate::state::AppState, service_id: &str, size: f32, 
     state.badges.image(badge, badge_size(size)?, dark)
 }
 
-/// A person's avatar: their profile photo once downloaded, else initials.
+/// A round photo, or `placeholder` while it loads and when the file doesn't
+/// load. Desktop's `Avatar.dom.tsx` shows the placeholder until the image
+/// is there, and sets `imageBroken` to keep it when the image fails: a
+/// photo can be damaged as its owner uploaded it, and still decrypt.
+/// (GPUI shows the loading one only after 200 ms, so a quick load doesn't
+/// flash it, and only for an image with an id, whose state times the
+/// wait. Avatars of the same photo side by side share that state, which
+/// is the same load's.)
+fn avatar_photo(path: std::path::PathBuf, size: Pixels, placeholder: impl Fn() -> AnyElement + 'static) -> AnyElement {
+    let placeholder = std::rc::Rc::new(placeholder);
+    let loading = placeholder.clone();
+    let id = SharedString::from(format!("avatar-{}", path.display()));
+    img(path)
+        .id(id)
+        .debug_selector(|| "avatar-photo".into())
+        .flex_none()
+        .size(size)
+        .rounded_full()
+        .object_fit(ObjectFit::Cover)
+        .with_loading(move || loading())
+        .with_fallback(move || div().debug_selector(|| "avatar-fallback".into()).child(placeholder()).into_any_element())
+        .into_any_element()
+}
+
+/// A person's avatar: their profile photo once downloaded, else (and
+/// while it loads, or when it doesn't) initials.
 pub fn person_avatar(photo: Option<&std::path::Path>, name: &str, color: u8, size: Pixels) -> AnyElement {
     match photo {
-        Some(path) => img(path.to_path_buf())
-            .flex_none()
-            .size(size)
-            .rounded_full()
-            .object_fit(ObjectFit::Cover)
-            .into_any_element(),
+        Some(path) => {
+            let name = name.to_owned();
+            avatar_photo(path.to_path_buf(), size, move || avatar(&name, color, size).into_any_element())
+        }
         None => avatar(name, color, size).into_any_element(),
     }
 }
@@ -244,32 +267,35 @@ pub fn signal_avatar(size: Pixels) -> AnyElement {
 }
 
 /// A conversation's avatar: its downloaded photo, else (like Signal Desktop)
-/// a people icon for groups, a note icon for Note to Self, or initials.
+/// a people icon for groups, a note icon for Note to Self, or initials,
+/// which also stand in for a photo while it loads or when it doesn't.
 pub fn conversation_avatar(conversation: &Conversation, size: Pixels) -> AnyElement {
     if conversation.id.is_signal() {
         return signal_avatar(size);
     }
     if let Some(path) = conversation.avatar_path.as_ref() {
-        return img(std::path::PathBuf::from(path))
-            .flex_none()
-            .size(size)
-            .rounded_full()
-            .object_fit(ObjectFit::Cover)
-            .into_any_element();
+        let (kind, title, color) = (conversation.kind, conversation.title.clone(), conversation.color);
+        return avatar_photo(path.into(), size, move || chat_placeholder(kind, &title, color, size));
     }
     // One not downloaded because the chat isn't accepted.
     if conversation.avatar_withheld {
         let hash = signal_backend::photo_placeholder_hash(&conversation.id);
         return photo_placeholder(hash, size).into_any_element();
     }
-    let icon = match conversation.kind {
+    chat_placeholder(conversation.kind, &conversation.title, conversation.color, size)
+}
+
+/// A chat's avatar without a photo: the group or Note to Self icon, or the
+/// title's initials.
+fn chat_placeholder(kind: ConversationKind, title: &str, color: u8, size: Pixels) -> AnyElement {
+    let icon = match kind {
         ConversationKind::Group => Some(IconName::Users),
         ConversationKind::NoteToSelf => Some(IconName::NotebookText),
         ConversationKind::Direct => None,
     };
     match icon {
         Some(icon) => {
-            let (bg, fg) = avatar_colors(conversation.color);
+            let (bg, fg) = avatar_colors(color);
             div()
                 .flex()
                 .flex_none()
@@ -281,7 +307,7 @@ pub fn conversation_avatar(conversation: &Conversation, size: Pixels) -> AnyElem
                 .child(Icon::new(icon).size(size * 0.5).text_color(fg))
                 .into_any_element()
         }
-        None => avatar(&conversation.title, conversation.color, size).into_any_element(),
+        None => avatar(title, color, size).into_any_element(),
     }
 }
 
@@ -448,6 +474,100 @@ mod tests {
             ]
         );
         assert!(find_links("no links here").is_empty());
+    }
+
+    /// Draws a photo as a person's avatar, or as a group's.
+    struct Avatar {
+        photo: std::path::PathBuf,
+        group: bool,
+        /// The timeline's cache, which draws senders' avatars, rather than
+        /// GPUI's global one.
+        cache: Option<gpui_kit::Entity<crate::image_cache::LruImageCache>>,
+    }
+
+    impl Render for Avatar {
+        fn render(&mut self, _: &mut gpui_kit::Window, _: &mut gpui_kit::Context<Self>) -> impl IntoElement {
+            let root = match &self.cache {
+                Some(cache) => div().image_cache(cache.clone()),
+                None => div(),
+            };
+            if !self.group {
+                return root.child(person_avatar(Some(&self.photo), "Sam Rivera", 3, px(28.)));
+            }
+            let person = crate::views::message_request::ReviewPerson {
+                aci: "a".into(),
+                name: "Hikers".into(),
+                phone: None,
+                shared_groups: Vec::new(),
+                chat: None,
+            };
+            let mut group = person.chat_or_new();
+            group.kind = ConversationKind::Group;
+            group.avatar_path = self.photo.to_str().map(str::to_owned);
+            root.child(conversation_avatar(&group, px(28.)))
+        }
+    }
+
+    /// Writes a JPEG's first bytes, then noise: a photo uploaded damaged,
+    /// which still decrypts.
+    fn damaged_photo(dir: &std::path::Path) -> std::path::PathBuf {
+        let photo = dir.join("d-sam.jpg");
+        let mut bytes = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00".to_vec();
+        bytes.extend((0..4096u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8));
+        std::fs::write(&photo, bytes).unwrap();
+        photo
+    }
+
+    /// The placeholder's bounds once `photo` has been loaded (or not).
+    fn placeholder(cx: &mut gpui_kit::TestAppContext, photo: std::path::PathBuf, group: bool) -> Option<gpui_kit::Bounds<Pixels>> {
+        let source = gpui_kit::Resource::Path(photo.clone().into());
+        let (_, vcx) = cx.add_window_view(|_, _| Avatar { photo, group, cache: None });
+        vcx.run_until_parked();
+        // The load ends after the first frame; the next draws the outcome.
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+        // The photo's element is there either way, holding the placeholder
+        // when it doesn't load.
+        assert!(vcx.debug_bounds("avatar-photo").is_some());
+        // And its load has ended, so a placeholder missing isn't one yet
+        // to come.
+        let loaded = vcx.update(|window, cx| window.get_asset::<gpui_kit::ImgResourceLoader>(&source, cx));
+        assert!(loaded.is_some(), "still loading");
+        vcx.debug_bounds("avatar-fallback")
+    }
+
+    /// A photo that doesn't decode (one uploaded damaged still decrypts)
+    /// shows the placeholder, as Desktop's `imageBroken` does, not nothing.
+    #[gpui_kit::test]
+    fn a_photo_that_wont_load_shows_the_placeholder(cx: &mut gpui_kit::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let photo = damaged_photo(dir.path());
+        for group in [false, true] {
+            let bounds = placeholder(cx, photo.clone(), group).unwrap_or_else(|| panic!("nothing drawn (group: {group})"));
+            assert_eq!(bounds.size.height, px(28.), "group: {group}");
+        }
+    }
+
+    /// The same through the timeline's own image cache.
+    #[gpui_kit::test]
+    fn a_sender_photo_that_wont_load_shows_the_placeholder(cx: &mut gpui_kit::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let photo = damaged_photo(dir.path());
+        let (_, vcx) = cx.add_window_view(|_, cx| Avatar { photo, group: false, cache: Some(crate::image_cache::LruImageCache::new(cx)) });
+        vcx.run_until_parked();
+        vcx.update(|window, _| window.refresh());
+        vcx.run_until_parked();
+        let bounds = vcx.debug_bounds("avatar-fallback").expect("nothing drawn");
+        assert_eq!(bounds.size.height, px(28.));
+    }
+
+    /// A photo that loads shows itself.
+    #[gpui_kit::test]
+    fn a_photo_that_loads_shows_no_placeholder(cx: &mut gpui_kit::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let photo = dir.path().join("d-sam.png");
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([200, 80, 40, 255])).save(&photo).unwrap();
+        assert!(placeholder(cx, photo, false).is_none());
     }
 }
 
