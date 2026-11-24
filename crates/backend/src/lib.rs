@@ -528,7 +528,8 @@ pub enum Command {
     UpdateGroup { conversation: ConversationId, title: Option<String>, description: Option<String> },
     /// Leaves a group.
     LeaveGroup { conversation: ConversationId },
-    /// Creates a group with us as its admin; answered with `Event::GroupCreated`.
+    /// Creates a group with us as its admin; answered with `Event::GroupCreated`,
+    /// or `Event::GroupCreateFailed`.
     /// `avatar` is a picked image (made a group photo as Desktop does) and
     /// `expire_timer` the disappearing message timer, in seconds (0: off).
     CreateGroup { title: String, members: Vec<String>, avatar: Option<Vec<u8>>, expire_timer: u32 },
@@ -1199,6 +1200,9 @@ pub enum Event {
     KeyTransparencyFailed,
     /// A group we created is ready to open.
     GroupCreated(ConversationId),
+    /// Creating a group failed (Desktop's `CREATE_GROUP_REJECTED`: "This
+    /// group couldn't be created").
+    GroupCreateFailed,
     /// What a group link leads to, for Desktop's join dialog.
     GroupLinkPreview(GroupLinkPreview),
     /// Open this group (joined, asked to join, or already in it), with

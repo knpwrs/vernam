@@ -103,6 +103,11 @@ pub struct Account {
 #[derive(Debug, Clone)]
 pub enum AppEvent {
     ConversationsChanged,
+    /// A group we created opened (New group's "Create"); the state
+    /// selected it.
+    GroupCreated,
+    /// Creating a group failed; Desktop's dialog has been shown.
+    GroupCreateFailed,
     /// The account was unlinked and its data wiped.
     Unlinked,
     SelectionChanged,
@@ -1361,7 +1366,16 @@ impl AppState {
             Event::ViewOnceOpened(opened) => self.view_once(opened, cx),
             Event::GroupCreated(conversation) => {
                 self.reload_conversations(cx);
-                self.select(Some(conversation), cx);
+                self.select(Some(conversation.clone()), cx);
+                cx.emit(AppEvent::GroupCreated);
+            }
+            // Desktop's `CREATE_GROUP_REJECTED` dialog, untitled.
+            Event::GroupCreateFailed => {
+                cx.emit(AppEvent::Alert {
+                    title: SharedString::default(),
+                    description: "This group couldn\u{2019}t be created. Check your connection and try again.".into(),
+                });
+                cx.emit(AppEvent::GroupCreateFailed);
             }
             Event::GroupLinkPreview(preview) => cx.emit(AppEvent::GroupLinkPreview(std::rc::Rc::new(preview))),
             Event::GroupOpened { conversation, toast } => {

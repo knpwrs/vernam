@@ -290,7 +290,12 @@ impl RootView {
         if let AppEvent::Alert { title, description } = event {
             use gpui_kit::component::WindowExt as _;
             let (title, description) = (title.clone(), description.clone());
-            window.open_alert_dialog(cx, move |alert, _, _| alert.title(title.clone()).description(description.clone()));
+            // An empty title is an untitled dialog, as Desktop's
+            // `AxoConfirmDialog` with no title.
+            window.open_alert_dialog(cx, move |alert, _, _| {
+                let alert = alert.description(description.clone());
+                if title.is_empty() { alert } else { alert.title(title.clone()) }
+            });
         }
         if let AppEvent::Info(message) = event {
             use gpui_kit::component::WindowExt as _;

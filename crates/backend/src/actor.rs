@@ -2145,10 +2145,17 @@ impl Actor {
     async fn create_group(self: Rc<Self>, title: String, members: Vec<String>, avatar: Option<Vec<u8>>, expire_timer: u32) {
         let title = title.trim().to_owned();
         if title.is_empty() {
+            self.emit(Event::GroupCreateFailed);
             return self.emit(Event::Error("A group needs a name".into()));
         }
-        let Some(manager) = self.manager() else { return };
-        let Some(me) = Aci::parse_from_service_id_string(&self.self_aci()) else { return };
+        let Some(manager) = self.manager() else {
+            warn!("can't create a group: not connected");
+            return self.emit(Event::GroupCreateFailed);
+        };
+        let Some(me) = Aci::parse_from_service_id_string(&self.self_aci()) else {
+            warn!("can't create a group: no account");
+            return self.emit(Event::GroupCreateFailed);
+        };
         let mine = self.our_profile_key(&manager).await;
         let mut candidates = Vec::new();
         for sid in &members {
@@ -2160,6 +2167,7 @@ impl Actor {
         // counting us (the UI stops picking people before that).
         let limit = crate::remote_config().group_size_hard_limit();
         if candidates.len() + 1 > limit {
+            self.emit(Event::GroupCreateFailed);
             return self.emit(Event::Error(format!("Signal groups can have a maximum of {limit} members.")));
         }
         let key: [u8; 32] = rand::Rng::random(&mut rand::rng());
@@ -2177,7 +2185,9 @@ impl Actor {
         }
         .await;
         if let Err(error) = created {
-            return self.error("couldn't create the group", format!("{error:#}"));
+            // Desktop's dialog says so ("This group couldn't be created").
+            warn!(error = %format!("{error:#}"), "couldn't create the group");
+            return self.emit(Event::GroupCreateFailed);
         }
         let conversation = ConversationId::group(&key);
         self.ensure_title(&conversation).await;

@@ -182,6 +182,8 @@ impl Sidebar {
                 | AppEvent::UsernameReserved { .. }
                 | AppEvent::UsernameSaved(_)
                 | AppEvent::UsernameLinkReset(_)
+                | AppEvent::GroupCreated
+                | AppEvent::GroupCreateFailed
                 | AppEvent::Unlinked => {}
             }),
         ];
