@@ -228,6 +228,9 @@ impl Sidebar {
             return;
         }
         cx.emit(SidebarEvent::Expand);
+        // A lookup from the inbox search is dropped: its answer would also
+        // complete New chat's lookup of the same text.
+        self.finding = None;
         let compose = cx.new(|cx| crate::views::compose::Compose::new(self.state.clone(), window, cx));
         let subscription = cx.subscribe_in(&compose, window, |this, _, event: &ComposeEvent, window, cx| {
             let archived = matches!(event, ComposeEvent::Opened { archived: true });
@@ -278,6 +281,10 @@ impl Sidebar {
 
     /// Desktop's "Search in chat": the search box searches `conversation`.
     pub fn search_in_chat(&mut self, conversation: ConversationId, window: &mut Window, cx: &mut Context<Self>) {
+        // Its field is the inbox's, which New chat covers: back to the inbox.
+        if self.compose.take().is_some() {
+            self.set_archive_open(false, cx);
+        }
         if self.chat_search.as_ref().is_none_or(|s| s.conversation != conversation) {
             let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search chat"));
             let subscription = cx.subscribe_in(&input, window, |this, input, event: &InputEvent, _, cx| {

@@ -17,7 +17,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::{Icon, Sizable as _, WindowExt as _};
 use gpui_kit::prelude::*;
-use gpui_kit::{App, Context, Entity, FontWeight, ListAlignment, ListState, SharedString, Subscription, Task, Window, div, list, px};
+use gpui_kit::{App, Context, Entity, FontWeight, ListAlignment, ListOffset, ListState, SharedString, Subscription, Task, Window, div, list, px};
 use signal_backend::recipients::{FindError, ParsedPhone};
 use signal_store::{ComposeContact, Conversation, ConversationId, ConversationKind, DirectoryEntry};
 
@@ -48,6 +48,9 @@ enum Row {
 pub enum ComposeEvent {
     /// Back to the inbox (back button, Escape).
     Close,
+    /// Closed for a dialog that takes the keyboard (New group), so the
+    /// inbox search doesn't take it back.
+    Handoff,
     /// A chat was picked; `archived` shows the archive (Desktop's
     /// `switchToAssociatedView`).
     Opened { archived: bool },
@@ -92,11 +95,12 @@ impl Compose {
             cx.subscribe_in(&search, window, |this, input, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
                     this.query = input.read(cx).value().to_string();
-                    this.rebuild(cx);
+                    this.rebuild(false, cx);
                 }
             }),
             cx.subscribe_in(&state, window, |this, _, event: &AppEvent, window, cx| match event {
-                AppEvent::ConversationsChanged => this.load(cx),
+                // A profile brings a new name to search and a new About.
+                AppEvent::ConversationsChanged | AppEvent::ProfileChanged(_) => this.load(cx),
                 AppEvent::RecipientFound { query, result } => this.found(query, result, window, cx),
                 _ => {}
             }),
@@ -114,7 +118,7 @@ impl Compose {
             _subscriptions: subscriptions,
         };
         this.load(cx);
-        this.rebuild(cx);
+        this.rebuild(false, cx);
         this
     }
 
@@ -131,7 +135,13 @@ impl Compose {
         let db = backend.db().clone();
         let read = backend.spawn(async move { db.compose_contacts(&me).await });
         self.load = Some(cx.spawn(async move |this, cx| {
-            let Ok(contacts) = read.await else { return };
+            let contacts = match read.await {
+                Ok(contacts) => contacts,
+                Err(error) => {
+                    tracing::warn!(%error, "couldn't read who New chat lists");
+                    return;
+                }
+            };
             let candidates: Vec<Candidate> = contacts
                 .into_iter()
                 .map(|contact| {
@@ -152,7 +162,7 @@ impl Compose {
                 .collect();
             let _ = this.update(cx, |this, cx| {
                 this.candidates = Rc::new(candidates);
-                this.rebuild(cx);
+                this.rebuild(true, cx);
             });
         }));
     }
@@ -170,12 +180,18 @@ impl Compose {
             .collect()
     }
 
-    /// Lays the rows out again for the query and data.
-    fn rebuild(&mut self, cx: &mut Context<Self>) {
+    /// Lays the rows out again for the query and data. `keep_place` keeps
+    /// the scroll position (the data changed: a message reorders the list);
+    /// a new query starts at the top.
+    fn rebuild(&mut self, keep_place: bool, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
         let home = state.account.as_ref().and_then(|a| a.phone.clone());
         let term = self.query.trim();
         let now = chrono::Utc::now().timestamp_millis();
+        // The term as a number, read with the account's region as Desktop
+        // reads it, so a local number finds a contact's stored one.
+        let parsed = signal_backend::recipients::parse_phone(term, home.as_deref());
+        let e164 = parsed.as_ref().map(|p| p.e164.as_str());
         let contacts = filter_and_sort(
             self.candidates.iter().map(|c| Entry {
                 title: &c.contact.title,
@@ -185,6 +201,7 @@ impl Compose {
                 archived: c.contact.archived,
             }),
             term,
+            e164,
             now,
         );
         let groups = self.groups(cx);
@@ -198,6 +215,7 @@ impl Compose {
                 archived: g.archived,
             }),
             term,
+            None,
             now,
         );
         let username = username_from_search(&self.query);
@@ -227,14 +245,28 @@ impl Compose {
             rows.push(Row::Username(name.to_owned()));
         }
         if username.is_none()
-            && let Some(phone) = signal_backend::recipients::parse_phone(term, home.as_deref())
+            && let Some(phone) = parsed.clone()
             && !contacts.iter().any(|&ix| self.candidates[ix].contact.phone.as_deref() == Some(phone.e164.as_str()))
         {
             rows.push(Row::Header("Find by phone number"));
             rows.push(Row::Phone(phone, term.to_owned()));
         }
         if *self.rows != rows {
-            self.list.reset(rows.len());
+            if keep_place {
+                // As the chat list does: `reset` drops the place at the next
+                // layout, so splice to the new count and remeasure instead.
+                let top = self.list.logical_scroll_top();
+                let old = self.list.item_count();
+                if rows.len() > old {
+                    self.list.splice(old..old, rows.len() - old);
+                } else if rows.len() < old {
+                    self.list.splice(rows.len()..old, 0);
+                }
+                self.list.scroll_to(ListOffset { item_ix: top.item_ix.min(rows.len().saturating_sub(1)), offset_in_item: top.offset_in_item });
+                self.list.remeasure();
+            } else {
+                self.list.reset(rows.len());
+            }
             self.rows = Rc::new(rows);
         }
         cx.notify();
@@ -259,13 +291,22 @@ impl Compose {
     }
 
     /// Looks a username or number up on Signal (Desktop's
-    /// `lookupConversationWithoutServiceId`); ignored while one runs.
+    /// `lookupConversationWithoutServiceId`); ignored while the same one
+    /// runs. Another takes its place, and the earlier answer is dropped.
     fn look_up(&mut self, row: &Row, window: &mut Window, cx: &mut Context<Self>) {
-        if self.finding.is_some() {
-            return;
-        }
         let (query, finding) = match row {
-            Row::Username(name) => (name.clone(), Finding::Username(name.clone())),
+            Row::Username(name) => {
+                // Desktop's `usernames.hash` throws for one that can't be a
+                // username (`alice.007`), which it reports as not valid.
+                if !is_username_valid(name) {
+                    let text = format!(
+                        "{name} is not a valid username. Make sure you\u{2019}ve entered the complete username followed by its set of digits."
+                    );
+                    window.open_alert_dialog(cx, move |alert, _, _| alert.description(text.clone()));
+                    return;
+                }
+                (name.clone(), Finding::Username(name.clone()))
+            }
             Row::Phone(phone, typed) => {
                 if !phone.valid {
                     let text = format!("User not found. \u{201c}{typed}\u{201d} is not a valid phone number.");
@@ -276,21 +317,25 @@ impl Compose {
             }
             _ => return,
         };
+        if self.finding.as_ref().is_some_and(|(q, _)| *q == query) {
+            return;
+        }
         self.state.read(cx).send(signal_backend::Command::FindRecipient { query: query.clone() });
         self.finding = Some((query, finding));
         cx.notify();
     }
 
-    /// The answer to a lookup of ours: its chat opens (the composer stays,
-    /// as Desktop's `showConversation` without `switchToAssociatedView`
-    /// leaves it), or Desktop's dialog or message says why not.
+    /// The answer to a lookup of ours: its chat opens and the composer
+    /// closes, as picking a contact does, or Desktop's dialog or message
+    /// says why not. (Desktop's code calls `showConversation` without
+    /// `switchToAssociatedView` here, which reads as leaving the composer
+    /// open, but the running app goes back to the chat list.)
     fn found(&mut self, query: &str, result: &Result<DirectoryEntry, FindError>, window: &mut Window, cx: &mut Context<Self>) {
         let Some((_, finding)) = self.finding.take_if(|(q, _)| q == query) else { return };
         cx.notify();
         let error = match result {
             Ok(entry) => {
-                let entry = entry.clone();
-                self.state.update(cx, |state, cx| state.start_conversation(entry, cx));
+                self.open(entry.id.clone(), Some(entry.clone()), cx);
                 return;
             }
             Err(error) => error,
@@ -334,7 +379,7 @@ impl Compose {
                 tile(SharedString::from("compose-new-group"), SELECT_HEIGHT, icon, div().child("New group").into_any_element(), None, Some("compose-new-group".into()), palette)
                     .on_click(cx.listener(|this, _, window, cx| {
                         crate::views::new_group::open(this.state.clone(), window, cx);
-                        cx.emit(ComposeEvent::Close);
+                        cx.emit(ComposeEvent::Handoff);
                     }))
                     .into_any_element()
             }
@@ -581,7 +626,7 @@ struct Entry<'a> {
 /// the term must appear in one of the names, and a number matches the
 /// stored number; the match's score is 0 when every word starts a word
 /// of a name and 0.1 otherwise, standing in for Fuse's.
-fn filter_and_sort<'a>(entries: impl Iterator<Item = Entry<'a>>, term: &str, now: i64) -> Vec<usize> {
+fn filter_and_sort<'a>(entries: impl Iterator<Item = Entry<'a>>, term: &str, e164: Option<&str>, now: i64) -> Vec<usize> {
     let entries: Vec<Entry<'a>> = entries.collect();
     let mut order: Vec<(usize, f64)> = if term.is_empty() {
         entries.iter().enumerate().map(|(ix, e)| (ix, -(e.active_at as f64))).collect()
@@ -594,7 +639,13 @@ fn filter_and_sort<'a>(entries: impl Iterator<Item = Entry<'a>>, term: &str, now
             .enumerate()
             .filter_map(|(ix, e)| {
                 let score = match_score(e.names, &words).or_else(|| {
-                    let phone: String = e.phone?.chars().filter(char::is_ascii_digit).collect();
+                    let stored = e.phone?;
+                    // The term read as a number (a local "07911 123456" is
+                    // "+447911123456"), or its digits inside the number.
+                    if e164 == Some(stored) {
+                        return Some(0.);
+                    }
+                    let phone: String = stored.chars().filter(char::is_ascii_digit).collect();
                     (digits.len() >= 3 && phone.contains(&digits)).then_some(0.1)
                 })?;
                 let age = (now - e.active_at) as f64 / WEEK_MS * 0.01;
@@ -743,6 +794,7 @@ mod tests {
             filter_and_sort(
                 ["Maya Chen", "Ana Lima", "Ben Ortiz", "42 Club"].iter().zip(&names).zip(active).map(|((t, n), a)| entry(t, n, a)),
                 term,
+                None,
                 1_000_000,
             )
         };
@@ -758,7 +810,10 @@ mod tests {
     fn a_number_matches_the_stored_number() {
         let names = vec![searchable("Dana Brooks")];
         let dana = Entry { title: "Dana Brooks", names: &names, phone: Some("+14155550177"), active_at: 0, archived: false };
-        assert_eq!(filter_and_sort([dana].into_iter(), "415 555", 0), [0]);
+        assert_eq!(filter_and_sort([dana].into_iter(), "415 555", None, 0), [0]);
+        // A local number, read with the account's region.
+        let uk = Entry { title: "Dana Brooks", names: &names, phone: Some("+447911123456"), active_at: 0, archived: false };
+        assert_eq!(filter_and_sort([uk].into_iter(), "07911 123456", Some("+447911123456"), 0), [0]);
     }
 
     mod view {
@@ -839,7 +894,7 @@ mod tests {
             compose.update_in(&mut m.cx, |c, window, cx| {
                 c.search.update(cx, |input, cx| input.set_value(text, window, cx));
                 c.query = text.to_owned();
-                c.rebuild(cx);
+                c.rebuild(false, cx);
             });
             m.cx.run_until_parked();
         }
@@ -933,12 +988,65 @@ mod tests {
             compose.update_in(&mut m.cx, |c, window, cx| c.look_up(&Row::Username("maya.42".into()), window, cx));
             let state = m.state.clone();
             wait(&mut m.cx, |cx| state.read_with(cx, |s, _| s.selected.as_ref().is_some_and(|id| id.0.ends_with("0000000000a1") || s.conversation(id).is_some_and(|c| c.title == "Maya Chen"))));
-            // New chat stays open, as Desktop's does after a lookup.
-            assert!(m.sidebar.read_with(&m.cx, |s, _| s.compose().is_some()));
+            // New chat closes, as Desktop's does after a lookup.
+            assert!(m.sidebar.read_with(&m.cx, |s, _| s.compose().is_none()));
             // No one has this one: Desktop's dialog.
+            open(&mut m);
+            let compose = self::compose(&mut m);
             compose.update_in(&mut m.cx, |c, window, cx| c.look_up(&Row::Username("nobody.99".into()), window, cx));
             wait(&mut m.cx, |cx| cx.update(|window, cx| window.has_active_dialog(cx)));
             assert!(compose.read_with(&m.cx, |c, _| c.finding.is_none()));
+            m.backend.shutdown();
+        }
+
+        #[gpui_kit::test]
+        fn a_username_that_cant_be_one_says_so_without_a_lookup(cx: &mut TestAppContext) {
+            let mut m = mount(cx);
+            open(&mut m);
+            let compose = compose(&mut m);
+            // Desktop's `usernames.hash` refuses a discriminator of "007".
+            compose.update_in(&mut m.cx, |c, window, cx| c.look_up(&Row::Username("alice.007".into()), window, cx));
+            m.cx.run_until_parked();
+            assert!(m.cx.update(|window, cx| window.has_active_dialog(cx)));
+            assert!(compose.read_with(&m.cx, |c, _| c.finding.is_none()), "nothing looked up");
+            m.backend.shutdown();
+        }
+
+        #[gpui_kit::test]
+        fn new_data_keeps_the_place_and_a_new_query_starts_at_the_top(cx: &mut TestAppContext) {
+            let mut m = mount(cx);
+            open(&mut m);
+            let compose = compose(&mut m);
+            let top = |m: &mut Mounted| compose.read_with(&m.cx, |c, _| c.list.logical_scroll_top().item_ix);
+            // Short enough that the list scrolls (every row fits otherwise,
+            // and the list keeps to the top).
+            m.cx.simulate_resize(gpui_kit::size(px(400.), px(300.)));
+            m.cx.run_until_parked();
+            compose.update(&mut m.cx, |c, _| c.list.scroll_to(ListOffset { item_ix: 3, offset_in_item: px(0.) }));
+            // A chat changing reorders the list (as a message does).
+            compose.update(&mut m.cx, |c, cx| {
+                let mut candidates: Vec<Candidate> = Rc::try_unwrap(std::mem::take(&mut c.candidates)).unwrap_or_else(|rc| {
+                    rc.iter().map(|c| Candidate { contact: c.contact.clone(), names: c.names.clone() }).collect()
+                });
+                candidates.reverse();
+                c.candidates = Rc::new(candidates);
+                c.rebuild(true, cx);
+            });
+            m.cx.run_until_parked();
+            assert_eq!(top(&mut m), 3);
+            type_in(&mut m, "a");
+            assert_eq!(top(&mut m), 0);
+            m.backend.shutdown();
+        }
+
+        #[gpui_kit::test]
+        fn searching_a_chat_closes_new_chat(cx: &mut TestAppContext) {
+            let mut m = mount(cx);
+            open(&mut m);
+            let chat = m.state.read_with(&m.cx, |s, _| s.conversations[0].id.clone());
+            m.sidebar.update_in(&mut m.cx, |s, window, cx| s.search_in_chat(chat, window, cx));
+            m.cx.run_until_parked();
+            assert!(m.sidebar.read_with(&m.cx, |s, _| s.compose().is_none()));
             m.backend.shutdown();
         }
 

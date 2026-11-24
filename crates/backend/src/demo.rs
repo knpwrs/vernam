@@ -2496,7 +2496,6 @@ pub(crate) async fn run(db: AppDb, data_dir: PathBuf, mut commands: mpsc::Unboun
 /// The demo's badge: made up, its images drawn here.
 pub(crate) const DEMO_BADGE: &str = "DEMO_SUSTAINER";
 
-/// Profiles for the made-up people and for us, a badge, and our username.
 /// The demo's `Command::FindRecipient`, answered from its own data as the
 /// server would: a username someone here has, or a number in the
 /// directory or a chat; anyone else isn't on Signal. Nothing goes out.
@@ -2536,6 +2535,7 @@ async fn demo_find(db: &AppDb, query: &str) -> Result<signal_store::DirectoryEnt
         .ok_or_else(|| FindError::NotFound(format!("{e164} isn't on Signal")))
 }
 
+/// Profiles for the made-up people and for us, a badge, and our username.
 async fn seed_profiles(db: &AppDb, data_dir: &Path) -> signal_store::Result<()> {
     use signal_store::{Badge, BadgeCategory, BadgeImage, FetchedProfile, ProfileBadge};
     let me = aci(SELF);
