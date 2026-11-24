@@ -30,6 +30,7 @@ pub mod media;
 pub mod link_preview;
 pub mod debug_log;
 pub mod recipients;
+pub mod countries;
 pub mod giphy;
 pub mod sticker_upload;
 pub mod stickers;

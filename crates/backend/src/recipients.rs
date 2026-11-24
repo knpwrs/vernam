@@ -58,6 +58,45 @@ pub fn parse_phone(query: &str, home: Option<&str>) -> Option<ParsedPhone> {
     Some(ParsedPhone { e164: number.format().mode(phonenumber::Mode::E164).to_string(), valid: phonenumber::is_valid(&number) })
 }
 
+/// The region of `home`, a number in E.164 (your own: Desktop's
+/// `regionCode`, kept from the number the account registered with).
+pub fn region_of(home: &str) -> Option<String> {
+    let number = phonenumber::parse(None, home).ok()?;
+    number.metadata(&phonenumber::metadata::DATABASE).map(|m| m.id().to_owned())
+}
+
+/// [`parse_phone`] with a region rather than a number (Find by phone
+/// number's country, Desktop's `selectedRegion || regionCode`). Without a
+/// region, only a number with a `+` and its country code reads.
+pub fn parse_phone_in(query: &str, region: Option<&str>) -> Option<ParsedPhone> {
+    let query = query.trim();
+    if !query.chars().any(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let region = region.and_then(|r| r.parse::<phonenumber::country::Id>().ok());
+    let number = phonenumber::parse(region, query).ok()?;
+    Some(ParsedPhone { e164: number.format().mode(phonenumber::Mode::E164).to_string(), valid: phonenumber::is_valid(&number) })
+}
+
+/// Desktop's typing in Find by phone number (`SET_COMPOSE_SEARCH_TERM`):
+/// text whose country code is another region's than `selected` (a typed
+/// `+44 …`, or a number another region of the same code owns) switches to
+/// that region, and the text becomes the national number. `None` keeps
+/// both. (Desktop formats the number without its country code
+/// "in original format", which with no region to format by is its national
+/// digits.)
+pub fn switch_country(text: &str, selected: Option<&str>) -> Option<(String, String)> {
+    let parsed_region = selected.and_then(|r| r.parse::<phonenumber::country::Id>().ok());
+    let number = phonenumber::parse(parsed_region, text.trim()).ok()?;
+    let region = number.metadata(&phonenumber::metadata::DATABASE)?.id().to_owned();
+    if Some(region.as_str()) == selected {
+        return None;
+    }
+    let national = number.national();
+    let digits = format!("{}{}", "0".repeat(usize::from(national.zeros())), national.value());
+    Some((region, digits))
+}
+
 /// A phone number in `query`, in E.164 (`+15551234567`). Numbers without a
 /// country code are read as being in `home`'s country (your own number).
 pub fn phone_in(query: &str, home: Option<&str>) -> Option<String> {
@@ -95,6 +134,29 @@ mod tests {
         for text in ["bob", "", "  "] {
             assert_eq!(parse_phone(text, home), None, "{text}");
         }
+    }
+
+    #[test]
+    fn a_number_reads_with_the_country_picked() {
+        assert_eq!(region_of("+442079460958").as_deref(), Some("GB"));
+        assert_eq!(region_of("+12025550123").as_deref(), Some("US"));
+        assert_eq!(parse_phone_in("020 7946 0958", Some("GB")).map(|p| (p.e164, p.valid)), Some(("+442079460958".into(), true)));
+        assert_eq!(parse_phone_in("+44 20 7946 0958", None).map(|p| p.e164), Some("+442079460958".into()));
+        // No region and no country code: nothing to read it by.
+        assert_eq!(parse_phone_in("20 7946 0958", None), None);
+        assert_eq!(parse_phone_in("bob", Some("GB")), None);
+    }
+
+    #[test]
+    fn a_typed_country_code_switches_the_country() {
+        // Desktop's own example: the United Kingdom, its national part kept.
+        assert_eq!(switch_country("+44 20 7946 0000", Some("US")), Some(("GB".into(), "2079460000".into())));
+        assert_eq!(switch_country("+44 20 7946 0000", None), Some(("GB".into(), "2079460000".into())));
+        // The country already picked, or text that isn't a number: no change.
+        assert_eq!(switch_country("20 7946 0000", Some("GB")), None);
+        assert_eq!(switch_country("+44 20 7946 0000", Some("GB")), None);
+        assert_eq!(switch_country("20 7946", None), None);
+        assert_eq!(switch_country("abc", Some("GB")), None);
     }
 
     #[test]

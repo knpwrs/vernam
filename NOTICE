@@ -57,6 +57,9 @@ Bundled data and assets:
     (images/profile-avatar.svg), and the navigation tabs' icons
     (images/icons/v3), from Signal Desktop (AGPL-3.0-only),
     Copyright Signal Messenger, LLC. See crates/app/assets/icons/signal.
+  - The English country names for "Find by phone number", from Signal
+    Desktop's build/country-display-names.json (AGPL-3.0-only), Copyright
+    Signal Messenger, LLC. See crates/backend/src/countries.rs.
   - The preset profile photos from Signal Desktop (images/avatars,
     AGPL-3.0-only), Copyright Signal Messenger, LLC. See
     crates/app/assets/avatars.
