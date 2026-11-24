@@ -334,6 +334,26 @@ impl Compose {
     }
 
     /// Name this group (Desktop's `startSettingGroupMetadata`).
+    /// Desktop's "Custom Time" dialog for the new group's timer.
+    fn open_custom_timer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(current) = self.group.as_ref().map(|g| g.timer) else { return };
+        let this = cx.entity();
+        crate::views::chat_menu::custom_time(
+            current,
+            move |seconds, _, cx| this.update(cx, |this, cx| this.set_group_timer(seconds, cx)),
+            window,
+            cx,
+        );
+    }
+
+    /// The new group's disappearing-message timer.
+    fn set_group_timer(&mut self, seconds: u32, cx: &mut Context<Self>) {
+        if let Some(group) = &mut self.group {
+            group.timer = seconds;
+            cx.notify();
+        }
+    }
+
     fn show_set_metadata(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(group) = &self.group else { return };
         // Desktop disables Next past the hard limit, which picking can't reach.
@@ -1328,8 +1348,12 @@ impl Compose {
                     .border_color(palette.panel_border)
                     .child(Icon::new(IconName::Camera).size(px(16.)).text_color(palette.text)),
             );
+        // Desktop's `DisappearingTimerSelect`: the preset durations, then
+        // "Custom time..." (`DisappearingTimeDialog`); a custom time reads
+        // "Custom time", its duration under the row.
+        let custom = !crate::views::chat_menu::TIMER_CHOICES.contains(&timer);
         let timer_button = Button::new("compose-group-timer")
-            .label(crate::views::chat_menu::format_timer_long(timer))
+            .label(if custom { "Custom time".to_owned() } else { crate::views::chat_menu::format_timer_long(timer) })
             .outline()
             .small()
             .disabled(creating)
@@ -1338,18 +1362,16 @@ impl Compose {
                 move |mut menu, _, _| {
                     for seconds in crate::views::chat_menu::TIMER_CHOICES {
                         let this = this.clone();
-                        menu = menu.item(PopupMenuItem::new(crate::views::chat_menu::format_timer_long(seconds)).checked(timer == seconds).on_click(
-                            move |_, _, cx| {
-                                this.update(cx, |this, cx| {
-                                    if let Some(group) = &mut this.group {
-                                        group.timer = seconds;
-                                        cx.notify();
-                                    }
-                                });
-                            },
-                        ));
+                        menu = menu.item(
+                            PopupMenuItem::new(crate::views::chat_menu::format_timer_long(seconds))
+                                .checked(timer == seconds)
+                                .on_click(move |_, _, cx| this.update(cx, |this, cx| this.set_group_timer(seconds, cx))),
+                        );
                     }
-                    menu
+                    let this = this.clone();
+                    menu.item(PopupMenuItem::new("Custom time...").checked(custom).on_click(move |_, window, cx| {
+                        this.update(cx, |this, cx| this.open_custom_timer(window, cx));
+                    }))
                 }
             });
         let members = order.iter().map(|sid| {
@@ -1387,6 +1409,19 @@ impl Compose {
                             .child(div().mr(px(12.)).child("Disappearing messages"))
                             .child(timer_button),
                     )
+                    .when(custom, |d| {
+                        d.child(
+                            div()
+                                .id("compose-group-custom-timer")
+                                .debug_selector(|| "compose-group-custom-timer".into())
+                                .mx(px(16.))
+                                .mt(px(-8.))
+                                .mb(px(16.))
+                                .text_size(px(12.))
+                                .text_color(palette.text_secondary)
+                                .child(crate::views::chat_menu::format_timer_long(timer)),
+                        )
+                    })
                     .when(!order.is_empty(), |d| {
                         d.child(
                             div()
@@ -2086,6 +2121,40 @@ mod tests {
             wait(&mut m.cx, |cx| m.sidebar.read_with(cx, |s, _| s.compose().is_none()));
             let members = m.state.read_with(&m.cx, |s, _| s.selected.as_ref().and_then(|id| s.conversation(id)).map(|c| c.members.len()));
             assert_eq!(members, Some(2));
+            m.backend.shutdown();
+        }
+
+        #[gpui_kit::test]
+        fn a_custom_timer_is_set_from_desktops_dialog(cx: &mut TestAppContext) {
+            use gpui_kit::test::TestWindowExt as _;
+            let mut m = mount(cx);
+            open(&mut m);
+            new_group(&mut m);
+            let compose = compose(&mut m);
+            compose.update_in(&mut m.cx, |c, window, cx| {
+                c.show_set_metadata(window, cx);
+                c.open_custom_timer(window, cx);
+            });
+            m.cx.run_until_parked();
+            // From Off, the dialog starts at 1 second; one more is 2.
+            for id in ["custom-time-more", "custom-time-set"] {
+                m.cx.update(|window, cx| {
+                    window.render_frame(cx);
+                    window.click(id, cx);
+                });
+                m.cx.run_until_parked();
+            }
+            let timer = compose.read_with(&m.cx, |c, _| c.group.as_ref().map(|g| g.timer));
+            assert_eq!(timer, Some(2));
+            // Not a preset: "Custom time", with the duration under it.
+            m.cx.update(|window, _| window.refresh());
+            m.cx.run_until_parked();
+            assert!(m.cx.debug_bounds("compose-group-custom-timer").is_some());
+            // A preset again: no duration line.
+            compose.update(&mut m.cx, |c, cx| c.set_group_timer(crate::views::chat_menu::TIMER_CHOICES[2], cx));
+            m.cx.update(|window, _| window.refresh());
+            m.cx.run_until_parked();
+            assert!(m.cx.debug_bounds("compose-group-custom-timer").is_none());
             m.backend.shutdown();
         }
 
