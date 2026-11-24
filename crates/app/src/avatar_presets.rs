@@ -1,5 +1,6 @@
-//! Signal Desktop's preset profile photos (`PersonalAvatarIcons` and
-//! `personalIconColors` in `ts/types/Avatar.std.ts`): its illustrations
+//! Signal Desktop's preset profile and group photos (`PersonalAvatarIcons`
+//! with `personalIconColors`, and `GroupAvatarIcons` with
+//! `groupIconColors`, in `ts/types/Avatar.std.ts`): its illustrations
 //! (`images/avatars`, AGPL-3.0-only like this app) on one of Signal's
 //! avatar colors, drawn as Desktop's `avatarDataToBytes` draws them: the
 //! color filling a 1024-pixel square, the illustration over it.
@@ -36,6 +37,23 @@ pub const PRESETS: [Preset; 12] = [
     preset!("ghost", 0),
 ];
 
+/// Desktop's group presets (`getDefaultAvatars(isGroup)`), in its order,
+/// with its colors.
+pub const GROUP_PRESETS: [Preset; 12] = [
+    preset!("balloon", 8),
+    preset!("book", 2),
+    preset!("briefcase", 1),
+    preset!("celebration", 7),
+    preset!("drink", 0),
+    preset!("football", 11),
+    preset!("heart", 0),
+    preset!("house", 8),
+    preset!("melon", 2),
+    preset!("soccerball", 1),
+    preset!("sunset", 3),
+    preset!("surfboard", 11),
+];
+
 /// The preset as a PNG, its color behind the illustration.
 pub fn render(preset: &Preset) -> anyhow::Result<Vec<u8>> {
     use resvg::{tiny_skia, usvg};
@@ -52,7 +70,7 @@ pub fn render(preset: &Preset) -> anyhow::Result<Vec<u8>> {
 mod tests {
     #[test]
     fn every_preset_draws_on_its_color() {
-        for (ix, preset) in super::PRESETS.iter().enumerate() {
+        for (ix, preset) in super::PRESETS.iter().chain(&super::GROUP_PRESETS).enumerate() {
             let png = super::render(preset).unwrap();
             let image = image::load_from_memory(&png).unwrap().to_rgba8();
             assert_eq!(image.dimensions(), (1024, 1024), "preset {ix}");

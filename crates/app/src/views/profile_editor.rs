@@ -3,8 +3,6 @@
 //! presets), name, about and its emoji, the username (`UsernameEditor`)
 //! and its link and QR code (`UsernameLinkEditor`).
 
-use std::sync::Arc;
-
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -13,7 +11,7 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    AnyElement, App, ClipboardItem, Context, Entity, FontWeight, Image, ImageFormat, ObjectFit, SharedString, Subscription, Task, Window,
+    AnyElement, App, ClipboardItem, Context, Entity, FontWeight, ObjectFit, SharedString, Subscription, Task, Window,
     deferred, div, img, px,
 };
 use signal_backend::profiles::{ABOUT_BYTES, ABOUT_GRAPHEMES, AvatarChange, NAME_BYTES, NAME_GRAPHEMES, ProfileEdit};
@@ -82,14 +80,7 @@ impl Page {
 }
 
 /// The photo staged on the avatar page.
-#[derive(Clone)]
-enum StagedPhoto {
-    /// What we have.
-    Current,
-    Remove,
-    /// A processed JPEG, with its image for the preview.
-    New(Arc<Vec<u8>>, Arc<Image>),
-}
+use crate::views::avatar_editor::Staged as StagedPhoto;
 
 /// The username editor's state (Desktop's `usernameReservation`).
 #[derive(Default)]
@@ -369,32 +360,13 @@ impl ProfileEditor {
         Some(edit)
     }
 
-    /// A picked or preset image, cropped and saved as Desktop uploads it.
-    pub fn stage_photo(&mut self, bytes: &[u8], window: &mut Window, cx: &mut Context<Self>) {
-        match signal_backend::profiles::avatar_image(bytes) {
-            Ok(jpeg) => {
-                let image = Arc::new(Image::from_bytes(ImageFormat::Jpeg, jpeg.clone()));
-                self.photo = StagedPhoto::New(Arc::new(jpeg), image);
-            }
-            Err(error) => window.push_notification(Notification::error(format!("That image can't be used: {error}")), cx),
+    /// A picked or preset photo, or why it can't be used.
+    fn stage_photo(&mut self, photo: Result<StagedPhoto, String>, window: &mut Window, cx: &mut Context<Self>) {
+        match photo {
+            Ok(photo) => self.photo = photo,
+            Err(reason) => window.push_notification(Notification::error(format!("That image can't be used: {reason}")), cx),
         }
         cx.notify();
-    }
-
-    fn pick_photo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let picked = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("Choose photo".into()),
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(paths))) = picked.await else { return };
-            let Some(path) = paths.into_iter().next() else { return };
-            let Ok(bytes) = std::fs::read(&path) else { return };
-            let _ = this.update_in(cx, |this, window, cx| this.stage_photo(&bytes, window, cx));
-        })
-        .detach();
     }
 
     fn nickname_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -784,57 +756,28 @@ impl ProfileEditor {
             StagedPhoto::Remove => false,
             StagedPhoto::New(..) => true,
         };
-        let presets = crate::avatar_presets::PRESETS.iter().enumerate().map(|(ix, preset)| {
-            let (bg, _) = crate::theme::avatar_colors(preset.color);
-            let image = Arc::new(Image::from_bytes(ImageFormat::Svg, preset.svg.to_vec()));
-            div()
-                .id(("profile-preset", ix))
-                .debug_selector(move || format!("profile-preset-{ix}"))
-                .size(px(56.))
-                .rounded_full()
-                .overflow_hidden()
-                .bg(bg)
-                .cursor_pointer()
-                .child(img(image).size(px(56.)))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    match crate::avatar_presets::render(&crate::avatar_presets::PRESETS[ix]) {
-                        Ok(png) => this.stage_photo(&png, window, cx),
-                        Err(error) => tracing::warn!(%error, "couldn't draw a preset photo"),
-                    }
-                }))
-        });
+        let editor = crate::views::avatar_editor::body(
+            "profile",
+            photo_element(&self.photo, profile, 96.),
+            has_photo,
+            &crate::avatar_presets::PRESETS,
+            palette,
+            cx,
+            |_, window, cx| crate::views::avatar_editor::pick_photo("Choose photo", window, cx, |this: &mut Self, photo, window, cx| this.stage_photo(photo, window, cx)),
+            |this, _, cx| {
+                this.photo = StagedPhoto::Remove;
+                cx.notify();
+            },
+            |this, ix, window, cx| {
+                let photo = StagedPhoto::from_preset(&crate::avatar_presets::PRESETS[ix]);
+                this.stage_photo(photo, window, cx);
+            },
+        );
         div()
             .flex()
             .flex_col()
             .gap_3()
-            .child(div().flex().justify_center().child(photo_element(&self.photo, profile, 96.)))
-            .child(
-                div()
-                    .flex()
-                    .justify_center()
-                    .gap_2()
-                    .child(
-                        Button::new("profile-upload-photo")
-                            .label("Upload photo")
-                            .outline()
-                            .small()
-                            .on_click(cx.listener(|this, _, window, cx| this.pick_photo(window, cx))),
-                    )
-                    .when(has_photo, |d| {
-                        d.child(
-                            Button::new("profile-remove-photo")
-                                .label("Remove")
-                                .ghost()
-                                .small()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.photo = StagedPhoto::Remove;
-                                    cx.notify();
-                                })),
-                        )
-                    }),
-            )
-            .child(div().text_xs().text_color(palette.text_secondary).child("Select an avatar"))
-            .child(div().flex().flex_wrap().gap_2().children(presets))
+            .child(editor)
             .child(footer(
                 Button::new("profile-cancel").label("Cancel").outline().on_click(cx.listener(|this, _, window, cx| this.back(window, cx))),
                 Button::new("profile-save")

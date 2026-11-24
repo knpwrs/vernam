@@ -30,6 +30,7 @@ pub mod nickname;
 pub mod notices;
 pub mod poll;
 pub mod preferred_reactions;
+pub mod avatar_editor;
 pub mod profile_editor;
 pub mod root;
 pub mod safety_number;

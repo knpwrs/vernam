@@ -104,8 +104,8 @@ struct GroupDraft {
     /// The pills' scroll, kept at the newest pick (Desktop's `ContactPills`).
     pills_scroll: gpui_kit::ScrollHandle,
     alerts: Alerts,
-    /// The picked photo: its file, and its bytes.
-    avatar: Option<(std::path::PathBuf, Vec<u8>)>,
+    /// The photo from "Group Avatar" (Desktop's `AvatarEditor`).
+    avatar: Option<crate::views::avatar_editor::Photo>,
     /// The disappearing message timer, in seconds.
     timer: u32,
     name: Entity<InputState>,
@@ -420,7 +420,7 @@ impl Compose {
         let command = signal_backend::Command::CreateGroup {
             title,
             members: group.order.clone(),
-            avatar: group.avatar.as_ref().map(|(_, bytes)| bytes.clone()),
+            avatar: group.avatar.as_ref().map(|(jpeg, _)| jpeg.to_vec()),
             expire_timer: group.timer,
         };
         self.state.read(cx).send(command);
@@ -439,37 +439,28 @@ impl Compose {
         }
     }
 
-    /// Picks a photo for the new group (Desktop's `AvatarPreview` upload).
-    fn pick_photo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let picked = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("Choose a group photo".into()),
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(paths))) = picked.await else { return };
-            let Some(path) = paths.into_iter().next() else { return };
-            // Read and tried as a group photo off the UI thread: a large
-            // file would stall it, and one the backend can't make a photo
-            // of is refused now rather than failing Create.
-            let reading = path.clone();
-            let checked = cx.background_executor().spawn(async move { read_group_photo(&reading) }).await;
-            let _ = this.update_in(cx, |this, window, cx| match checked {
-                Ok(bytes) => {
+    /// Desktop's "Group Avatar" dialog (`AvatarEditor` for a group): a
+    /// photo uploaded or a group preset, or none.
+    fn open_photo_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(group) = &self.group else { return };
+        let current = group.avatar.clone();
+        let this = cx.entity();
+        crate::views::avatar_editor::open_dialog(
+            "Group Avatar",
+            current,
+            &crate::avatar_presets::GROUP_PRESETS,
+            || crate::views::common::group_photo(None, "", 0, px(96.)),
+            move |photo, _, cx| {
+                this.update(cx, |this, cx| {
                     if let Some(group) = &mut this.group {
-                        group.avatar = Some((path, bytes));
+                        group.avatar = photo;
                         cx.notify();
                     }
-                }
-                Err(reason) => {
-                    tracing::warn!(%reason, "refused a group photo");
-                    let text = format!("That file can\u{2019}t be used as a group photo: {reason}");
-                    window.open_alert_dialog(cx, move |alert, _, _| alert.description(text.clone()));
-                }
-            });
-        })
-        .detach();
+                })
+            },
+            window,
+            cx,
+        );
     }
 
     /// The account's region (Desktop's `regionCode`), from its number.
@@ -1006,23 +997,6 @@ impl Compose {
     }
 }
 
-/// The largest file taken as a group photo. Vernam's other caps on images
-/// it reads whole (release note media, GIFs) are 25 MiB; a photo the
-/// backend shrinks to 512 pixels needs no more.
-const GROUP_PHOTO_MAX_BYTES: u64 = 25 * 1024 * 1024;
-
-/// A picked group photo's bytes, if it's an image the backend can make a
-/// group photo of and not too large; else why not.
-fn read_group_photo(path: &std::path::Path) -> Result<Vec<u8>, String> {
-    let size = std::fs::metadata(path).map_err(|e| format!("it couldn\u{2019}t be read ({e})."))?.len();
-    if size > GROUP_PHOTO_MAX_BYTES {
-        return Err("it\u{2019}s larger than 25 MB.".into());
-    }
-    let bytes = std::fs::read(path).map_err(|e| format!("it couldn\u{2019}t be read ({e})."))?;
-    signal_backend::media::group_avatar(&bytes).map_err(|_| "it isn\u{2019}t an image Vernam can read.".to_owned())?;
-    Ok(bytes)
-}
-
 /// Desktop's `Avatar` with `searchResult`: the search glyph in a circle.
 fn search_glyph(palette: Palette) -> gpui_kit::AnyElement {
     div()
@@ -1321,7 +1295,7 @@ impl Compose {
         let creating = group.creating;
         let ready = !creating && !group.name.read(cx).value().trim().is_empty();
         let timer = group.timer;
-        let photo = group.avatar.as_ref().map(|(path, _)| path.clone());
+        let photo = group.avatar.as_ref().map(|(_, image)| image.clone());
         let name = group.name.clone();
         let title = name.read(cx).value().to_string();
         let order = group.order.clone();
@@ -1331,8 +1305,11 @@ impl Compose {
             .debug_selector(|| "compose-group-photo".into())
             .relative()
             .size(px(96.))
-            .when(!creating, |d| d.cursor_pointer().on_click(cx.listener(|this, _, window, cx| this.pick_photo(window, cx))))
-            .child(crate::views::common::group_photo(photo.as_deref(), &title, 0, px(96.)))
+            .when(!creating, |d| d.cursor_pointer().on_click(cx.listener(|this, _, window, cx| this.open_photo_editor(window, cx))))
+            .child(match photo {
+                Some(image) => gpui_kit::img(image).size(px(96.)).rounded_full().object_fit(gpui_kit::ObjectFit::Cover).into_any_element(),
+                None => crate::views::common::group_photo(None, &title, 0, px(96.)),
+            })
             .child(
                 div()
                     .absolute()
@@ -2125,6 +2102,48 @@ mod tests {
         }
 
         #[gpui_kit::test]
+        fn the_group_photo_comes_from_desktops_editor(cx: &mut TestAppContext) {
+            use gpui_kit::test::TestWindowExt as _;
+            let mut m = mount(cx);
+            open(&mut m);
+            new_group(&mut m);
+            let compose = compose(&mut m);
+            let click = |m: &mut Mounted, id: gpui_kit::ElementId| {
+                m.cx.update(|window, cx| {
+                    window.render_frame(cx);
+                    window.click(id, cx);
+                });
+                m.cx.run_until_parked();
+            };
+            let photo = |m: &mut Mounted| compose.read_with(&m.cx, |c, _| c.group.as_ref().and_then(|g| g.avatar.as_ref().map(|(jpeg, _)| jpeg.clone())));
+            compose.update_in(&mut m.cx, |c, window, cx| {
+                c.show_set_metadata(window, cx);
+                c.open_photo_editor(window, cx);
+            });
+            m.cx.run_until_parked();
+            // Nothing changed: Save does nothing.
+            click(&mut m, "avatar-editor-save".into());
+            assert!(m.cx.update(|window, cx| window.has_active_dialog(cx)), "still open");
+            // A group preset (Desktop's balloon), saved.
+            m.cx.update(|window, _| window.refresh());
+            m.cx.run_until_parked();
+            let at = m.cx.debug_bounds("avatar-editor-preset-0").expect("the presets show").center();
+            m.cx.simulate_click(at, gpui_kit::Modifiers::none());
+            m.cx.run_until_parked();
+            click(&mut m, "avatar-editor-save".into());
+            assert!(!m.cx.update(|window, cx| window.has_active_dialog(cx)));
+            let saved = photo(&mut m).expect("a photo");
+            assert!(saved.starts_with(&[0xff, 0xd8]), "a JPEG");
+            // Removed and saved: no photo.
+            compose.update_in(&mut m.cx, |c, window, cx| c.open_photo_editor(window, cx));
+            m.cx.run_until_parked();
+            click(&mut m, "avatar-editor-remove-photo".into());
+            click(&mut m, "avatar-editor-save".into());
+            assert!(photo(&mut m).is_none());
+            m.backend.shutdown();
+        }
+
+        #[gpui_kit::test]
         fn a_custom_timer_is_set_from_desktops_dialog(cx: &mut TestAppContext) {
             use gpui_kit::test::TestWindowExt as _;
             let mut m = mount(cx);
@@ -2200,22 +2219,6 @@ mod tests {
             assert!(m.sidebar.read_with(&m.cx, |s, _| s.compose().is_some()));
             assert_eq!(step(&mut m), Step::SetGroupMetadata);
             m.backend.shutdown();
-        }
-
-        #[test]
-        fn a_group_photo_must_be_an_image_of_at_most_25_mb() {
-            let dir = tempfile::tempdir().unwrap();
-            let not_image = dir.path().join("notes.pdf");
-            std::fs::write(&not_image, b"%PDF-1.7 not an image").unwrap();
-            assert!(read_group_photo(&not_image).is_err());
-            let photo = dir.path().join("photo.png");
-            image::RgbaImage::from_pixel(8, 8, image::Rgba([200, 80, 40, 255])).save(&photo).unwrap();
-            assert!(read_group_photo(&photo).is_ok_and(|bytes| !bytes.is_empty()));
-            // Too large is refused before it's read.
-            let large = dir.path().join("large.png");
-            std::fs::File::create(&large).unwrap().set_len(GROUP_PHOTO_MAX_BYTES + 1).unwrap();
-            assert!(read_group_photo(&large).is_err_and(|reason| reason.contains("25 MB")));
-            assert!(read_group_photo(&dir.path().join("missing.png")).is_err());
         }
 
         #[gpui_kit::test]
