@@ -12,7 +12,9 @@ use std::ops::Range;
 pub fn check(text: &str) -> Vec<Range<usize>> {
     #[cfg(target_os = "macos")]
     return macos::check(text);
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    return linux::check(text);
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = text;
         Vec::new()
@@ -23,7 +25,9 @@ pub fn check(text: &str) -> Vec<Range<usize>> {
 pub fn guesses(text: &str, range: Range<usize>) -> Vec<String> {
     #[cfg(target_os = "macos")]
     return macos::guesses(text, range);
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    return linux::guesses(text, range);
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (text, range);
         Vec::new()
@@ -31,11 +35,13 @@ pub fn guesses(text: &str, range: Range<usize>) -> Vec<String> {
 }
 
 /// UTF-16 offset of a byte offset (NSString counts UTF-16 units).
+#[cfg(target_os = "macos")]
 fn utf16_at(text: &str, byte: usize) -> usize {
     text[..byte.min(text.len())].encode_utf16().count()
 }
 
 /// Byte offset of a UTF-16 offset, if it falls on a character boundary.
+#[cfg(target_os = "macos")]
 fn byte_at(text: &str, utf16: usize) -> Option<usize> {
     let mut units = 0;
     for (byte, c) in text.char_indices() {
@@ -91,6 +97,128 @@ mod macos {
             .guessesForWordRange_inString_language_inSpellDocumentWithTag(range, &string, None, 0)
             .map(|list| list.iter().map(|s| s.to_string()).collect())
             .unwrap_or_default()
+    }
+}
+
+/// Hunspell, the checker under Desktop's Electron and Chromium's bundled
+/// dictionaries: spellbook parses the system's dictionary and checks.
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::ops::Range;
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+
+    use spellbook::Dictionary;
+
+    /// What a context menu shows.
+    const MAX_GUESSES: usize = 5;
+
+    pub fn check(text: &str) -> Vec<Range<usize>> {
+        let Some(dictionary) = dictionary() else { return Vec::new() };
+        words(text)
+            .into_iter()
+            // `2nd`, `5pm`, `3x`: a dictionary rejects them all (its words
+            // are letters), so they'd read as misspelled.
+            .filter(|(_, word)| !word.chars().any(|c| c.is_numeric()))
+            .filter(|(_, word)| !dictionary.check(word))
+            .map(|(range, _)| range)
+            .collect()
+    }
+
+    pub fn guesses(text: &str, range: Range<usize>) -> Vec<String> {
+        let Some(dictionary) = dictionary() else { return Vec::new() };
+        let mut guesses = Vec::new();
+        dictionary.suggest(&text[range], &mut guesses);
+        guesses.truncate(MAX_GUESSES);
+        guesses
+    }
+
+    /// The user's language's dictionary, loaded once (None: none is
+    /// installed, `hunspell-en_US` and friends). Without one, nothing is
+    /// marked, as off macOS with no spellchecker.
+    fn dictionary() -> Option<&'static Dictionary> {
+        static DICTIONARY: OnceLock<Option<Dictionary>> = OnceLock::new();
+        DICTIONARY
+            .get_or_init(|| {
+                let languages = languages();
+                for directory in directories() {
+                    for language in &languages {
+                        let (Ok(aff), Ok(dic)) = (
+                            std::fs::read_to_string(directory.join(format!("{language}.aff"))),
+                            std::fs::read_to_string(directory.join(format!("{language}.dic"))),
+                        ) else {
+                            continue;
+                        };
+                        match Dictionary::new(&aff, &dic) {
+                            Ok(dictionary) => return Some(dictionary),
+                            Err(error) => tracing::warn!("couldn't parse {language}'s dictionary: {error}"),
+                        }
+                    }
+                }
+                tracing::info!("no hunspell dictionary for any of {languages:?}, spellcheck is off");
+                None
+            })
+            .as_ref()
+    }
+
+    /// The user's languages, longest first: `en_US.UTF-8` in `LC_ALL`
+    /// (glibc's first pick), `LC_MESSAGES`, or `LANG` is `en_US`, then its
+    /// bare language `en`.
+    fn languages() -> Vec<String> {
+        let raw = std::env::var("LC_ALL")
+            .or_else(|_| std::env::var("LC_MESSAGES"))
+            .or_else(|_| std::env::var("LANG"))
+            .unwrap_or_default();
+        let base = raw.split('.').next().unwrap_or_default().to_string();
+        let mut languages = vec![base.clone()];
+        if let Some((language, _)) = base.split_once('_') {
+            languages.push(language.to_string());
+        }
+        languages.retain(|language| !language.is_empty() && language != "C" && language != "POSIX");
+        languages
+    }
+
+    /// Where hunspell dictionaries live: the user's first (a user-installed
+    /// dictionary should win over the system's), then the system's, which
+    /// Debian's `hunspell` and Fedora's `myspell` name differently.
+    fn directories() -> Vec<PathBuf> {
+        let mut directories = Vec::new();
+        if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
+            directories.push(PathBuf::from(data_home).join("hunspell"));
+        } else if let Some(home) = std::env::var_os("HOME") {
+            directories.push(PathBuf::from(home).join(".local/share/hunspell"));
+        }
+        directories.push(PathBuf::from("/usr/share/hunspell"));
+        directories.push(PathBuf::from("/usr/share/myspell/dicts"));
+        directories.push(PathBuf::from("/usr/local/share/hunspell"));
+        directories
+    }
+
+    /// The words in a text, as (byte range, word): runs of alphanumeric
+    /// characters and internal apostrophes (`don't`, `isn’t`), with ones
+    /// hanging off an edge trimmed (`'tis` is `tis`). Spellbook leaves
+    /// tokenizing to its caller.
+    pub(crate) fn words(text: &str) -> Vec<(Range<usize>, &str)> {
+        let apostrophe = |c: char| c == '\'' || c == '’';
+        let mut words = Vec::new();
+        let mut start: Option<usize> = None;
+        for (byte, c) in text.char_indices().chain([(text.len(), '\0')]) {
+            if c.is_alphanumeric() || (start.is_some() && apostrophe(c)) {
+                if start.is_none() {
+                    start = Some(byte);
+                }
+                continue;
+            }
+            if let Some(from) = start.take() {
+                let body = &text[from..byte];
+                let inner = body.trim_start_matches(apostrophe).trim_end_matches(apostrophe);
+                let at = from + (body.len() - inner.len());
+                if !inner.is_empty() {
+                    words.push((at..at + inner.len(), inner));
+                }
+            }
+        }
+        words
     }
 }
 
@@ -153,6 +281,7 @@ pub fn at(marked: &[Range<usize>], at: usize) -> Option<Range<usize>> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn utf16_offsets_map_to_bytes() {
         let text = "é😀a";
@@ -202,5 +331,34 @@ mod tests {
         assert!(!words.contains(&"checker"));
         let range = found.iter().find(|r| &text[(*r).clone()] == "tesst").unwrap().clone();
         assert!(!guesses(text, range).is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn words_keep_internal_apostrophes_and_drop_edge_ones() {
+        let text = "don't 'tis o’’kay hello, isn’t — a’";
+        let found: Vec<&str> = linux::words(text).iter().map(|(_, w)| *w).collect();
+        assert_eq!(found, ["don't", "tis", "o’’kay", "hello", "isn’t", "a"]);
+    }
+
+    /// The system's dictionary, if one is installed: obvious misspellings
+    /// are found, and a word it knows isn't.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_system_checker_finds_obvious_misspellings() {
+        // Safety: fine in a test before any thread reads the environment.
+        unsafe { std::env::set_var("LC_MESSAGES", "en_US.UTF-8") };
+        let text = "Thiss is a tesst of the checker 2nd 5pm";
+        let found = check(text);
+        if found.is_empty() {
+            eprintln!("skipping: no hunspell dictionary installed");
+            return;
+        }
+        let words: Vec<&str> = found.iter().map(|r| &text[r.clone()]).collect();
+        assert!(words.contains(&"Thiss") && words.contains(&"tesst"), "{words:?}");
+        assert!(!words.contains(&"checker"), "{words:?}");
+        // Numbers are letters to a dictionary, so they aren't misspellings.
+        assert!(!words.contains(&"2nd") && !words.contains(&"5pm"), "{words:?}");
+        assert!(!guesses(text, found.iter().find(|r| &text[(*r).clone()] == "tesst").unwrap().clone()).is_empty());
     }
 }
